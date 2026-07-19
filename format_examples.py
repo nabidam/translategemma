@@ -2,10 +2,7 @@ import json
 
 
 def format_to_translategemma_schema(examples):
-    # This function takes batches of English and Farsi pairs
-    # and formats them into the required conversation structure.
     conversations = []
-
     for en_text, fa_text in zip(examples["english"], examples["farsi"]):
         message = [
             {
@@ -19,11 +16,15 @@ def format_to_translategemma_schema(examples):
                     }
                 ],
             },
-            {"role": "assistant", "content": fa_text},
+            {
+                "role": "assistant",
+                "content": str(fa_text),  # Ensure this is a raw string
+            },
         ]
-        conversations.append(message)
-
-    return {"messages": conversations}
+        conversations.append(
+            {"messages": message}
+        )  # The Trainer expects a 'messages' key
+    return {"messages": [c["messages"] for c in conversations]}
 
 
 # Apply this to your Hugging Face dataset

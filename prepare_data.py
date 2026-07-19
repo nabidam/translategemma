@@ -67,14 +67,38 @@ def convert_csv_to_jsonl(
 
 
 if __name__ == "__main__":
-    # Ensure your data directory exists before running
+    import argparse
     import os
 
-    os.makedirs("data", exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Convert raw CSV into SFT and DPO JSONL datasets."
+    )
+    parser.add_argument(
+        "--input_csv",
+        default="raw_scientific_translations.csv",
+        help="Path to input CSV with columns [id, en, fa, domain].",
+    )
+    parser.add_argument(
+        "--sft_output",
+        default="data/sft_farsi_science.jsonl",
+        help="Path to write the SFT JSONL file.",
+    )
+    parser.add_argument(
+        "--dpo_output",
+        default="data/dpo_farsi_science.jsonl",
+        help="Path to write the DPO JSONL scaffold file.",
+    )
+    args = parser.parse_args()
+
+    # Ensure the parent directories for the output files exist
+    for out_path in (args.sft_output, args.dpo_output):
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
     # Run conversion
     convert_csv_to_jsonl(
-        input_csv="raw_scientific_translations.csv",
-        sft_output="data/sft_farsi_science.jsonl",
-        dpo_output="data/dpo_farsi_science.jsonl",
+        input_csv=args.input_csv,
+        sft_output=args.sft_output,
+        dpo_output=args.dpo_output,
     )

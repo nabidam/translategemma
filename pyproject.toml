@@ -1,0 +1,30 @@
+[project]
+name = "translategemma-project"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.13.0",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "peft",
+    "trl",
+    "datasets",
+    "accelerate",
+    "bitsandbytes",
+    "pandas",
+    "pyyaml",
+    "pysbd",
+    "unbabel-comet>=2.2.0",
+    "rich>=15.0.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
+torchaudio = { index = "pytorch-cu132" }

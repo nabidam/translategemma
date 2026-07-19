@@ -29,7 +29,7 @@ lora:
 
 training:
   run_sft: true
-  run_dpo: true
+  run_dpo: false
   batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
@@ -44,3 +44,8 @@ evaluation:
   metricx_model_id: "google/metricx-24-hybrid-large-v2p6" # Updated to latest MetricX-24
   comet_model_id: "Unbabel/wmt22-comet-da"
   comet_batch_size: 8
+
+logging:
+  logs_dir: "logs" # Directory for full log files (all levels)
+  level: "INFO" # Console level: DEBUG | INFO | WARNING | ERROR
+  file_level: "DEBUG" # File always captures this level and above
