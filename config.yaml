@@ -1,0 +1,42 @@
+# config.yaml
+model:
+  base_model_id: "google/translategemma-12b-it" # Or 4b-it / 27b-it
+  output_dir: "./translategemma-farsi-science"
+  device_map: "auto"
+  use_4bit: true
+
+data:
+  sft_dataset_path: "data/sft_farsi_science.jsonl"
+  dpo_dataset_path: "data/dpo_farsi_science.jsonl" # Optional if run_dpo is false
+  source_lang: "en"
+  target_lang: "fa"
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj",
+    ]
+
+training:
+  run_sft: true
+  run_dpo: true # Set to false for minimal SFT-only run
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  dpo_learning_rate: 5.0e-6
+  epochs: 3
+  bf16: true # Recommended for Gemma models
+
+logging:
+  logs_dir: "logs" # Directory for full log files (all levels)
+  level: "INFO" # Console level: DEBUG | INFO | WARNING | ERROR
+  file_level: "DEBUG" # File always captures this level and above
