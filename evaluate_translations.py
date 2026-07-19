@@ -1,47 +1,42 @@
+import yaml
 import torch
 import pandas as pd
-from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-)
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from peft import PeftModel
 from comet import download_model, load_from_checkpoint
 
-# ==========================================
-# 1. Configuration
-# ==========================================
-BASE_MODEL_ID = "google/translategemma-12b-it"
-ADAPTER_PATH = "./translategemma-farsi-science/dpo_final"  # Path to your trained LoRA
-TEST_DATA_PATH = "data/test_farsi_science.jsonl"
-OUTPUT_FILE = "evaluation_results.csv"
-
-# Using MetricX-23 Large.
-# MetricX scores from 0 (perfect) to 25 (terrible)
-METRICX_MODEL_ID = "google/metricx-23-large-v2p0"
-
-# Using COMET-22.
-# COMET scores from 0 to 1 (higher is better)
-COMET_MODEL_ID = "Unbabel/wmt22-comet-da"
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ==========================================
-# 2. Translation Generation Function
-# ==========================================
-def generate_translations(test_df):
-    print("Loading Translation Model...")
-    processor = AutoProcessor.from_pretrained(BASE_MODEL_ID)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_ID, device_map="auto", torch_dtype=torch.bfloat16
+# NOTE: MetricX uses a custom T5 regression architecture.
+# You need the official MetricX codebase to load it properly:
+# pip install git+https://github.com/google-research/metricx.git
+try:
+    from metricx23.models import MT5ForRegression
+except ImportError:
+    raise ImportError(
+        "Please install metricx: pip install git+https://github.com/google-research/metricx.git"
     )
-    # Apply your fine-tuned LoRA weights
-    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+
+
+def load_config(config_path="config.yaml"):
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def generate_translations(test_df, config):
+    print(f"Loading Base Model: {config['model']['base_model_id']}...")
+    processor = AutoProcessor.from_pretrained(config["model"]["base_model_id"])
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config["model"]["base_model_id"],
+        device_map=config["model"]["device_map"],
+        torch_dtype=torch.bfloat16 if config["training"]["bf16"] else torch.float16,
+    )
+
+    print(f"Applying LoRA Adapter from: {config['evaluation']['adapter_path']}...")
+    model = PeftModel.from_pretrained(base_model, config["evaluation"]["adapter_path"])
 
     hypotheses = []
+    source_lang = config["data"]["source_lang"]
+    target_lang = config["data"]["target_lang"]
 
     print("Generating Farsi translations...")
     for idx, row in test_df.iterrows():
@@ -52,8 +47,8 @@ def generate_translations(test_df):
                 "content": [
                     {
                         "type": "text",
-                        "source_lang_code": "en",
-                        "target_lang_code": "fa",
+                        "source_lang_code": source_lang,
+                        "target_lang_code": target_lang,
                         "text": row["english"],
                     }
                 ],
@@ -68,46 +63,45 @@ def generate_translations(test_df):
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=256,
-                do_sample=False,  # Always greedy decoding for translation eval
+                do_sample=False,  # Always greedy decoding for eval
             )
 
         input_len = inputs["input_ids"].shape[-1]
         translation = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
         hypotheses.append(translation)
 
-        if idx % 10 == 0:
+        if idx % 10 == 0 and idx > 0:
             print(f"Translated {idx}/{len(test_df)}...")
 
-    # Clean up VRAM before loading evaluation models
+    # Clean up VRAM to make room for evaluation models
     del model, base_model, processor
     torch.cuda.empty_cache()
 
     return hypotheses
 
 
-# ==========================================
-# 3. Evaluation Setup
-# ==========================================
-def evaluate_metricx(sources, hypotheses, references):
-    print("\nLoading MetricX...")
-    tokenizer = AutoTokenizer.from_pretrained(METRICX_MODEL_ID)
-    model = AutoModelForSequenceClassification.from_pretrained(METRICX_MODEL_ID).to(
-        device
-    )
+def evaluate_metricx(sources, hypotheses, references, config):
+    print(f"\nLoading MetricX: {config['evaluation']['metricx_model_id']}...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained(config["evaluation"]["metricx_model_id"])
+    model = MT5ForRegression.from_pretrained(
+        config["evaluation"]["metricx_model_id"]
+    ).to(device)
     model.eval()
 
     scores = []
-    print("Scoring with MetricX (Lower is better, [0-25])...")
+    print("Scoring with MetricX-24 (Lower is better, [0-25])...")
     with torch.no_grad():
         for src, hyp, ref in zip(sources, hypotheses, references):
-            # MetricX expects inputs formatted as: "ref: {ref} hyp: {hyp} src: {src}"
+            # MetricX-24 Hybrid expects inputs formatted as: "ref: {ref} hyp: {hyp} src: {src}"
             input_text = f"ref: {ref} hyp: {hyp} src: {src}"
             inputs = tokenizer(
                 input_text, return_tensors="pt", truncation=True, max_length=1024
             ).to(device)
 
             output = model(**inputs)
-            # Clip between 0 and 25 as per MetricX design
+            # MetricX-24 scores are strictly clamped between 0 and 25
             score = torch.clamp(output.logits, min=0.0, max=25.0).item()
             scores.append(score)
 
@@ -116,51 +110,55 @@ def evaluate_metricx(sources, hypotheses, references):
     return scores
 
 
-def evaluate_comet(sources, hypotheses, references):
-    print("\nLoading COMET...")
-    model_path = download_model(COMET_MODEL_ID)
+def evaluate_comet(sources, hypotheses, references, config):
+    print(f"\nLoading COMET: {config['evaluation']['comet_model_id']}...")
+    model_path = download_model(config["evaluation"]["comet_model_id"])
     model = load_from_checkpoint(model_path)
 
-    data = []
-    for src, hyp, ref in zip(sources, hypotheses, references):
-        data.append({"src": src, "mt": hyp, "ref": ref})
+    data = [
+        {"src": src, "mt": hyp, "ref": ref}
+        for src, hyp, ref in zip(sources, hypotheses, references)
+    ]
 
     print("Scoring with COMET (Higher is better, [0-1])...")
-    model_output = model.predict(data, batch_size=8, gpus=1 if device == "cuda" else 0)
+    device = 1 if torch.cuda.is_available() else 0
+    model_output = model.predict(
+        data, batch_size=config["evaluation"]["comet_batch_size"], gpus=device
+    )
 
     del model
     torch.cuda.empty_cache()
 
-    # model_output.scores contains segment-level scores
-    # model_output.system_score contains the system-level average
     return model_output.scores, model_output.system_score
 
 
-# ==========================================
-# 4. Main Execution
-# ==========================================
 if __name__ == "__main__":
-    # Load your held-out test dataset
-    print(f"Loading test data from {TEST_DATA_PATH}...")
-    test_df = pd.read_json(TEST_DATA_PATH, lines=True)
+    config = load_config()
+
+    test_path = config["data"]["test_dataset_path"]
+    print(f"Loading test data from {test_path}...")
+    test_df = pd.read_json(test_path, lines=True)
 
     sources = test_df["english"].tolist()
     references = test_df["farsi"].tolist()
 
     # 1. Generate translations
-    hypotheses = generate_translations(test_df)
+    hypotheses = generate_translations(test_df, config)
     test_df["generated_farsi"] = hypotheses
 
-    # 2. Score with MetricX (Reference-based)
-    metricx_scores = evaluate_metricx(sources, hypotheses, references)
+    # 2. Score with MetricX
+    metricx_scores = evaluate_metricx(sources, hypotheses, references, config)
     test_df["metricx_score"] = metricx_scores
 
-    # 3. Score with COMET (Reference-based)
-    comet_scores, comet_system_score = evaluate_comet(sources, hypotheses, references)
+    # 3. Score with COMET
+    comet_scores, comet_system_score = evaluate_comet(
+        sources, hypotheses, references, config
+    )
     test_df["comet_score"] = comet_scores
 
     # 4. Save and summarize
-    test_df.to_csv(OUTPUT_FILE, index=False)
+    output_file = config["evaluation"]["output_file"]
+    test_df.to_csv(output_file, index=False)
 
     print("\n" + "=" * 40)
     print("EVALUATION COMPLETE")
@@ -169,4 +167,4 @@ if __name__ == "__main__":
         f"MetricX System Score (0-25, LOWER is better): {sum(metricx_scores)/len(metricx_scores):.4f}"
     )
     print(f"COMET System Score (0-1, HIGHER is better): {comet_system_score:.4f}")
-    print(f"\nDetailed segment scores saved to {OUTPUT_FILE}")
+    print(f"\nDetailed segment scores saved to {output_file}")

@@ -7,7 +7,8 @@ model:
 
 data:
   sft_dataset_path: "data/sft_farsi_science.jsonl"
-  dpo_dataset_path: "data/dpo_farsi_science.jsonl" # Optional if run_dpo is false
+  dpo_dataset_path: "data/dpo_farsi_science.jsonl"
+  test_dataset_path: "data/test_farsi_science.jsonl" # Added for evaluation
   source_lang: "en"
   target_lang: "fa"
 
@@ -28,15 +29,18 @@ lora:
 
 training:
   run_sft: true
-  run_dpo: true # Set to false for minimal SFT-only run
+  run_dpo: true
   batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
   dpo_learning_rate: 5.0e-6
   epochs: 3
-  bf16: true # Recommended for Gemma models
+  bf16: true
 
-logging:
-  logs_dir: "logs" # Directory for full log files (all levels)
-  level: "INFO" # Console level: DEBUG | INFO | WARNING | ERROR
-  file_level: "DEBUG" # File always captures this level and above
+evaluation:
+  # Use dpo_final if DPO was run, otherwise sft_final
+  adapter_path: "./translategemma-farsi-science/dpo_final"
+  output_file: "evaluation_results.csv"
+  metricx_model_id: "google/metricx-24-hybrid-large-v2p6" # Updated to latest MetricX-24
+  comet_model_id: "Unbabel/wmt22-comet-da"
+  comet_batch_size: 8
