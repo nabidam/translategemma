@@ -5,7 +5,7 @@ import json
 def convert_csv_to_jsonl(
     input_csv: str,
     sft_output: str = "data/sft_farsi_science.jsonl",
-    dpo_output: str = "data/dpo_farsi_science.jsonl",
+    dpo_output: str | None = "data/dpo_farsi_science.jsonl",
 ):
     """
     Converts a raw CSV with columns ['id', 'en', 'fa', 'domain']
@@ -24,6 +24,9 @@ def convert_csv_to_jsonl(
     # Drop any rows with missing translations
     df = df.dropna(subset=["en", "fa"]).copy()
     print(f"Found {len(df)} valid translation pairs.")
+
+    if dpo_output is None:
+        return
 
     # ==========================================
     # 2. Prepare SFT Dataset
@@ -88,10 +91,18 @@ if __name__ == "__main__":
         default="data/dpo_farsi_science.jsonl",
         help="Path to write the DPO JSONL scaffold file.",
     )
+    parser.add_argument(
+        "--skip_dpo",
+        action="store_true",
+        help="Write only the SFT-compatible JSONL. Use this for a held-out test CSV.",
+    )
     args = parser.parse_args()
 
     # Ensure the parent directories for the output files exist
-    for out_path in (args.sft_output, args.dpo_output):
+    output_paths = [args.sft_output]
+    if not args.skip_dpo:
+        output_paths.append(args.dpo_output)
+    for out_path in output_paths:
         out_dir = os.path.dirname(out_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -100,5 +111,5 @@ if __name__ == "__main__":
     convert_csv_to_jsonl(
         input_csv=args.input_csv,
         sft_output=args.sft_output,
-        dpo_output=args.dpo_output,
+        dpo_output=None if args.skip_dpo else args.dpo_output,
     )
