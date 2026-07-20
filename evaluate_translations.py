@@ -1,213 +1,138 @@
-import logging
+"""Evaluate a base TranslateGemma model or a LoRA adapter on the configured test split."""
 
-import torch
+import argparse
+import json
+from pathlib import Path
+
 import pandas as pd
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+import torch
 from peft import PeftModel
-from comet import download_model, load_from_checkpoint
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
 
-# NOTE: MetricX uses a custom T5 regression architecture.
-# You need the official MetricX codebase to load it properly:
-# pip install git+https://github.com/google-research/metricx.git
-try:
-    from metricx23.models import MT5ForRegression
-except ImportError:
-    raise ImportError(
-        "Please install metricx: pip install git+https://github.com/google-research/metricx.git"
-    )
 
-
-def _make_progress():
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("ETA"),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-    )
-
-
-def generate_translations(test_df, config):
-    logger.info(f"Loading Base Model: [bold]{config['model']['base_model_id']}[/bold]")
-    processor = AutoProcessor.from_pretrained(config["model"]["base_model_id"])
-
+def generate_translations(test_df, config, adapter_path=None):
+    model_cfg, training_cfg, eval_cfg, data_cfg = config["model"], config["training"], config["evaluation"], config["data"]
+    processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"])
     base_model = AutoModelForCausalLM.from_pretrained(
-        config["model"]["base_model_id"],
-        device_map=config["model"]["device_map"],
-        torch_dtype=torch.bfloat16 if config["training"]["bf16"] else torch.float16,
+        model_cfg["base_model_id"], device_map=model_cfg["device_map"],
+        torch_dtype=torch.bfloat16 if training_cfg["bf16"] else torch.float16,
     )
-
-    logger.info(f"Applying LoRA Adapter from: [bold]{config['evaluation']['adapter_path']}[/bold]")
-    model = PeftModel.from_pretrained(base_model, config["evaluation"]["adapter_path"])
-
+    model = PeftModel.from_pretrained(base_model, adapter_path) if adapter_path else base_model
+    model.eval()
     hypotheses = []
-    source_lang = config["data"]["source_lang"]
-    target_lang = config["data"]["target_lang"]
-    total = len(test_df)
-
-    logger.info(f"Generating Farsi translations for {total} segments...")
-    with _make_progress() as progress:
-        task = progress.add_task("Translating", total=total)
-        for idx, row in test_df.iterrows():
-            # Strict TranslateGemma formatting
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "source_lang_code": source_lang,
-                            "target_lang_code": target_lang,
-                            "text": row["english"],
-                        }
-                    ],
-                }
-            ]
-
-            inputs = processor.apply_chat_template(
-                messages, add_generation_prompt=True, return_dict=True, return_tensors="pt"
-            ).to(model.device)
-
-            with torch.inference_mode():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False,  # Always greedy decoding for eval
-                )
-
-            input_len = inputs["input_ids"].shape[-1]
-            translation = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
-            hypotheses.append(translation)
-
-            progress.update(task, advance=1)
-            if idx > 0 and idx % 50 == 0:
-                logger.debug(f"Translated {idx}/{total}")
-
-    # Clean up VRAM to make room for evaluation models
+    for _, row in test_df.iterrows():
+        source = row[data_cfg["source_column"]]
+        messages = [{"role": "user", "content": [{"type": "text", "source_lang_code": data_cfg["source_lang"], "target_lang_code": data_cfg["target_lang"], "text": source}]}]
+        inputs = processor.apply_chat_template(messages, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            generation_kwargs = {
+                "max_new_tokens": eval_cfg["max_new_tokens"], "do_sample": eval_cfg["do_sample"],
+                "num_beams": eval_cfg["num_beams"],
+            }
+            if eval_cfg["do_sample"]:
+                generation_kwargs.update(temperature=eval_cfg["temperature"], top_p=eval_cfg["top_p"])
+            outputs = model.generate(**inputs, **generation_kwargs)
+        hypotheses.append(processor.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True))
     del model, base_model, processor
-    torch.cuda.empty_cache()
-    logger.info("Translation generation complete; VRAM cleared.")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return hypotheses
 
 
 def evaluate_metricx(sources, hypotheses, references, config):
-    logger.info(f"Loading MetricX: [bold]{config['evaluation']['metricx_model_id']}[/bold]")
+    try:
+        from metricx23.models import MT5ForRegression
+    except ImportError as error:
+        raise ImportError("Install MetricX or set evaluation.metricx_enabled: false.") from error
+    eval_cfg = config["evaluation"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"MetricX device: {device}")
-
-    tokenizer = AutoTokenizer.from_pretrained(config["evaluation"]["metricx_model_id"])
-    model = MT5ForRegression.from_pretrained(
-        config["evaluation"]["metricx_model_id"]
-    ).to(device)
-    model.eval()
-
+    tokenizer = AutoTokenizer.from_pretrained(eval_cfg["metricx_model_id"])
+    model = MT5ForRegression.from_pretrained(eval_cfg["metricx_model_id"]).to(device).eval()
     scores = []
-    total = len(sources)
-    logger.info("Scoring with MetricX-24 (Lower is better, [0-25])...")
-    with _make_progress() as progress:
-        task = progress.add_task("MetricX", total=total)
-        with torch.no_grad():
-            for src, hyp, ref in zip(sources, hypotheses, references):
-                # MetricX-24 Hybrid expects inputs formatted as: "ref: {ref} hyp: {hyp} src: {src}"
-                input_text = f"ref: {ref} hyp: {hyp} src: {src}"
-                inputs = tokenizer(
-                    input_text, return_tensors="pt", truncation=True, max_length=1024
-                ).to(device)
-
-                output = model(**inputs)
-                # MetricX-24 scores are strictly clamped between 0 and 25
-                score = torch.clamp(output.logits, min=0.0, max=25.0).item()
-                scores.append(score)
-                progress.update(task, advance=1)
-
+    with torch.inference_mode():
+        for source, hypothesis, reference in zip(sources, hypotheses, references):
+            inputs = tokenizer(f"ref: {reference} hyp: {hypothesis} src: {source}", return_tensors="pt", truncation=True, max_length=eval_cfg["metricx_max_length"]).to(device)
+            scores.append(torch.clamp(model(**inputs).logits, min=0.0, max=25.0).item())
     del model, tokenizer
-    torch.cuda.empty_cache()
-    logger.info(f"MetricX done. mean={sum(scores)/len(scores):.4f}" if scores else "MetricX done (empty)")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return scores
 
 
 def evaluate_comet(sources, hypotheses, references, config):
-    logger.info(f"Loading COMET: [bold]{config['evaluation']['comet_model_id']}[/bold]")
-    model_path = download_model(config["evaluation"]["comet_model_id"])
-    model = load_from_checkpoint(model_path)
-
-    data = [
-        {"src": src, "mt": hyp, "ref": ref}
-        for src, hyp, ref in zip(sources, hypotheses, references)
-    ]
-
-    logger.info("Scoring with COMET (Higher is better, [0-1])...")
-    device = 1 if torch.cuda.is_available() else 0
-    logger.info(f"COMET gpus={device}, batch_size={config['evaluation']['comet_batch_size']}")
-    model_output = model.predict(
-        data, batch_size=config["evaluation"]["comet_batch_size"], gpus=device
-    )
-
+    from comet import download_model, load_from_checkpoint
+    eval_cfg = config["evaluation"]
+    model = load_from_checkpoint(download_model(eval_cfg["comet_model_id"]))
+    data = [{"src": source, "mt": hypothesis, "ref": reference} for source, hypothesis, reference in zip(sources, hypotheses, references)]
+    output = model.predict(data, batch_size=eval_cfg["comet_batch_size"], gpus=eval_cfg["comet_gpus"] if torch.cuda.is_available() else 0)
     del model
-    torch.cuda.empty_cache()
-    logger.info(f"COMET done. system_score={model_output.system_score:.4f}")
-    return model_output.scores, model_output.system_score
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return output.scores, output.system_score
+
+
+def _write_human_review_sample(results, config, output_dir, prefix):
+    data_cfg, eval_cfg = config["data"], config["evaluation"]
+    domain_column = data_cfg["domain_column"]
+    sample = (results.groupby(domain_column, group_keys=False)
+              .apply(lambda group: group.sample(n=min(len(group), eval_cfg["human_review_samples_per_domain"]), random_state=eval_cfg["human_review_seed"]))
+              .reset_index(drop=True))
+    columns = [column for column in [data_cfg["id_column"], domain_column, data_cfg["source_column"], data_cfg["target_column"], "generated_farsi", "metricx_score", "comet_score"] if column in sample]
+    sample[columns].to_csv(output_dir / f"{prefix}_{eval_cfg['human_review_filename']}", index=False)
+
+
+def _run_one(config, adapter_path, prefix):
+    data_cfg, eval_cfg = config["data"], config["evaluation"]
+    test_df = pd.read_json(data_cfg["test_dataset_path"], lines=True)
+    required = {data_cfg["source_column"], data_cfg["target_column"], data_cfg["domain_column"]}
+    if missing := required - set(test_df.columns):
+        raise ValueError(f"Test dataset is missing columns: {sorted(missing)}")
+    sources, references = test_df[data_cfg["source_column"]].tolist(), test_df[data_cfg["target_column"]].tolist()
+    results = test_df.copy()
+    results["generated_farsi"] = generate_translations(test_df, config, adapter_path)
+    summary = {"label": prefix, "examples": len(results), "adapter_path": adapter_path}
+    if eval_cfg["metricx_enabled"]:
+        results["metricx_score"] = evaluate_metricx(sources, results["generated_farsi"].tolist(), references, config)
+        summary["metricx_mean_lower_is_better"] = float(results["metricx_score"].mean())
+    if eval_cfg["comet_enabled"]:
+        scores, system_score = evaluate_comet(sources, results["generated_farsi"].tolist(), references, config)
+        results["comet_score"] = scores
+        summary["comet_system_score_higher_is_better"] = float(system_score)
+    output_dir = Path(eval_cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results.to_csv(output_dir / f"{prefix}_{eval_cfg['detailed_filename']}", index=False)
+    _write_human_review_sample(results, config, output_dir, prefix)
+    return summary
+
+
+def run_evaluation(config, adapter_path=None):
+    eval_cfg = config["evaluation"]
+    adapter_path = adapter_path or eval_cfg["adapter_path"]
+    if not adapter_path:
+        raise ValueError("Provide an adapter path or set evaluation.adapter_path before adapter evaluation.")
+    summaries = []
+    if eval_cfg["run_baseline"]:
+        summaries.append(_run_one(config, None, eval_cfg["baseline_prefix"]))
+    summaries.append(_run_one(config, adapter_path, eval_cfg["adapter_prefix"]))
+    output_path = Path(eval_cfg["output_dir"]) / eval_cfg["summary_filename"]
+    output_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print_json(json.dumps(summaries, ensure_ascii=False))
+    logger.info("Evaluation results saved to %s", output_path)
+    return summaries
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--adapter-path", default=None)
+    args = parser.parse_args()
+    config = load_config(args.config)
+    setup_logging(config, run_name="evaluation")
+    log_config_summary(config)
+    run_evaluation(config, args.adapter_path)
 
 
 if __name__ == "__main__":
-    config = load_config()
-    setup_logging(config, run_name=None)
-    log_config_summary(config)
-
-    try:
-        test_path = config["data"]["test_dataset_path"]
-        logger.info(f"Loading test data from [bold]{test_path}[/bold]")
-        test_df = pd.read_json(test_path, lines=True)
-        logger.info(f"Loaded {len(test_df)} test segments")
-
-        sources = test_df["english"].tolist()
-        references = test_df["farsi"].tolist()
-
-        # 1. Generate translations
-        hypotheses = generate_translations(test_df, config)
-        test_df["generated_farsi"] = hypotheses
-
-        # 2. Score with MetricX
-        metricx_scores = evaluate_metricx(sources, hypotheses, references, config)
-        test_df["metricx_score"] = metricx_scores
-
-        # 3. Score with COMET
-        comet_scores, comet_system_score = evaluate_comet(
-            sources, hypotheses, references, config
-        )
-        test_df["comet_score"] = comet_scores
-
-        # 4. Save and summarize
-        output_file = config["evaluation"]["output_file"]
-        test_df.to_csv(output_file, index=False)
-        logger.info(f"Saved detailed segment scores to [bold]{output_file}[/bold]")
-
-        console.rule("[bold green]EVALUATION COMPLETE[/bold green]")
-        avg_metricx = sum(metricx_scores) / len(metricx_scores) if metricx_scores else 0.0
-        logger.info(
-            f"MetricX System Score (0-25, LOWER is better): [bold]{avg_metricx:.4f}[/bold]"
-        )
-        logger.info(
-            f"COMET System Score (0-1, HIGHER is better): [bold]{comet_system_score:.4f}[/bold]"
-        )
-    except Exception:
-        logger.exception("Evaluation failed.")
-        raise
+    main()
