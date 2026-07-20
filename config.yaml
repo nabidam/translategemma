@@ -1,16 +1,44 @@
-# config.yaml
+# Every path and training/evaluation decision is configured here. Keep this file with
+# the output adapters so a run can be reproduced.
 model:
-  base_model_id: "google/translategemma-12b-it" # Or 4b-it / 27b-it
+  base_model_id: "google/translategemma-12b-it"
   output_dir: "./translategemma-farsi-science"
+  sft_checkpoint_subdir: "sft"
+  sft_final_subdir: "sft_final"
+  dpo_checkpoint_subdir: "dpo"
+  dpo_final_subdir: "dpo_final"
+  run_metadata_filename: "run_metadata.json"
   device_map: "auto"
   use_4bit: true
 
 data:
-  sft_dataset_path: "data/sft_farsi_science.jsonl"
-  dpo_dataset_path: "data/dpo_farsi_science.jsonl"
-  test_dataset_path: "data/test_farsi_science.jsonl" # Added for evaluation
+  train_sft_dataset_path: "data/splits/train.jsonl"
+  validation_sft_dataset_path: "data/splits/validation.jsonl" # Set null for train-only runs.
+  test_dataset_path: "data/splits/test.jsonl" # Set null and disable run_after_training when no test split exists.
+  dpo_train_dataset_path: "data/dpo_train_farsi_science.jsonl"
   source_lang: "en"
   target_lang: "fa"
+  source_column: "english"
+  target_column: "farsi"
+  id_column: "id"
+  domain_column: "domain"
+
+# Used only by split_dataset.py, never by train.py. Splitting by the document part of
+# id (for example, "42" in "42:17") prevents adjacent segments leaking across splits.
+splitting:
+  input_dataset_path: "data/sft_farsi_science.jsonl"
+  output_dir: "data/splits"
+  train_filename: "train.jsonl"
+  validation_filename: "validation.jsonl"
+  test_filename: "test.jsonl"
+  group_id_delimiter: ":"
+  train_ratio: 0.90
+  validation_ratio: 0.05 # May be 0; no validation file is written.
+  test_ratio: 0.05 # May be 0; no test file is written. If both are 0, input is copied to train.
+  seed: 42
+  deduplicate_by_source: true
+  stratify_by_domain: true
+  manifest_filename: "split_manifest.json"
 
 lora:
   r: 16
@@ -30,22 +58,60 @@ lora:
 training:
   run_sft: true
   run_dpo: false
+  seed: 42
   batch_size: 4
+  eval_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
   dpo_learning_rate: 5.0e-6
+  dpo_epochs: 1
+  dpo_beta: 0.1
   epochs: 3
   bf16: true
+  max_length: 2048
+  truncation_side: "right"
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: "cosine"
+  logging_steps: 10
+  evaluation_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 2
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  resume_from_checkpoint: null
+  dataloader_num_workers: 2
+  optimizer: "paged_adamw_32bit"
+  report_to: "none"
 
 evaluation:
-  # Use dpo_final if DPO was run, otherwise sft_final
-  adapter_path: "./translategemma-farsi-science/dpo_final"
-  output_file: "evaluation_results.csv"
-  metricx_model_id: "google/metricx-24-hybrid-large-v2p6" # Updated to latest MetricX-24
+  run_after_training: true
+  run_baseline: true
+  adapter_path: null # Set only when evaluating an existing adapter directly.
+  output_dir: "evaluation"
+  adapter_prefix: "adapter"
+  baseline_prefix: "base"
+  detailed_filename: "detailed_scores.csv"
+  summary_filename: "summary.json"
+  human_review_filename: "human_review_sample.csv"
+  human_review_seed: 42
+  max_new_tokens: 1024
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  num_beams: 1
+  metricx_enabled: true
+  metricx_model_id: "google/metricx-24-hybrid-large-v2p6"
+  metricx_max_length: 1024
+  comet_enabled: true
   comet_model_id: "Unbabel/wmt22-comet-da"
   comet_batch_size: 8
+  comet_gpus: 1
+  human_review_samples_per_domain: 15
 
 logging:
-  logs_dir: "logs" # Directory for full log files (all levels)
-  level: "INFO" # Console level: DEBUG | INFO | WARNING | ERROR
-  file_level: "DEBUG" # File always captures this level and above
+  logs_dir: "logs"
+  level: "INFO"
+  file_level: "DEBUG"
