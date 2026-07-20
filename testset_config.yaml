@@ -1,0 +1,97 @@
+# ============================================================
+# Test-set builder configuration
+# All knobs for build_test_set.py live here.
+# ============================================================
+
+input:
+  csv_path: "preprocessed_translations.csv" # columns: id, en, fa, domain
+  # id format: "documentId:chunkId" — used for document-level holdout
+  id_separator: ":"
+  source_lang_col: "en" # which column is the SOURCE for length/feature stats
+  target_lang_col: "fa"
+
+output:
+  dir: "testset_output"
+  test_file: "test_set.csv"
+  dev_file: "dev_set.csv" # only written if splits.dev_test_split = true
+  train_pool_file: "train_pool.csv" # everything NOT selected (safe to train on)
+  report_file: "selection_report.json"
+  manifest_file: "MANIFEST.json" # sha256 hashes for freezing/versioning
+
+selection:
+  total_size: 1000
+  seed: 42
+
+  # --- Domain allocation -------------------------------------
+  # "proportional": mirror corpus proportions
+  # "flattened":    interpolate between proportional and uniform
+  #                 (alpha=0 -> proportional, alpha=1 -> uniform)
+  domain_allocation: "flattened"
+  flatten_alpha: 0.5
+  min_per_domain: 50 # domains that can't reach this get all their rows (with a warning)
+
+  # --- Length buckets (token counts on source_lang_col) ------
+  length_buckets: [0, 15, 40, 80, 999999] # edges -> buckets [0-15), [15-40), [40-80), [80+)
+  # target share of each length bucket inside every domain (must sum to 1.0)
+  length_bucket_shares: [0.20, 0.35, 0.30, 0.15]
+
+  # --- Hard-phenomena minimum quotas (fraction of total_size) -
+  # Selection guarantees AT LEAST this fraction of rows carry each flag,
+  # topping up after the stratified fill if needed.
+  hard_phenomena_min_share:
+    has_math: 0.08
+    has_numbers_units: 0.15
+    has_acronyms: 0.15
+    has_mixed_script: 0.10
+  # terminology novelty: min share of rows whose rare-term score is in the
+  # top quantile of the corpus
+  rare_term_top_quantile: 0.90
+  rare_term_min_share: 0.10
+  max_test_documents: 30 # or null to disable (old behavior)
+
+features:
+  # token frequency threshold used for the rare-term score:
+  # a token is "rare" if its corpus count <= rare_token_max_count
+  rare_token_max_count: 3
+
+dedup:
+  enabled: true
+  # exact dedup is always on; these control near-duplicate removal
+  minhash_enabled: true
+  minhash_threshold: 0.85 # Jaccard threshold on word 3-shingles
+  embedding_dedup_enabled: true
+  embedding_cosine_threshold: 0.95
+
+embeddings:
+  enabled: true # if false, falls back to TF-IDF vectors
+  model: "sentence-transformers/LaBSE"
+  batch_size: 64
+  device: "auto" # "auto" | "cpu" | "cuda"
+  cache_path: "testset_output/embeddings.npy" # cached so re-runs are fast; keyed by data hash
+
+diversity:
+  # per-cell selection strategy: "kcenter" (farthest-point greedy) or "random"
+  strategy: "kcenter"
+
+contamination:
+  # Held out at DOCUMENT level: no document may appear in both
+  # test/dev and the remaining train pool.
+  document_level_holdout: true
+  # After selection, drop from the train pool any row whose embedding cosine
+  # similarity to a selected test/dev row exceeds this (cross-document leakage:
+  # same abstract in a paper and a thesis, boilerplate, etc.)
+  near_dup_cosine_threshold: 0.92
+  near_dup_check_enabled: true
+
+splits:
+  dev_test_split: true
+  dev_fraction: 0.5 # of total_size; stratified by domain x length bucket
+
+gold_subset:
+  enabled: true
+  size: 120 # rows flagged human_verify=true, spread across domains
+
+logging:
+  logs_dir: "logs"
+  level: "INFO"
+  file_level: "DEBUG"
