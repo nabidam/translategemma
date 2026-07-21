@@ -1,10 +1,13 @@
 """Config-driven QLoRA training for scientific English-to-Farsi TranslateGemma."""
 
 import argparse
+import copy
 import importlib.metadata
 import inspect
 import json
+import logging
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,7 +80,15 @@ def format_translategemma_message(source, target, source_lang, target_lang):
     ]
 
 
-def load_sft_split(path, config, split_name):
+def limit_dataset(dataset, max_examples, split_name):
+    """Return at most max_examples rows, preserving the dataset's order."""
+    if max_examples is None or len(dataset) <= max_examples:
+        return dataset
+    logger.info("Limiting %s split from %s to %s examples.", split_name, len(dataset), max_examples)
+    return dataset.select(range(max_examples))
+
+
+def load_sft_split(path, config, split_name, max_examples=None):
     data_cfg = config["data"]
     dataset = load_dataset("json", data_files=path, split="train")
     required = {data_cfg["source_column"], data_cfg["target_column"]}
@@ -86,6 +97,7 @@ def load_sft_split(path, config, split_name):
         raise ValueError(f"{split_name} dataset {path} is missing columns: {sorted(missing)}")
     if not len(dataset):
         raise ValueError(f"{split_name} dataset {path} contains no examples")
+    dataset = limit_dataset(dataset, max_examples, split_name)
     logger.info("Loaded %s split: %s examples from %s", split_name, len(dataset), path)
     return dataset
 
@@ -180,7 +192,7 @@ def setup_model_and_processor(config):
     return model, processor
 
 
-def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_dataset):
+def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_dataset, max_steps=None):
     cfg = config["training"]
     args = {
         "output_dir": str(output_dir), "per_device_train_batch_size": cfg["batch_size"],
@@ -197,6 +209,8 @@ def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_
     }
     evaluation_key = "eval_strategy" if "eval_strategy" in inspect.signature(TrainingArguments).parameters else "evaluation_strategy"
     args[evaluation_key] = cfg["evaluation_strategy"] if has_eval_dataset else "no"
+    if max_steps is not None:
+        args["max_steps"] = max_steps
     return TrainingArguments(**args)
 
 
@@ -219,19 +233,19 @@ def write_run_metadata(config, split_sizes):
     logger.info("Run metadata saved to %s", path)
 
 
-def run_sft(model, processor, config):
+def run_sft(model, processor, config, max_examples=None, max_steps=None):
     model_cfg, data_cfg = config["model"], config["data"]
-    train_data = tokenize_sft_dataset(load_sft_split(data_cfg["train_sft_dataset_path"], config, "train"), processor, config, "train")
+    train_data = tokenize_sft_dataset(load_sft_split(data_cfg["train_sft_dataset_path"], config, "train", max_examples), processor, config, "train")
     validation_path = data_cfg["validation_sft_dataset_path"]
     validation_data = (
-        tokenize_sft_dataset(load_sft_split(validation_path, config, "validation"), processor, config, "validation")
+        tokenize_sft_dataset(load_sft_split(validation_path, config, "validation", max_examples), processor, config, "validation")
         if validation_path else None
     )
     split_sizes = {"train": len(train_data)}
     if validation_data is not None:
         split_sizes["validation"] = len(validation_data)
     write_run_metadata(config, split_sizes)
-    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None)
+    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, max_steps)
     trainer = Trainer(model=model, args=args, train_dataset=train_data, eval_dataset=validation_data,
                       data_collator=TranslationDataCollator(processor.tokenizer), callbacks=[RichLoggingCallback()])
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
@@ -242,17 +256,20 @@ def run_sft(model, processor, config):
     return model, str(save_path)
 
 
-def run_dpo(model, processor, config):
+def run_dpo(model, processor, config, max_examples=None, max_steps=None):
     data_cfg, model_cfg = config["data"], config["model"]
     dataset = load_dataset("json", data_files=data_cfg["dpo_train_dataset_path"], split="train")
     required = {data_cfg["source_column"], "farsi_chosen", "farsi_rejected"}
     if missing := required - set(dataset.column_names):
         raise ValueError(f"DPO dataset is missing columns: {sorted(missing)}")
+    if not len(dataset):
+        raise ValueError("DPO dataset contains no examples")
+    dataset = limit_dataset(dataset, max_examples, "DPO train")
     def format_dpo(example):
         prompt = format_translategemma_message(example[data_cfg["source_column"]], "", data_cfg["source_lang"], data_cfg["target_lang"])[0]
         return {"prompt": [prompt], "chosen": [{"role": "assistant", "content": example["farsi_chosen"]}], "rejected": [{"role": "assistant", "content": example["farsi_rejected"]}]}
     dataset = dataset.map(format_dpo, remove_columns=dataset.column_names)
-    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["dpo_checkpoint_subdir"], config["training"]["dpo_learning_rate"], config["training"]["dpo_epochs"], False)
+    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["dpo_checkpoint_subdir"], config["training"]["dpo_learning_rate"], config["training"]["dpo_epochs"], False, max_steps)
     trainer = DPOTrainer(model=model, args=args, beta=config["training"]["dpo_beta"], train_dataset=dataset, processing_class=processor, callbacks=[RichLoggingCallback()])
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
     save_path = Path(model_cfg["output_dir"]) / model_cfg["dpo_final_subdir"]
@@ -264,25 +281,105 @@ def run_dpo(model, processor, config):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.yaml")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--dry-run", action="store_true", help="Validate enabled data and tokenization without loading the model or writing outputs.")
+    modes.add_argument("--smoke-test", action="store_true", help="Run enabled stages with at most 10 examples and one training step in a temporary directory.")
     return parser.parse_args()
+
+
+def validate_dpo_split(path, config, max_examples=None):
+    """Load and validate the DPO schema without constructing a trainer."""
+    data_cfg = config["data"]
+    dataset = load_dataset("json", data_files=path, split="train")
+    required = {data_cfg["source_column"], "farsi_chosen", "farsi_rejected"}
+    if missing := required - set(dataset.column_names):
+        raise ValueError(f"DPO dataset is missing columns: {sorted(missing)}")
+    if not len(dataset):
+        raise ValueError("DPO dataset contains no examples")
+    return limit_dataset(dataset, max_examples, "DPO train")
+
+
+def run_dry_run(config):
+    """Check each enabled stage without model weights, output files, or training."""
+    logger.info("Dry run: validating enabled pipeline stages; no model weights or outputs will be created.")
+    processor = None
+    if config["training"]["run_sft"]:
+        processor = AutoProcessor.from_pretrained(config["model"]["base_model_id"])
+        train_data = tokenize_sft_dataset(load_sft_split(config["data"]["train_sft_dataset_path"], config, "train", 10), processor, config, "train")
+        validation_path = config["data"]["validation_sft_dataset_path"]
+        validation_data = (
+            tokenize_sft_dataset(load_sft_split(validation_path, config, "validation", 10), processor, config, "validation")
+            if validation_path else None
+        )
+        make_training_arguments(config, Path(config["model"]["output_dir"]) / config["model"]["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None)
+        logger.info("SFT preflight passed: train=%s validation=%s", len(train_data), len(validation_data) if validation_data is not None else 0)
+    if config["training"]["run_dpo"]:
+        dataset = validate_dpo_split(config["data"]["dpo_train_dataset_path"], config, 10)
+        make_training_arguments(config, Path(config["model"]["output_dir"]) / config["model"]["dpo_checkpoint_subdir"], config["training"]["dpo_learning_rate"], config["training"]["dpo_epochs"], False)
+        logger.info("DPO preflight passed: train=%s", len(dataset))
+    if config["evaluation"]["run_after_training"]:
+        test_data = load_sft_split(config["data"]["test_dataset_path"], config, "test", 10)
+        required = {config["data"]["domain_column"]}
+        if missing := required - set(test_data.column_names):
+            raise ValueError(f"Test dataset is missing columns: {sorted(missing)}")
+        logger.info("Evaluation preflight passed: test=%s", len(test_data))
+    logger.info("Dry run passed.")
+
+
+def smoke_test_config(config, output_dir):
+    """Make an isolated, bounded configuration for an end-to-end smoke test."""
+    smoke = copy.deepcopy(config)
+    smoke["model"]["output_dir"] = str(output_dir / "artifacts")
+    training = smoke["training"]
+    training.update({
+        "epochs": 1, "dpo_epochs": 1, "batch_size": min(training["batch_size"], 2),
+        "eval_batch_size": min(training["eval_batch_size"], 2), "logging_steps": 1,
+        "evaluation_strategy": "no", "save_strategy": "no", "load_best_model_at_end": False,
+        "resume_from_checkpoint": None, "dataloader_num_workers": 0,
+    })
+    evaluation = smoke["evaluation"]
+    evaluation.update({
+        "output_dir": str(output_dir / "evaluation"), "run_baseline": False,
+        "metricx_enabled": False, "comet_enabled": False, "max_new_tokens": min(evaluation["max_new_tokens"], 16),
+        "smoke_test_max_examples": 10,
+    })
+    return smoke
+
+
+def run_pipeline(config, max_examples=None, max_steps=None):
+    set_seed(config["training"]["seed"])
+    model, processor = setup_model_and_processor(config)
+    adapter_path = None
+    if config["training"]["run_sft"]:
+        model, adapter_path = run_sft(model, processor, config, max_examples, max_steps)
+    if config["training"]["run_dpo"]:
+        adapter_path = run_dpo(model, processor, config, max_examples, max_steps)
+    if config["evaluation"]["run_after_training"]:
+        del model, processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        from evaluate_translations import run_evaluation
+        run_evaluation(config, adapter_path=adapter_path)
 
 
 if __name__ == "__main__":
     args = parse_args()
     config = load_config(args.config)
-    setup_logging(config)
+    if args.dry_run:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    else:
+        setup_logging(config)
     log_config_summary(config)
     try:
-        set_seed(config["training"]["seed"])
-        model, processor = setup_model_and_processor(config)
-        adapter_path = None
-        if config["training"]["run_sft"]:
-            model, adapter_path = run_sft(model, processor, config)
-        if config["training"]["run_dpo"]:
-            adapter_path = run_dpo(model, processor, config)
-        if config["evaluation"]["run_after_training"]:
-            from evaluate_translations import run_evaluation
-            run_evaluation(config, adapter_path=adapter_path)
+        if args.dry_run:
+            run_dry_run(config)
+        elif args.smoke_test:
+            with tempfile.TemporaryDirectory(prefix="translategemma-smoke-") as temp_dir:
+                smoke_config = smoke_test_config(config, Path(temp_dir))
+                logger.info("Smoke test: at most 10 rows per split, one training step, temporary outputs in %s", temp_dir)
+                run_pipeline(smoke_config, max_examples=10, max_steps=1)
+        else:
+            run_pipeline(config)
         logger.info("Pipeline complete.")
     except Exception:
         logger.exception("Pipeline failed.")

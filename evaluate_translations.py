@@ -89,6 +89,9 @@ def _run_one(config, adapter_path, prefix):
     required = {data_cfg["source_column"], data_cfg["target_column"], data_cfg["domain_column"]}
     if missing := required - set(test_df.columns):
         raise ValueError(f"Test dataset is missing columns: {sorted(missing)}")
+    if max_examples := eval_cfg.get("smoke_test_max_examples"):
+        test_df = test_df.head(max_examples).copy()
+        logger.info("Limiting evaluation to %s examples for smoke test.", len(test_df))
     sources, references = test_df[data_cfg["source_column"]].tolist(), test_df[data_cfg["target_column"]].tolist()
     results = test_df.copy()
     results["generated_farsi"] = generate_translations(test_df, config, adapter_path)

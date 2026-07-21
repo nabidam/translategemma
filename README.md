@@ -30,6 +30,12 @@ python split_dataset.py --config config.yaml
 # 2. Train using only the configured train and validation paths.
 python train.py --config config.yaml
 
+# Optional: validate enabled inputs/template/arguments without model weights or outputs.
+python train.py --config config.yaml --dry-run
+
+# Optional: run enabled stages with ≤10 rows per split and one train step in temporary outputs.
+python train.py --config config.yaml --smoke-test
+
 # 3. Evaluate an existing adapter (or inspect final outputs again).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
 ```
