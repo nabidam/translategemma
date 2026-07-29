@@ -104,7 +104,12 @@ evaluation:
   num_beams: 1
   metricx_enabled: true
   metricx_model_id: "google/metricx-24-hybrid-large-v2p6"
-  metricx_max_length: 1024
+  # MetricX repositories contain no tokenizer files. MetricX-24 was initialised
+  # from mT5 and predict.py always tokenizes with google/mt5-xl.
+  metricx_tokenizer_id: "google/mt5-xl"
+  # MetricX-24 was trained at 1536 tokens (MetricX-23 used 1024). Raising this
+  # further produces unpredictable scores.
+  metricx_max_length: 1536
   comet_enabled: true
   comet_model_id: "Unbabel/wmt22-comet-da"
   comet_batch_size: 8

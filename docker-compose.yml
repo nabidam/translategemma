@@ -1,0 +1,75 @@
+# Interactive, fully offline TranslateGemma environment.
+#
+# Usage on the offline host:
+#   docker compose run --rm trainer            # interactive shell in /workspace
+#   docker compose run --rm trainer python train.py --config config.yaml --dry-run
+#
+# `run` is preferred over `up` because these are foreground jobs, not services.
+
+services:
+  trainer:
+    image: ${IMAGE_NAME:-translategemma}:${IMAGE_TAG:-cu130-py312}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_METRICX: ${INSTALL_METRICX:-1}
+
+    # Run as the invoking host user so adapters, logs and evaluation CSVs
+    # written into the bind mounts are not owned by root.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+    # NCCL/dataloader shared memory. `ipc: host` avoids the default 64 MB /dev/shm
+    # that makes dataloader_num_workers > 0 crash with bus errors.
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    volumes:
+      # Source, config, data and outputs: editable on the host, no rebuild needed.
+      - .:/workspace
+      # Staged model tree, produced by scripts/fetch_offline_assets.py --dest.
+      # Deliberately NOT read-only: huggingface_hub takes file locks under
+      # <cache>/.locks even on cache hits, and COMET's download_model() goes
+      # through snapshot_download() at every run.
+      - ${MODELS_DIR:-./offline_assets/models}:/models
+      # Scratch cache (XDG_CACHE_HOME / HOME) for anything that writes outside
+      # the HF tree, kept off the model mount so it can be wiped freely.
+      - ${HF_CACHE_DIR:-./offline_assets/hf_cache}:/hf_cache
+
+    environment:
+      # Hard offline. Any accidental network fetch fails loudly instead of hanging.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      # MODELS_DIR is mounted at /models and IS the HF home, so the hub cache is
+      # /models/hub — exactly where fetch_offline_assets.py --dest writes. This
+      # also covers unbabel-comet's download_model(), which calls
+      # snapshot_download(cache_dir=None) and therefore uses the default cache.
+      HF_HOME: /models
+      HUGGINGFACE_HUB_CACHE: /models/hub
+      # The container runs as a numeric uid with no /etc/passwd entry, so HOME
+      # would otherwise default to / and libraries would scatter ~/.cache there.
+      HOME: /hf_cache
+      XDG_CACHE_HOME: /hf_cache
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONUNBUFFERED: "1"
+      # Which GPUs the container sees: "all", or "0", or "0,1".
+      NVIDIA_VISIBLE_DEVICES: ${GPUS:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Blackwell (sm_120) and Ada (sm_89) both benefit from the expandable
+      # allocator on long QLoRA runs with variable sequence lengths.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -10,9 +10,15 @@ tools for a scientific English-to-Farsi TranslateGemma adapter. All run choices 
 uv venv .venv
 source .venv/bin/activate
 uv pip install -e .
+
 # MetricX is optional, but required when evaluation.metricx_enabled is true.
-uv pip install "git+https://github.com/google-research/metricx.git"
+# It has no packaging metadata, so it is used as a source checkout, not installed.
+git clone https://github.com/google-research/metricx.git ../metricx
+export PYTHONPATH="$PWD/../metricx:$PYTHONPATH"
 ```
+
+For an air-gapped machine, use the Docker environment instead — see
+[`docs/OFFLINE_DEPLOYMENT.md`](docs/OFFLINE_DEPLOYMENT.md).
 
 ## Data contract
 

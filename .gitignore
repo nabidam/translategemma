@@ -1,0 +1,27 @@
+# Staged offline artefacts: model snapshots and caches, tens of GB.
+offline_assets/
+
+# Per-machine Docker settings (UID/GID, model paths, GPU selection).
+.env
+
+# Corpora and derived splits. sft_farsi_science.jsonl alone is ~140 MB, over
+# GitHub's per-file limit, and it is transferred to the offline host alongside
+# the model tarball rather than through git.
+data/*
+!data/.gitkeep
+
+# Run outputs.
+translategemma-farsi-science/
+evaluation/
+logs/
+
+# Shipping tarballs.
+*.tar
+*.tar.zst
+*.tar.gz
+
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+.pytest_cache/

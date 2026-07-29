@@ -42,19 +42,32 @@ def generate_translations(test_df, config, adapter_path=None):
 
 
 def evaluate_metricx(sources, hypotheses, references, config):
+    """Score with a reference-based MetricX-24 hybrid model (lower is better).
+
+    The input serialisation, the stripped EOS token and the tokenizer choice all
+    follow metricx24/predict.py exactly. MetricX is sensitive to every one of
+    them: a different prompt order or a trailing EOS silently shifts the scores
+    instead of raising, so this must not be "simplified".
+    """
     try:
-        from metricx23.models import MT5ForRegression
+        from metricx24.models import MT5ForRegression
     except ImportError as error:
         raise ImportError("Install MetricX or set evaluation.metricx_enabled: false.") from error
     eval_cfg = config["evaluation"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(eval_cfg["metricx_model_id"])
-    model = MT5ForRegression.from_pretrained(eval_cfg["metricx_model_id"]).to(device).eval()
+    # MetricX checkpoints ship weights only; the tokenizer comes from the mT5
+    # model they were initialised from.
+    tokenizer = AutoTokenizer.from_pretrained(eval_cfg["metricx_tokenizer_id"])
+    model = MT5ForRegression.from_pretrained(eval_cfg["metricx_model_id"], torch_dtype="auto").to(device).eval()
     scores = []
     with torch.inference_mode():
         for source, hypothesis, reference in zip(sources, hypotheses, references):
-            inputs = tokenizer(f"ref: {reference} hyp: {hypothesis} src: {source}", return_tensors="pt", truncation=True, max_length=eval_cfg["metricx_max_length"]).to(device)
-            scores.append(torch.clamp(model(**inputs).logits, min=0.0, max=25.0).item())
+            text = f"source: {source} candidate: {hypothesis} reference: {reference}"
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=eval_cfg["metricx_max_length"], padding=False)
+            # The models were trained on inputs without a trailing EOS token.
+            inputs = {key: value[:, :-1].to(device) for key, value in inputs.items()}
+            # forward() already clamps its regression output to [0, 25].
+            scores.append(model(**inputs).predictions.item())
     del model, tokenizer
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
