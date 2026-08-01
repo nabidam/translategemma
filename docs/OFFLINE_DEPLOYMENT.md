@@ -173,8 +173,28 @@ Copy to removable media:
 translategemma-image.tar.zst      ~5-6 GB
 translategemma-models.tar.zst     ~30 GB
 translategemma-src.tar            (git archive HEAD, a few MB)
+data/sft_farsi_science.jsonl      ~140 MB  (corpus, not in the git archive)
 nvidia-*.deb / *.rpm / *.run      (only if needed)
 ```
+
+**`offline_assets/hf_cache` is deliberately not on that list.** It holds only
+machine-generated scratch — Triton's JIT kernel cache, Torch inductor artifacts,
+matplotlib's font cache — and those kernels are compiled for the *building*
+GPU's architecture, so they are useless or actively wrong on a different card.
+The container rebuilds them on first use, which is why the image carries `gcc`
+(§6.3). Nothing is ever downloaded into it: every network-sourced artefact goes
+through `HF_HOME=/models`. Create it empty on the target and leave it alone.
+
+If you want to confirm that on the staging machine before wiping it:
+
+```bash
+du -sh offline_assets/hf_cache
+find offline_assets/hf_cache -type f | head -20
+```
+
+Expect only `.triton/` and similar compiled caches. Anything resembling a model
+snapshot there means a library bypassed `HF_HOME` and the transfer list needs
+revisiting.
 
 Source snapshot. This directory is its own git repository, so `git archive`
 bundles exactly the pipeline and nothing from any parent repo. Ignored paths
@@ -223,8 +243,16 @@ printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 # Both bind targets must exist and be owned by HOST_UID *before* the first run.
 # Docker auto-creates missing bind targets as root:root, and the container runs
 # as a non-root uid, so anything writing a cache then fails with EACCES.
+# hf_cache starts EMPTY on purpose -- it is regenerated scratch, not shipped.
 mkdir -p offline_assets/hf_cache offline_assets/models
 sudo chown -R "$(id -u):$(id -g)" offline_assets
+```
+
+Also place the corpus, which travels outside the git archive:
+
+```bash
+mkdir -p data
+cp /media/usb/sft_farsi_science.jsonl data/
 ```
 
 If the weights live elsewhere on the host (a shared NFS mount, a second disk),
