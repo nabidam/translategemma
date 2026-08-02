@@ -5,8 +5,9 @@ using a shipped Docker image, with the source, models and outputs bind-mounted
 so everything stays visible and debuggable from the host.
 
 Target GPUs: **RTX 6000 Ada (sm_89)**, **RTX 5090 (sm_120)** and **RTX PRO 6000
-Blackwell (sm_120)**. One image covers all three — the `cu130` PyTorch wheels
-pinned in `pyproject.toml` ship kernels for every one of those architectures.
+Blackwell (sm_120)**. The default `cu128` image covers all three with an NVIDIA
+r570+ driver. The retained, named `cu130` image covers the same GPUs but needs
+an r580+ driver.
 
 ---
 
@@ -31,11 +32,11 @@ building anything.
 
 | Component | Minimum | Recommended | Why |
 | --- | --- | --- | --- |
-| NVIDIA driver | **580.65.06** | 580.95.05 or any newer 580/590+ branch | CUDA 13.0 (which the `cu130` wheels target) refuses to initialise below r580. Blackwell cards separately need r570+, so r580 satisfies both. |
-| nvidia-container-toolkit | **1.17.8** | 1.18.x | First release with correct Blackwell / CUDA 13 device and library injection. |
+| NVIDIA driver | **570.x** for `cu128`; **580.65.06** for `cu130` | Latest supported driver in the required branch | The default CUDA 12.8 wheels require r570+. The CUDA 13.0 image refuses to initialise below r580. |
+| nvidia-container-toolkit | **1.17.8** | 1.18.x | Supports Blackwell and current CUDA device/library injection. |
 | Docker Engine | 25.0 | 27.x or newer | Stable `--gpus` / CDI handling. |
 | Docker Compose plugin | 2.30 | 2.35+ | `deploy.resources.reservations.devices` behaviour used in `docker-compose.yml`. |
-| Host kernel | 5.15 | 6.x | Driver 580 requirement. |
+| Host kernel | 5.15 | 6.x | Meets the r570/r580 driver requirements. |
 
 Verify on the GPU host:
 
@@ -44,12 +45,15 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 docker --version && docker compose version
 ```
 
-If the driver is older than 580.65.06, you have two options:
+Choose the image that matches the installed driver:
 
-1. **Upgrade the driver** (preferred — one `.run` file, works offline).
-2. **Downgrade the CUDA target** — change `pyproject.toml` to the `cu128` index
-   and `torch==2.8.*`. That still covers sm_89 and sm_120 and only needs driver
-   r570+. Rebuild the image after the change.
+| Image tag | CUDA / PyTorch | Minimum driver | Compose selection |
+| --- | --- | --- | --- |
+| `translategemma:cu128-py312` **(default)** | CUDA 12.8 / PyTorch 2.8.0 | r570 | No changes: use `.env.example` as supplied. |
+| `translategemma:cu130-py312` | CUDA 13.0 / PyTorch 2.13.0 | r580.65.06 | Set `IMAGE_TAG=cu130-py312` and `PYTORCH_CUDA=cu130` when building. |
+
+Do not build the `cu130` tag for an r570-only host: an image can build
+successfully but cannot initialise CUDA at runtime on that driver.
 
 ---
 
@@ -57,14 +61,19 @@ If the driver is older than 580.65.06, you have two options:
 
 ### 3.1 Wheel availability (already verified)
 
-`pyproject.toml` pins `torch==2.13.0` against the `cu130` index.
-`torch-2.13.0+cu130-cp312-cp312-manylinux_2_28_x86_64.whl` is published and is
-the newest `cu130` build at the time of writing. `manylinux_2_28` needs
-glibc ≥ 2.28; the `python:3.12-slim-bookworm` base ships 2.36.
+`pyproject.toml` pins the default image to `torch==2.8.0` from the `cu128`
+index. The pipeline is text-only, so it deliberately does not install the
+optional TorchVision or TorchAudio binary extensions. This avoids unrelated
+vision-operator import failures during `transformers` initialisation.
+`torch-2.8.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl` is published. When
+`PYTORCH_CUDA=cu130`, the Docker build selects the retained Torch 2.13.0 CUDA
+13.0 configuration. Both wheel variants use `manylinux_2_28`, which needs glibc
+≥ 2.28; `python:3.12-slim-bookworm` ships 2.36.
 
 To re-check after a pin change:
 
 ```bash
+curl -s https://download.pytorch.org/whl/cu128/torch/ | grep -c 'torch-2.8.0+cu128-cp312.*manylinux'
 curl -s https://download.pytorch.org/whl/cu130/torch/ | grep -c 'torch-2.13.0+cu130-cp312.*manylinux'
 ```
 
@@ -75,28 +84,48 @@ cd translategemma
 cp .env.example .env
 printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 
+# The default cu128 Docker build installs exactly this lockfile. Create or
+# refresh it on the GPU staging host only after the import preflight passes,
+# then commit it before creating the git archive transferred offline.
+uv lock
+git add uv.lock && git commit -m "Lock CUDA 12.8 training dependencies"
+
 docker compose build trainer
 ```
 
-Expect roughly **9–11 GB** uncompressed. The build context is a single file
-(`.dockerignore` excludes everything but `pyproject.toml`), so rebuilds after a
-dependency change are the only slow ones.
+This builds the default `translategemma:cu128-py312` image. To deliberately
+build the retained CUDA 13.0 image for an r580+ host:
+
+```bash
+IMAGE_TAG=cu130-py312 PYTORCH_CUDA=cu130 docker compose build trainer
+```
+
+Expect roughly **9–11 GB** uncompressed. The build context contains only
+`pyproject.toml` and `uv.lock`, so rebuilds after a dependency change are the
+only slow ones. The default `cu128` build uses `uv sync --locked`; it fails if
+`uv.lock` does not match `pyproject.toml` rather than silently resolving newer
+packages.
 
 Sanity-check the resolved environment (no GPU needed):
 
 ```bash
-docker run --rm translategemma:cu130-py312 \
+docker run --rm translategemma:cu128-py312 \
   python -c "import torch, peft, trl, bitsandbytes; print(torch.__version__, torch.version.cuda)"
-docker run --rm translategemma:cu130-py312 cat /opt/resolved-requirements.txt
+docker run --rm translategemma:cu128-py312 cat /opt/resolved-requirements.txt
 ```
 
-`torch.version.cuda` must print `13.0`.
+`torch.version.cuda` must print `12.8`. For the named CUDA 13.0 image, replace
+the tag in both commands with `cu130-py312`; it must print `13.0`.
 
 ### 3.3 Export the image
 
 ```bash
-docker save translategemma:cu130-py312 | zstd -19 -T0 -o translategemma-image.tar.zst
+docker save translategemma:cu128-py312 | zstd -19 -T0 -o translategemma-cu128-image.tar.zst
 ```
+
+For the CUDA 13.0 image, save `translategemma:cu130-py312` as
+`translategemma-cu130-image.tar.zst`. Transfer only the image matching the GPU
+host's driver.
 
 Roughly 5–6 GB compressed. Use `gzip` if `zstd` is unavailable on either side.
 
@@ -170,7 +199,7 @@ nvidia.com — it is self-contained and installs without network access.
 Copy to removable media:
 
 ```
-translategemma-image.tar.zst      ~5-6 GB
+translategemma-cu128-image.tar.zst (or translategemma-cu130-image.tar.zst) ~5-6 GB
 translategemma-models.tar.zst     ~30 GB
 translategemma-src.tar            (git archive HEAD, a few MB)
 data/sft_farsi_science.jsonl      ~140 MB  (corpus, not in the git archive)
@@ -217,7 +246,9 @@ in git. Transfer `data/` separately, next to the model tarball.
 Only if not already present:
 
 ```bash
-sudo sh NVIDIA-Linux-x86_64-580.95.05.run      # driver
+# Default cu128 image: install a matching r570+ driver. The named cu130 image
+# instead requires r580.65.06 or newer.
+sudo sh NVIDIA-Linux-x86_64-570.xx.xx.run      # driver
 sudo dpkg -i ./*.deb                            # container toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
@@ -226,13 +257,13 @@ sudo systemctl restart docker
 Verify the GPU is visible to containers:
 
 ```bash
-docker run --rm --gpus all translategemma:cu130-py312 nvidia-smi
+docker run --rm --gpus all translategemma:cu128-py312 nvidia-smi
 ```
 
 ### 5.2 Unpack
 
 ```bash
-zstd -d -c translategemma-image.tar.zst | docker load
+zstd -d -c translategemma-cu128-image.tar.zst | docker load
 tar -xf translategemma-src.tar
 cd translategemma
 tar -I zstd -xf ../translategemma-models.tar.zst      # creates offline_assets/models
@@ -247,6 +278,17 @@ printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 mkdir -p offline_assets/hf_cache offline_assets/models
 sudo chown -R "$(id -u):$(id -g)" offline_assets
 ```
+
+For the named CUDA 13.0 image, load `translategemma-cu130-image.tar.zst` and
+set the following in `.env` before using Compose:
+
+```dotenv
+IMAGE_TAG=cu130-py312
+PYTORCH_CUDA=cu130
+```
+
+The `PYTORCH_CUDA` setting only affects image builds; retaining it alongside
+the tag makes a later `docker compose build` select the correct image variant.
 
 Also place the corpus, which travels outside the git archive:
 
@@ -404,14 +446,33 @@ compose       HF_HOME=/models, HUGGINGFACE_HUB_CACHE=/models/hub
 
 ### 6.6 `bitsandbytes` on Blackwell
 
-The image force-upgrades `bitsandbytes>=0.48.0` after the main resolve. Older
-versions lack sm_120 kernels and fail on RTX 5090 / RTX PRO 6000 with
+The image requires and locks `bitsandbytes>=0.48.0`. Older versions lack sm_120
+kernels and fail on RTX 5090 / RTX PRO 6000 with
 `no kernel image is available for execution on the device`. Do not pin it lower.
 
 ### 6.7 vLLM serving
 
 The vLLM command in `README.md` is not part of this image — `vllm` is not in
 `pyproject.toml`. Serving offline needs its own image, staged the same way.
+
+### 6.8 Transformers version boundary
+
+The image pins `transformers>=4.57.6,<5.0`. Without the upper bound, a fresh
+build can resolve Transformers v5 while other training dependencies still use
+v4 import paths, producing a misleading `Could not import module
+'BloomPreTrainedModel'` error during `import peft`. This is unrelated to CUDA,
+the NVIDIA driver, or the staged model files. Keep the v4 bound until the full
+training dependency set is validated against Transformers v5.
+
+The dependency set also pins `pyarrow<21.0.0`: `unbabel-comet` currently
+resolves `datasets` 2.14.x, whose extension APIs predate newer PyArrow
+releases. Do not remove that bound independently; upgrade and validate
+`datasets`/COMET together first.
+
+`unbabel-comet` also resolves `torchmetrics` 0.10.x through PyTorch Lightning.
+That release imports `pkg_resources`, which Setuptools 82+ no longer ships, so
+the image pins `setuptools<82.0.0`. Removing it produces
+`ModuleNotFoundError: No module named 'pkg_resources'` when importing COMET.
 
 ---
 
@@ -422,7 +483,8 @@ Failures seen while building this image on a proxied WSL/Docker Desktop host.
 ### 7.1 Building through a proxy
 
 The staging build needs ~4 GB from PyPI, `download.pytorch.org`, `deb.debian.org`
-and `codeload.github.com`. Symptoms and meanings differ:
+and `codeload.github.com`. The default download is `cu128`; a deliberate CUDA
+13.0 build downloads from `cu130`. Symptoms and meanings differ:
 
 | Message | Meaning |
 | --- | --- |

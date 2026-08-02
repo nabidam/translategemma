@@ -2,18 +2,19 @@
 #
 # Design notes (why it looks like this):
 #   * Base is plain python:3.12-slim, NOT pytorch/pytorch or nvidia/cuda. The
-#     torch cu130 wheels vendor their own CUDA 13 runtime libraries, so a CUDA
+#     torch CUDA wheels vendor their own CUDA runtime libraries, so a CUDA
 #     base image would only add a second, conflicting toolkit and ~4 GB. The
 #     host contributes the driver via nvidia-container-toolkit; nothing else.
-#   * Only pyproject.toml is copied at build time. The project source, models,
-#     data and outputs are bind-mounted at run time so scripts stay editable and
-#     debuggable on the offline host without ever rebuilding the image.
-#   * Dependencies are resolved with `uv pip install -r pyproject.toml`, which
-#     reads [project.dependencies], [[tool.uv.index]] and [tool.uv.sources]
-#     without invoking the build backend (the project itself is not installed).
+#   * Only pyproject.toml and uv.lock are copied at build time. The project
+#     source, models, data and outputs are bind-mounted at run time so scripts
+#     stay editable and debuggable on the offline host without rebuilding.
+#   * The default cu128 image is installed with `uv sync --locked`, so it uses
+#     exactly the dependency set validated before staging. The retained cu130
+#     image has no independent lockfile yet; see DEPLOYMENT_BACKLOG.md.
 #
 # Target GPUs: sm_89 (RTX 6000 Ada) and sm_120 (RTX 5090 / RTX PRO 6000
-# Blackwell). Both are covered by the cu130 wheels pinned in pyproject.toml.
+# Blackwell). Both are covered by the default cu128 wheels pinned in
+# pyproject.toml. The named cu130 image remains available via PYTORCH_CUDA.
 
 FROM python:3.12-slim-bookworm
 
@@ -41,6 +42,7 @@ RUN apt-get update -o Acquire::Retries=5 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
@@ -52,17 +54,32 @@ ENV VIRTUAL_ENV=/opt/venv \
 
 RUN uv venv --python 3.12 "$VIRTUAL_ENV"
 
-# Resolve and install project dependencies. WORKDIR matters: uv reads the
-# [tool.uv] table (pytorch-cu130 index, torch source pins) from the pyproject
-# in the working directory.
+# Resolve and install project dependencies. The project-root uv.lock is
+# required: it is the dependency set validated on the staging GPU host. The
+# default cu128 build fails if that lock is stale. The retained cu130 build
+# transforms the copied manifest and therefore still resolves from it until it
+# has a separate lock; see docs/DEPLOYMENT_BACKLOG.md.
+#
+# WORKDIR matters: uv reads the [tool.uv] table (PyTorch index and source pins)
+# from the pyproject in the working directory.
 WORKDIR /tmp/deps
-COPY pyproject.toml /tmp/deps/pyproject.toml
-RUN uv pip install -r pyproject.toml
+COPY pyproject.toml uv.lock /tmp/deps/
+ARG PYTORCH_CUDA=cu128
+RUN case "$PYTORCH_CUDA" in \
+        cu128) uv sync --locked --no-dev --no-install-project ;; \
+        cu130) \
+            sed -i \
+                -e 's/torch==2.8.0/torch==2.13.0/' \
+                -e 's/pytorch-cu128/pytorch-cu130/g' \
+                -e 's#/whl/cu128#/whl/cu130#' \
+                pyproject.toml \
+            && uv pip install -r pyproject.toml ;; \
+        *) echo "Unsupported PYTORCH_CUDA=$PYTORCH_CUDA (expected cu128 or cu130)" >&2; exit 2 ;; \
+    esac
 
-# bitsandbytes must be new enough to ship sm_120 (Blackwell) kernels; without
-# this, 4-bit QLoRA fails on RTX 5090 / RTX PRO 6000 with a "no kernel image is
-# available for execution on the device" CUDA error.
-RUN uv pip install --upgrade "bitsandbytes>=0.48.0"
+# bitsandbytes>=0.48.0 is declared in pyproject.toml and therefore locked for
+# cu128. Older versions lack sm_120 (Blackwell) kernels and fail QLoRA with
+# "no kernel image is available for execution on the device".
 
 # MetricX is optional (evaluation.metricx_enabled in config.yaml). Build with
 # --build-arg INSTALL_METRICX=0 to skip it and drop the git dependency.

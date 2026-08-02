@@ -1,4 +1,6 @@
-# The build context only needs pyproject.toml. Everything else is bind-mounted
+# The build context only needs the dependency manifest and its lockfile.
+# Everything else is bind-mounted
 # at run time, so excluding it keeps the context (and rebuild times) tiny.
 *
 !pyproject.toml
+!uv.lock

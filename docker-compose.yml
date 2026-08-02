@@ -8,12 +8,15 @@
 
 services:
   trainer:
-    image: ${IMAGE_NAME:-translategemma}:${IMAGE_TAG:-cu130-py312}
+    image: ${IMAGE_NAME:-translategemma}:${IMAGE_TAG:-cu128-py312}
     build:
       context: .
       dockerfile: Dockerfile
       args:
         INSTALL_METRICX: ${INSTALL_METRICX:-1}
+        # cu128 is the r570+ default. The retained CUDA 13.0 image is built
+        # explicitly with IMAGE_TAG=cu130-py312 PYTORCH_CUDA=cu130.
+        PYTORCH_CUDA: ${PYTORCH_CUDA:-cu128}
 
     # Run as the invoking host user so adapters, logs and evaluation CSVs
     # written into the bind mounts are not owned by root.
