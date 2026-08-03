@@ -56,6 +56,11 @@ services:
       # snapshot_download(cache_dir=None) and therefore uses the default cache.
       HF_HOME: /models
       HUGGINGFACE_HUB_CACHE: /models/hub
+      # Kept OFF the model mount on purpose. Tokenizing a multi-million-row
+      # corpus with training.tokenize_num_proc writes one Arrow shard per
+      # worker; under the HF_HOME default those land inside the staged model
+      # tree, which is the one directory that ships between machines.
+      HF_DATASETS_CACHE: /hf_cache/datasets
       # The container runs as a numeric uid with no /etc/passwd entry, so HOME
       # would otherwise default to / and libraries would scatter ~/.cache there.
       HOME: /hf_cache
@@ -65,8 +70,8 @@ services:
       # Which GPUs the container sees: "all", or "0", or "0,1".
       NVIDIA_VISIBLE_DEVICES: ${GPUS:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      # Blackwell (sm_120) and Ada (sm_89) both benefit from the expandable
-      # allocator on long QLoRA runs with variable sequence lengths.
+      # Hopper (sm_90), Blackwell (sm_120) and Ada (sm_89) all benefit from the
+      # expandable allocator on long runs with variable sequence lengths.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 
     deploy:

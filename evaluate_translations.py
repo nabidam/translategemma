@@ -10,14 +10,18 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
+from train import resolve_dtype
 
 
 def generate_translations(test_df, config, adapter_path=None):
-    model_cfg, training_cfg, eval_cfg, data_cfg = config["model"], config["training"], config["evaluation"], config["data"]
+    model_cfg, eval_cfg, data_cfg = config["model"], config["evaluation"], config["data"]
     processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"])
+    # Same model.dtype / model.attn_implementation the adapter was trained
+    # under, so evaluation never silently measures a different numeric setup.
     base_model = AutoModelForCausalLM.from_pretrained(
         model_cfg["base_model_id"], device_map=model_cfg["device_map"],
-        torch_dtype=torch.bfloat16 if training_cfg["bf16"] else torch.float16,
+        dtype=resolve_dtype(model_cfg["dtype"]),
+        attn_implementation=model_cfg["attn_implementation"],
     )
     model = PeftModel.from_pretrained(base_model, adapter_path) if adapter_path else base_model
     model.eval()

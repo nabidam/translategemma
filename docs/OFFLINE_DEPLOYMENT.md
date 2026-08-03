@@ -4,10 +4,10 @@ How to run the TranslateGemma fine-tuning pipeline on an air-gapped GPU machine
 using a shipped Docker image, with the source, models and outputs bind-mounted
 so everything stays visible and debuggable from the host.
 
-Target GPUs: **RTX 6000 Ada (sm_89)**, **RTX 5090 (sm_120)** and **RTX PRO 6000
-Blackwell (sm_120)**. The default `cu128` image covers all three with an NVIDIA
-r570+ driver. The retained, named `cu130` image covers the same GPUs but needs
-an r580+ driver.
+Target GPUs: **RTX 6000 Ada (sm_89)**, **H100 / H100 NVL (sm_90)**, **RTX 5090
+(sm_120)** and **RTX PRO 6000 Blackwell (sm_120)**. The default `cu128` image
+covers all of them with an NVIDIA r570+ driver. The retained, named `cu130`
+image covers the same GPUs but needs an r580+ driver.
 
 ---
 
@@ -93,6 +93,16 @@ git add uv.lock && git commit -m "Lock CUDA 12.8 training dependencies"
 docker compose build trainer
 ```
 
+**A stale lock is now a hard build failure, not a warning.** `liger-kernel` was
+added to `pyproject.toml` for `training.use_liger_kernel`, so a lockfile created
+before that change no longer matches and `uv sync --locked` aborts. Any
+dependency change means: `uv lock`, commit, rebuild, re-export, re-transfer.
+
+`flash-attn-3` is deliberately *not* in the image. It is declared as an optional
+`speed` extra and compiles against `nvcc`, which `python:3.12-slim` does not
+carry; `uv sync --no-dev` does not install extras, so the build is unaffected.
+`model.attn_implementation` must stay `sdpa` in this image — see §6.7.
+
 This builds the default `translategemma:cu128-py312` image. To deliberately
 build the retained CUDA 13.0 image for an r580+ host:
 
@@ -110,7 +120,7 @@ Sanity-check the resolved environment (no GPU needed):
 
 ```bash
 docker run --rm translategemma:cu128-py312 \
-  python -c "import torch, peft, trl, bitsandbytes; print(torch.__version__, torch.version.cuda)"
+  python -c "import torch, peft, trl, bitsandbytes, liger_kernel; print(torch.__version__, torch.version.cuda)"
 docker run --rm translategemma:cu128-py312 cat /opt/resolved-requirements.txt
 ```
 
@@ -208,11 +218,19 @@ nvidia-*.deb / *.rpm / *.run      (only if needed)
 
 **`offline_assets/hf_cache` is deliberately not on that list.** It holds only
 machine-generated scratch — Triton's JIT kernel cache, Torch inductor artifacts,
-matplotlib's font cache — and those kernels are compiled for the *building*
-GPU's architecture, so they are useless or actively wrong on a different card.
-The container rebuilds them on first use, which is why the image carries `gcc`
-(§6.3). Nothing is ever downloaded into it: every network-sourced artefact goes
-through `HF_HOME=/models`. Create it empty on the target and leave it alone.
+matplotlib's font cache, and the tokenized-dataset Arrow cache
+(`HF_DATASETS_CACHE`) — all of it reproducible on the target. The Triton kernels
+in particular are compiled for the *building* GPU's architecture, so they are
+useless or actively wrong on a different card. The container rebuilds them on
+first use, which is why the image carries `gcc` (§6.3). Nothing is ever
+downloaded into it: every network-sourced artefact goes through
+`HF_HOME=/models`. Create it empty on the target and leave it alone.
+
+Size it accordingly on the GPU host. The tokenized cache is the large tenant:
+the 2.7M-row corpus produces tens of GB of Arrow shards, one set per worker in
+`training.tokenize_num_proc`. It scales with the *measured* mean length (336
+tokens), not with `training.max_length`, since only truncated rows are affected
+by the cap.
 
 If you want to confirm that on the staging machine before wiping it:
 
@@ -221,9 +239,9 @@ du -sh offline_assets/hf_cache
 find offline_assets/hf_cache -type f | head -20
 ```
 
-Expect only `.triton/` and similar compiled caches. Anything resembling a model
-snapshot there means a library bypassed `HF_HOME` and the transfer list needs
-revisiting.
+Expect `.triton/`, similar compiled caches, and `datasets/`. Anything resembling
+a *model* snapshot there means a library bypassed `HF_HOME` and the transfer
+list needs revisiting.
 
 Source snapshot. This directory is its own git repository, so `git archive`
 bundles exactly the pipeline and nothing from any parent repo. Ignored paths
@@ -315,10 +333,34 @@ docker compose run --rm trainer python train.py --config config.yaml --dry-run
 
 # 2. Every enabled stage, <=10 rows per split, one optimiser step, temp outputs.
 docker compose run --rm trainer python train.py --config config.yaml --smoke-test
+
+# 3. Token-length distribution of the real corpus. Decide training.max_length
+#    from this before committing to a multi-day run.
+docker compose run --rm trainer \
+    python scripts/analyze_token_lengths.py --config config.yaml
 ```
 
-A successful `--smoke-test` proves the model loads from the offline cache, 4-bit
-quantisation works on this GPU, and the evaluation path is importable.
+A successful `--smoke-test` proves the model loads from the offline cache, the
+configured precision path (`model.use_4bit`, `model.dtype`) runs on this GPU,
+Triton compiled the Liger kernels against this architecture, and the evaluation
+path is importable.
+
+The first `--smoke-test` after loading a new image is slower than later runs:
+Triton is compiling the fused kernels into `/hf_cache/.triton` for this GPU. A
+compiler error here, rather than a CUDA error, points at §6.3.
+
+Step 3 has already been run against the current corpus and its conclusions are
+baked into `config.yaml`: mean 336 tokens, p95 1072, a thin tail to 6509, so
+`training.max_length` stays at 2048 and `training.group_by_length` is on. Re-run
+it whenever the corpus changes materially — it is cheap relative to what it
+decides, and both of those settings follow from the shape of the distribution
+rather than from a default. Full reasoning, including why lowering `max_length`
+is *not* the lever it looks like, is in
+`docs/2026-08-03_training_speed_tier1_tier2_applied.md`.
+
+The setting that still needs a decision on this host is `training.batch_size`.
+It is 4, which underuses an H100 now that the memory fixes have landed; with
+grouping on, a typical batch is far narrower than the 2048 cap implies.
 
 ### 5.4 Real runs
 
@@ -354,14 +396,29 @@ docker logs -f tg-train
 
 ### 6.1 Per-GPU memory settings
 
-QLoRA on a 12B model at `max_length: 2048` with 4-bit weights and gradient
-checkpointing needs roughly 20–26 GB.
+`model.use_4bit` now defaults to **false** — bf16 LoRA, not QLoRA. On a large
+card the 4-bit weights bought VRAM that was not scarce while adding a
+dequantisation step to every matmul. That changes the memory picture: bf16
+weights are ~24 GB before activations, against ~7 GB for the same model in NF4.
+
+Rough figures at `max_length: 2048` with gradient checkpointing on:
+
+| Configuration | Weights | Typical peak |
+| --- | --- | --- |
+| `use_4bit: true` (QLoRA) | ~7 GB | 20–26 GB |
+| `use_4bit: false` (bf16 LoRA) | ~24 GB | 34–42 GB |
 
 | GPU | VRAM | Guidance |
 | --- | --- | --- |
+| H100 / H100 NVL | 80–94 GB | Defaults fine. Prefer `use_4bit: false`. Raise `batch_size` and consider `gradient_checkpointing: false`; see the speed document. |
 | RTX PRO 6000 Blackwell | 96 GB | Defaults fine. `batch_size` can go to 8–16. |
-| RTX 6000 Ada | 48 GB | Defaults fine. |
-| RTX 5090 | 32 GB | Defaults usually fit but are close. On OOM, set `batch_size: 2` and `gradient_accumulation_steps: 8` in `config.yaml` — the effective batch is unchanged. |
+| RTX 6000 Ada | 48 GB | bf16 LoRA fits but leaves little headroom for long batches. Either lower `batch_size` or set `use_4bit: true`. |
+| RTX 5090 | 32 GB | Set `use_4bit: true`. Even then the defaults are close: on OOM use `batch_size: 2` and `gradient_accumulation_steps: 8` — the effective batch is unchanged. |
+
+`training.use_liger_kernel: true` cuts peak memory substantially on top of the
+above, because the `batch × seq × 262144` logit tensor is never materialised.
+The figures assume it is on. Turning it off may reintroduce OOMs that the
+old QLoRA defaults did not hit.
 
 Evaluation loads the base model, then the adapter, then MetricX, then COMET.
 On a 32 GB card, run evaluation as a separate step rather than via
@@ -403,7 +460,8 @@ subclasses `MT5PreTrainedModel`), change the commit SHA in the Dockerfile's
 
 ### 6.3 The image needs a C compiler at runtime
 
-Triton (pulled in by `torch`) JIT-compiles GPU kernels **while training runs**,
+Triton (pulled in by `torch`, and now used on every step by
+`training.use_liger_kernel`) JIT-compiles GPU kernels **while training runs**,
 not at build time, and shells out to a C compiler to build the launcher stubs.
 Without it:
 
@@ -411,6 +469,11 @@ Without it:
 RuntimeError: Failed to find C compiler. Please specify via CC environment
 variable or set triton.knobs.build.impl.
 ```
+
+This used to be an occasional path. With Liger enabled it is guaranteed: the
+fused cross-entropy, RMSNorm, RoPE and SwiGLU kernels are all Triton, and they
+compile on the first step of every run whose cache is cold. Symptoms of a
+missing or unwritable cache therefore appear at step 0, not at import.
 
 The image therefore installs `gcc` and `libc6-dev`. That is the entire apt
 footprint: `ca-certificates` and `tar` come with the base, `torch` and
@@ -450,12 +513,92 @@ The image requires and locks `bitsandbytes>=0.48.0`. Older versions lack sm_120
 kernels and fail on RTX 5090 / RTX PRO 6000 with
 `no kernel image is available for execution on the device`. Do not pin it lower.
 
-### 6.7 vLLM serving
+This only bites when `model.use_4bit: true`. With the current bf16 default,
+`bitsandbytes` is imported but never asked for a quantised kernel, so a
+Blackwell host can appear healthy right up until someone re-enables QLoRA.
+
+### 6.7 FlashAttention 3 is not in this image
+
+`model.attn_implementation` must remain `sdpa` here. Setting
+`flash_attention_3` raises at model load:
+
+```
+ImportError: FlashAttention3 has been toggled on, but it cannot be used due to
+the following error: the package flash_attn_3 seems to be not installed.
+```
+
+FlashAttention 3 is not a major-version upgrade of the `flash-attn` PyPI
+package. The official distribution is `flash-attn-3==3.0.0b1`, built from the
+upstream repository's `hopper/` directory; the `flash-attn-3` project currently
+visible on PyPI is an empty, yanked release and must not be used. The `speed`
+extra pins the source to upstream tag `v2.8.3.post1` and compiles it against the
+project's Torch. That requires `nvcc` — the full CUDA toolkit, roughly 3 GB,
+which `python:3.12-slim` deliberately does not carry.
+
+`uv lock` itself does not require CUDA. `[tool.uv.dependency-metadata]` records
+the metadata from the pinned `hopper/setup.py`, preventing uv from executing
+that CUDA-sensitive setup script during resolution. The CUDA requirement begins
+at `uv sync --extra speed`, when the extension is actually built.
+
+FA3 requires a Hopper-class GPU (H100/H800; compute capability >= 9.0) and CUDA
+>=12.3; upstream recommends CUDA 12.8. Keep `sdpa` on Ada/Ampere hardware.
+
+This costs less than it sounds. On Hopper, SDPA already dispatches to fused
+flash-attention kernels; the meaningful gap opens only with packed or
+padding-free batches, which this pipeline does not yet do. Adding a toolkit
+stage to the image is tracked in `DEPLOYMENT_BACKLOG.md` and is only worth doing
+alongside packing.
+
+**Nothing in the smoke test needs it.** `--dry-run`, `--smoke-test` and the
+length analysis all run on `sdpa`. If `uv sync --extra speed` is failing, skip
+the extra and validate with the plain environment; the extra is an optimisation
+to benchmark later, not a prerequisite.
+
+#### Building it on a host that does have a toolkit
+
+Two distinct failures, in the order they appear:
+
+```
+ModuleNotFoundError: No module named 'torch'
+```
+
+flash-attn-3's `setup.py` imports torch, packaging, wheel and ninja before its
+runtime dependencies can be processed, so an isolated PEP 517 build does not
+otherwise contain them.
+`pyproject.toml` now supplies it via `[tool.uv.extra-build-dependencies]` with
+an explicit `torch==2.8.0` build pin identical to the runtime pin. Do not replace
+this with `match-runtime = true`: FA3 exposes dynamic rather than static package
+metadata, so uv cannot determine the runtime requirement early enough and aborts
+before compilation. Building against a different Torch can succeed and then fail
+at import with an undefined-symbol error, which is much harder to diagnose.
+Whenever the project Torch pin changes, update both occurrences together.
+
+```
+RuntimeError: The current installed version of nvcc ... / nvcc: not found
+```
+
+The torch wheels vendor the CUDA *runtime*, not the compiler. Install a CUDA
+toolkit whose major version matches the wheels (12.x for `cu128`) and ensure
+`nvcc --version` works before retrying. This is not fixable from `pyproject.toml`.
+
+The build compiles a large set of CUDA kernels: expect 1–3 hours, and cap
+parallelism so it is not OOM-killed on a machine with limited RAM.
+
+```bash
+uv lock                              # works without a CUDA toolkit or GPU
+nvcc --version                       # must report CUDA >=12.3 before sync
+MAX_JOBS=4 uv sync --extra speed
+```
+
+Only then set `model.attn_implementation: "flash_attention_3"`, and benchmark it
+against `sdpa` rather than assuming it wins.
+
+### 6.8 vLLM serving
 
 The vLLM command in `README.md` is not part of this image — `vllm` is not in
 `pyproject.toml`. Serving offline needs its own image, staged the same way.
 
-### 6.8 Transformers version boundary
+### 6.9 Transformers version boundary
 
 The image pins `transformers>=4.57.6,<5.0`. Without the upper bound, a fresh
 build can resolve Transformers v5 while other training dependencies still use

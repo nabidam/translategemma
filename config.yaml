@@ -8,8 +8,24 @@ model:
   dpo_checkpoint_subdir: "dpo"
   dpo_final_subdir: "dpo_final"
   run_metadata_filename: "run_metadata.json"
-  device_map: "auto"
-  use_4bit: true
+  # Pin the whole model to GPU 0. "auto" is for models that do not fit on one
+  # device; on a single GPU it is free to place layers on CPU, which silently
+  # turns a training step into a PCIe round trip.
+  device_map: { "": 0 }
+  # Dtype of every parameter that is NOT 4-bit quantised: embeddings, norms and
+  # the 262k-row lm_head. Left unset, transformers loads them in float32.
+  dtype: "bfloat16"
+  # "sdpa" is the safe default and already dispatches to fused kernels on
+  # Hopper. Set "flash_attention_3" after installing the `speed` extra
+  # (see pyproject.toml). FA3 requires compute capability >= 9.0 and CUDA
+  # >= 12.3; CUDA 12.8 is recommended.
+  attn_implementation: "sdpa"
+  # QLoRA. On an H100 the 4-bit weights save VRAM you do not need and add a
+  # dequantisation step to every matmul, so bf16 LoRA is usually faster.
+  # Benchmark both; see docs/2026-08-03_training_speed_tier1_tier2_applied.md.
+  use_4bit: false
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
 
 data:
   train_sft_dataset_path: "data/splits/train.jsonl"
@@ -68,9 +84,29 @@ training:
   dpo_beta: 0.1
   epochs: 3
   bf16: true
+  # Run scripts/analyze_token_lengths.py before changing this. Every example is
+  # padded/attended up to the batch maximum, so budgeting 2048 for a corpus
+  # whose P95 is far shorter pays for tokens that carry no signal.
   max_length: 2048
   truncation_side: "right"
+  # Pads each batch up to a multiple of this many tokens so the matmul shapes
+  # stay tensor-core aligned. Set null to pad to the exact batch maximum.
+  pad_to_multiple_of: 8
+  # Batches are padded to their own longest member, so a batch drawn at random
+  # from a skewed corpus is mostly padding. Grouping similar lengths together
+  # is what makes a large batch_size worth setting; see the measured numbers in
+  # docs/2026-08-03_training_speed_tier1_tier2_applied.md. SFT only -- DPO
+  # examples are not tokenized when the sampler is built.
+  group_by_length: true
+  length_column_name: "length"
   gradient_checkpointing: true
+  # Non-reentrant checkpointing is the supported path for LoRA: the reentrant
+  # implementation drops the graph for inputs that do not require grad.
+  gradient_checkpointing_kwargs: { "use_reentrant": false }
+  # Fuses cross-entropy with the lm_head projection, so the
+  # batch x seq x 262144 logit tensor is never materialised. This is the single
+  # largest memory and time cost of training Gemma 3, ahead of attention.
+  use_liger_kernel: true
   max_grad_norm: 1.0
   warmup_ratio: 0.03
   lr_scheduler_type: "cosine"
@@ -83,8 +119,28 @@ training:
   greater_is_better: false
   resume_from_checkpoint: null
   dataloader_num_workers: 2
-  optimizer: "paged_adamw_32bit"
+  dataloader_pin_memory: true
+  # Keeps the worker processes (and their prefetch queues) alive between epochs
+  # and between evaluation passes. Ignored when dataloader_num_workers is 0.
+  dataloader_persistent_workers: true
+  # Processes used to tokenize the dataset once, before training starts. Clamped
+  # to the split size, so small dry runs stay single-process. Set null or 1 to
+  # disable multiprocessing.
+  tokenize_num_proc: 16
+  # LoRA trains ~0.5% of the parameters, so the optimizer state is small and
+  # paging it through host memory only adds synchronisation stalls.
+  optimizer: "adamw_torch_fused"
   report_to: "none"
+
+# Used only by scripts/analyze_token_lengths.py. It renders the same chat
+# template train.py uses, so the reported lengths are the lengths that will be
+# trained on, not a raw character-count proxy.
+length_analysis:
+  dataset_path: null # null means training.train_sft_dataset_path.
+  percentiles: [50, 75, 90, 95, 99, 99.9]
+  max_examples: null # Sample this many rows instead of the full split.
+  candidate_max_lengths: [512, 1024, 1536, 2048]
+  report_path: "logs/token_length_report.json"
 
 evaluation:
   run_after_training: true

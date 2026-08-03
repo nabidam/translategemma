@@ -51,16 +51,22 @@ class RichLoggingCallback(TrainerCallback):
 class TranslationDataCollator:
     """Pad pre-tokenized translations while keeping prompt labels masked with -100."""
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
         self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
 
     def __call__(self, features):
-        max_length = max(len(feature["input_ids"]) for feature in features)
         model_inputs = [
             {"input_ids": feature["input_ids"], "attention_mask": feature["attention_mask"]}
             for feature in features
         ]
-        batch = self.tokenizer.pad(model_inputs, padding=True, return_tensors="pt")
+        batch = self.tokenizer.pad(
+            model_inputs, padding=True, pad_to_multiple_of=self.pad_to_multiple_of, return_tensors="pt"
+        )
+        # Take the width from the padded batch rather than from the raw feature
+        # lengths: pad_to_multiple_of can round the batch up past the longest
+        # example, and labels must match input_ids exactly.
+        max_length = batch["input_ids"].shape[1]
         labels = []
         for feature in features:
             padding = [-100] * (max_length - len(feature["labels"]))
@@ -78,6 +84,22 @@ def format_translategemma_message(source, target, source_lang, target_lang):
         {"role": "user", "content": [{"type": "text", "source_lang_code": source_lang, "target_lang_code": target_lang, "text": source}]},
         {"role": "assistant", "content": str(target)},
     ]
+
+
+def resolve_dtype(name):
+    """Turn a config dtype name such as "bfloat16" into a torch.dtype."""
+    dtype = getattr(torch, str(name), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"model.dtype must name a torch dtype (for example bfloat16); got {name!r}")
+    return dtype
+
+
+def map_workers(requested, dataset_size):
+    """Clamp a configured process count to what datasets.map will accept."""
+    if not requested or requested <= 1:
+        return None
+    workers = min(int(requested), dataset_size)
+    return workers if workers > 1 else None
 
 
 def limit_dataset(dataset, max_examples, split_name):
@@ -151,17 +173,22 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
         return {
             "input_ids": input_ids,
             "attention_mask": [1] * len(input_ids),
+            # Read by Trainer's LengthGroupedSampler via
+            # training.length_column_name. Recorded post-truncation, which is
+            # the width this example actually contributes to its batch.
+            train_cfg["length_column_name"]: len(input_ids),
             "labels": [-100] * prompt_length + input_ids[prompt_length:],
             "has_target": len(input_ids) > prompt_length,
             "was_truncated": was_truncated,
         }
 
-    tokenized = dataset.map(tokenize_example, remove_columns=dataset.column_names, desc=f"Tokenizing {split_name}")
+    num_proc = map_workers(train_cfg["tokenize_num_proc"], len(dataset))
+    tokenized = dataset.map(tokenize_example, remove_columns=dataset.column_names, num_proc=num_proc, desc=f"Tokenizing {split_name}")
     truncated = sum(tokenized["was_truncated"])
     without_target = len(tokenized) - sum(tokenized["has_target"])
     if without_target:
         logger.warning("%s examples in %s contain no target tokens at max_length=%s and will be excluded.", without_target, split_name, max_length)
-        tokenized = tokenized.filter(lambda example: example["has_target"], desc=f"Filtering {split_name}")
+        tokenized = tokenized.filter(lambda example: example["has_target"], num_proc=num_proc, desc=f"Filtering {split_name}")
     if not len(tokenized):
         raise ValueError(f"No usable {split_name} examples remain after tokenization.")
     logger.info("%s tokenized: examples=%s truncated=%s (%.2f%%), max_length=%s", split_name, len(tokenized), truncated, 100 * truncated / (len(tokenized) + without_target), max_length)
@@ -170,16 +197,39 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
 
 def setup_model_and_processor(config):
     model_cfg, train_cfg = config["model"], config["training"]
-    processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"])
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=model_cfg["use_4bit"], bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16 if train_cfg["bf16"] else torch.float16,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["base_model_id"], quantization_config=bnb_config, device_map=model_cfg["device_map"]
-    )
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=train_cfg["gradient_checkpointing"])
+    processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"], use_fast=True)
+    # Without an explicit dtype, transformers materialises every unquantised
+    # parameter in float32 -- embeddings, norms and a 262k-row lm_head.
+    dtype = resolve_dtype(model_cfg["dtype"])
+    # model.dtype and training.bf16 describe the same decision from two angles
+    # (parameter storage and autocast). Disagreeing values cast on every matmul.
+    if (dtype == torch.bfloat16) != bool(train_cfg["bf16"]):
+        raise ValueError(f"model.dtype={model_cfg['dtype']!r} contradicts training.bf16={train_cfg['bf16']}.")
+    load_kwargs = {
+        "dtype": dtype,
+        "device_map": model_cfg["device_map"],
+        "attn_implementation": model_cfg["attn_implementation"],
+    }
+    if model_cfg["use_4bit"]:
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=model_cfg["bnb_4bit_use_double_quant"],
+            bnb_4bit_quant_type=model_cfg["bnb_4bit_quant_type"],
+            bnb_4bit_compute_dtype=dtype,
+        )
+    logger.info("Loading %s: dtype=%s 4bit=%s attn=%s", model_cfg["base_model_id"], dtype, model_cfg["use_4bit"], model_cfg["attn_implementation"])
+    model = AutoModelForCausalLM.from_pretrained(model_cfg["base_model_id"], **load_kwargs)
+    if model_cfg["use_4bit"]:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=train_cfg["gradient_checkpointing"],
+            gradient_checkpointing_kwargs=train_cfg["gradient_checkpointing_kwargs"],
+        )
+    elif train_cfg["gradient_checkpointing"]:
+        # prepare_model_for_kbit_training does this for the quantised path. The
+        # frozen embedding output must require grad or checkpointed blocks have
+        # no graph to recompute through, and the LoRA adapters get no gradient.
+        model.enable_input_require_grads()
     if train_cfg["gradient_checkpointing"]:
         model.config.use_cache = False
     lora_cfg = LoraConfig(
@@ -192,7 +242,7 @@ def setup_model_and_processor(config):
     return model, processor
 
 
-def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_dataset, max_steps=None):
+def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_dataset, max_steps=None, group_by_length=False):
     cfg = config["training"]
     args = {
         "output_dir": str(output_dir), "per_device_train_batch_size": cfg["batch_size"],
@@ -203,7 +253,18 @@ def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_
         "metric_for_best_model": cfg["metric_for_best_model"], "greater_is_better": cfg["greater_is_better"],
         "warmup_ratio": cfg["warmup_ratio"], "lr_scheduler_type": cfg["lr_scheduler_type"],
         "max_grad_norm": cfg["max_grad_norm"], "gradient_checkpointing": cfg["gradient_checkpointing"],
+        "gradient_checkpointing_kwargs": cfg["gradient_checkpointing_kwargs"],
         "seed": cfg["seed"], "data_seed": cfg["seed"], "dataloader_num_workers": cfg["dataloader_num_workers"],
+        "dataloader_pin_memory": cfg["dataloader_pin_memory"],
+        # persistent_workers is only meaningful with worker processes, and
+        # TrainingArguments rejects the combination outright.
+        "dataloader_persistent_workers": cfg["dataloader_persistent_workers"] and cfg["dataloader_num_workers"] > 0,
+        "use_liger_kernel": cfg["use_liger_kernel"],
+        # Off unless the caller tokenized the split and can therefore supply
+        # length_column_name. Left on for an untokenized dataset, Trainer falls
+        # back to deriving lengths from the raw features and fails.
+        "group_by_length": group_by_length,
+        "length_column_name": cfg["length_column_name"],
         "optim": cfg["optimizer"], "report_to": cfg["report_to"], "logging_first_step": True,
         "remove_unused_columns": False,
     }
@@ -245,9 +306,10 @@ def run_sft(model, processor, config, max_examples=None, max_steps=None):
     if validation_data is not None:
         split_sizes["validation"] = len(validation_data)
     write_run_metadata(config, split_sizes)
-    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, max_steps)
+    args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, max_steps, group_by_length=config["training"]["group_by_length"])
     trainer = Trainer(model=model, args=args, train_dataset=train_data, eval_dataset=validation_data,
-                      data_collator=TranslationDataCollator(processor.tokenizer), callbacks=[RichLoggingCallback()])
+                      data_collator=TranslationDataCollator(processor.tokenizer, config["training"]["pad_to_multiple_of"]),
+                      callbacks=[RichLoggingCallback()])
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
     save_path = Path(model_cfg["output_dir"]) / model_cfg["sft_final_subdir"]
     trainer.save_model(save_path)
@@ -311,7 +373,7 @@ def run_dry_run(config):
             tokenize_sft_dataset(load_sft_split(validation_path, config, "validation", 10), processor, config, "validation")
             if validation_path else None
         )
-        make_training_arguments(config, Path(config["model"]["output_dir"]) / config["model"]["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None)
+        make_training_arguments(config, Path(config["model"]["output_dir"]) / config["model"]["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, group_by_length=config["training"]["group_by_length"])
         logger.info("SFT preflight passed: train=%s validation=%s", len(train_data), len(validation_data) if validation_data is not None else 0)
     if config["training"]["run_dpo"]:
         dataset = validate_dpo_split(config["data"]["dpo_train_dataset_path"], config, 10)
@@ -336,6 +398,11 @@ def smoke_test_config(config, output_dir):
         "eval_batch_size": min(training["eval_batch_size"], 2), "logging_steps": 1,
         "evaluation_strategy": "no", "save_strategy": "no", "load_best_model_at_end": False,
         "resume_from_checkpoint": None, "dataloader_num_workers": 0,
+        # Ten rows do not justify a process pool, and the pool's startup cost
+        # dominates the smoke test. use_liger_kernel is deliberately left as
+        # configured: whether the fused kernels bind to this model is exactly
+        # the kind of failure a smoke test should surface.
+        "tokenize_num_proc": 0,
     })
     evaluation = smoke["evaluation"]
     evaluation.update({

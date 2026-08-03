@@ -12,9 +12,10 @@
 #     exactly the dependency set validated before staging. The retained cu130
 #     image has no independent lockfile yet; see DEPLOYMENT_BACKLOG.md.
 #
-# Target GPUs: sm_89 (RTX 6000 Ada) and sm_120 (RTX 5090 / RTX PRO 6000
-# Blackwell). Both are covered by the default cu128 wheels pinned in
-# pyproject.toml. The named cu130 image remains available via PYTORCH_CUDA.
+# Target GPUs: sm_89 (RTX 6000 Ada), sm_90 (H100 / H100 NVL) and sm_120
+# (RTX 5090 / RTX PRO 6000 Blackwell). All are covered by the default cu128
+# wheels pinned in pyproject.toml. The named cu130 image remains available via
+# PYTORCH_CUDA.
 
 FROM python:3.12-slim-bookworm
 
@@ -26,7 +27,9 @@ FROM python:3.12-slim-bookworm
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # Triton JIT-compiles GPU kernels at *runtime* and invokes a C compiler to build
-# the launcher stubs, so gcc must be in the image, not just at build time.
+# the launcher stubs, so gcc must be in the image, not just at build time. This
+# is load-bearing, not incidental: training.use_liger_kernel puts Triton kernels
+# on the forward/backward path of every step.
 # libc6-dev supplies the headers and crt objects it links against; the Python
 # headers Triton also needs are already in the official python image.
 #

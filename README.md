@@ -33,7 +33,11 @@ never appear in more than one split.
 # 1. Validate, de-duplicate, and create document-level train/validation/test splits.
 python split_dataset.py --config config.yaml
 
-# 2. Train using only the configured train and validation paths.
+# 2. Measure the tokenized length distribution before committing to a
+#    training.max_length. Writes length_analysis.report_path.
+python scripts/analyze_token_lengths.py --config config.yaml
+
+# 3. Train using only the configured train and validation paths.
 python train.py --config config.yaml
 
 # Optional: validate enabled inputs/template/arguments without model weights or outputs.
@@ -42,9 +46,28 @@ python train.py --config config.yaml --dry-run
 # Optional: run enabled stages with ≤10 rows per split and one train step in temporary outputs.
 python train.py --config config.yaml --smoke-test
 
-# 3. Evaluate an existing adapter (or inspect final outputs again).
+# 4. Evaluate an existing adapter (or inspect final outputs again).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
 ```
+
+Throughput settings (`model.dtype`, `model.attn_implementation`,
+`model.use_4bit`, `training.use_liger_kernel`, `training.max_length`) and the
+measurements they still need are documented in
+[docs/2026-08-03_training_speed_tier1_tier2_applied.md](docs/2026-08-03_training_speed_tier1_tier2_applied.md).
+
+Locking is GPU- and toolkit-independent because `pyproject.toml` supplies FA3's
+static dependency metadata. Building the optional package requires CUDA >=12.3
+(12.8 recommended), but the build machine itself does not need a Hopper GPU:
+
+```bash
+uv lock
+# Run this one only in the CUDA 12.8 toolkit/devel build environment:
+MAX_JOBS=4 uv sync --extra speed
+```
+
+Then set `model.attn_implementation: "flash_attention_3"` in `config.yaml`.
+CUDA 12.8 is recommended. The checked-in configuration remains on `sdpa` so
+the default slim Docker image and non-Hopper machines continue to work.
 
 To convert a held-out CSV with `id`, `domain`, `en`, and `fa` columns directly to the
 configured test location, without creating DPO data:

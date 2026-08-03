@@ -18,6 +18,10 @@ dependencies = [
     # pkg_resources module, which Setuptools 82+ no longer provides.
     "setuptools<82.0.0",
     "accelerate",
+    # Fused Triton kernels (chiefly the linear+cross-entropy fusion) selected by
+    # training.use_liger_kernel. Pure Python/Triton, so it adds no compiler
+    # requirement to the offline image; Triton is already a torch dependency.
+    "liger-kernel>=0.5.0",
     "bitsandbytes>=0.48.0",
     "pandas",
     "pillow",
@@ -30,6 +34,55 @@ dependencies = [
     "sentence-transformers>=5.6.0",
 ]
 
+# Optional, and deliberately not a default dependency: FlashAttention 3 is a
+# separate source package in the upstream repository's hopper/ directory. It is
+# not the `flash-attn` PyPI package (that package is FlashAttention 2), and the
+# similarly named `flash-attn-3` release on PyPI is an empty, yanked package.
+# Build it only on a Hopper host with CUDA >=12.3 (12.8 recommended), then set
+# model.attn_implementation: "flash_attention_3".
+#
+#     uv sync --extra speed
+#
+# Budget for it: the build compiles CUDA sources and takes 1-3 hours. Cap the
+# parallelism or it will exhaust host RAM and be OOM-killed:
+#
+#     MAX_JOBS=4 uv sync --extra speed
+[project.optional-dependencies]
+speed = ["flash-attn-3==3.0.0b1"]
+
+# flash-attn-3's setup.py imports these modules before setuptools can process
+# install_requires, so they must be available in uv's isolated build env.
+#
+# Keep this Torch pin identical to project.dependencies above. uv cannot use
+# `match-runtime = true` here because flash-attn-3's setup.py exposes only
+# dynamic metadata; runtime matching requires static package metadata. An exact
+# duplicate pin gives the isolated build the same Torch ABI instead. Compiling
+# against any other Torch can succeed and then fail at import with an undefined
+# symbol.
+[tool.uv.extra-build-dependencies]
+flash-attn-3 = [
+    "torch==2.8.0",
+    "packaging",
+    "wheel",
+    "ninja",
+]
+
+# FA3 exposes its package metadata dynamically through setup.py. Without this
+# override, `uv lock` executes that setup script merely to discover dependencies;
+# setup.py then checks the local nvcc and makes locking fail on machines without
+# CUDA >=12.3. This is the metadata declared by hopper/setup.py at the pinned
+# source tag. Keep it synchronized if the source tag changes.
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-3"
+version = "3.0.0b1"
+requires-python = ">=3.10"
+requires-dist = ["torch", "einops", "packaging", "ninja"]
+
+# The build also needs the CUDA compiler. torch's wheels vendor the CUDA
+# *runtime*, not nvcc, so a host without the toolkit fails later in the same
+# build with "nvcc not found" -- a different error from the one above, and not
+# fixable from this file. See docs/OFFLINE_DEPLOYMENT.md section 6.7.
+
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
@@ -37,3 +90,4 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention.git", tag = "v2.8.3.post1", subdirectory = "hopper" }
