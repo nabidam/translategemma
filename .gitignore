@@ -20,6 +20,10 @@ logs/
 *.tar.zst
 *.tar.gz
 
+# Prebuilt CUDA wheels (FlashAttention 3). Hundreds of MB of ABI-specific
+# binary, rebuilt by scripts/build_flash_attn3_wheel.sh rather than tracked.
+wheels/*.whl
+
 __pycache__/
 *.pyc
 .venv/

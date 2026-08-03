@@ -50,10 +50,17 @@ Choose the image that matches the installed driver:
 | Image tag | CUDA / PyTorch | Minimum driver | Compose selection |
 | --- | --- | --- | --- |
 | `translategemma:cu128-py312` **(default)** | CUDA 12.8 / PyTorch 2.8.0 | r570 | No changes: use `.env.example` as supplied. |
+| `translategemma:cu128-fa3-py312` | CUDA 12.8 / PyTorch 2.8.0 + FlashAttention 3 | r570 | Set `IMAGE_TAG=cu128-fa3-py312` and `INSTALL_FLASH_ATTN3=1`. **Hopper hosts only** — see §6.7. |
 | `translategemma:cu130-py312` | CUDA 13.0 / PyTorch 2.13.0 | r580.65.06 | Set `IMAGE_TAG=cu130-py312` and `PYTORCH_CUDA=cu130` when building. |
 
 Do not build the `cu130` tag for an r570-only host: an image can build
 successfully but cannot initialise CUDA at runtime on that driver.
+
+The `cu128-fa3` tag is a superset of the default one and is interchangeable
+with it on a Hopper host, since `model.attn_implementation` still defaults to
+`sdpa`. It is a separate tag rather than a new default because the wheel it
+carries contains sm_90 kernels only, and because it is not yet benchmarked
+against `sdpa` on this pipeline.
 
 ---
 
@@ -98,10 +105,11 @@ added to `pyproject.toml` for `training.use_liger_kernel`, so a lockfile created
 before that change no longer matches and `uv sync --locked` aborts. Any
 dependency change means: `uv lock`, commit, rebuild, re-export, re-transfer.
 
-`flash-attn-3` is deliberately *not* in the image. It is declared as an optional
-`speed` extra and compiles against `nvcc`, which `python:3.12-slim` does not
-carry; `uv sync --no-dev` does not install extras, so the build is unaffected.
-`model.attn_implementation` must stay `sdpa` in this image — see §6.7.
+`flash-attn-3` is not in this image. It is declared as an optional `speed` extra
+and compiles against `nvcc`, which `python:3.12-slim` does not carry;
+`uv sync --no-dev` does not install extras, so the build is unaffected.
+`model.attn_implementation` must stay `sdpa` here — see §6.7 for the
+Hopper-only variant that does carry it.
 
 This builds the default `translategemma:cu128-py312` image. To deliberately
 build the retained CUDA 13.0 image for an r580+ host:
@@ -110,9 +118,32 @@ build the retained CUDA 13.0 image for an r580+ host:
 IMAGE_TAG=cu130-py312 PYTORCH_CUDA=cu130 docker compose build trainer
 ```
 
+To build the FlashAttention 3 variant for a Hopper host, first produce the
+wheel (once, ~1–3 hours), then build against it (seconds):
+
+```bash
+scripts/build_flash_attn3_wheel.sh
+IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
+```
+
+The build fails fast with a clear message if `INSTALL_FLASH_ATTN3=1` is set but
+`wheels/` holds no wheel.
+
+**Verify that image before exporting it.** The build host is not a Hopper
+machine, so a successful build does not mean a working wheel — but the two
+worst outcomes (glibc and Torch-ABI mismatches) are detectable there anyway:
+
+```bash
+docker run --rm -v "$PWD/scripts:/scripts:ro" \
+    translategemma:cu128-fa3-py312 python /scripts/verify_flash_attn3.py
+```
+
+Full procedure, including the architecture check and what must wait for the
+H100, is in §6.7.
+
 Expect roughly **9–11 GB** uncompressed. The build context contains only
-`pyproject.toml` and `uv.lock`, so rebuilds after a dependency change are the
-only slow ones. The default `cu128` build uses `uv sync --locked`; it fails if
+`pyproject.toml`, `uv.lock` and `wheels/`, so rebuilds after a dependency
+change are the only slow ones. The default `cu128` build uses `uv sync --locked`; it fails if
 `uv.lock` does not match `pyproject.toml` rather than silently resolving newer
 packages.
 
@@ -134,8 +165,10 @@ docker save translategemma:cu128-py312 | zstd -19 -T0 -o translategemma-cu128-im
 ```
 
 For the CUDA 13.0 image, save `translategemma:cu130-py312` as
-`translategemma-cu130-image.tar.zst`. Transfer only the image matching the GPU
-host's driver.
+`translategemma-cu130-image.tar.zst`; for the FlashAttention 3 variant, save
+`translategemma:cu128-fa3-py312` as `translategemma-cu128-fa3-image.tar.zst`.
+Transfer only the image matching the GPU host's driver and architecture. The
+wheel itself does not travel separately — it is already inside that image.
 
 Roughly 5–6 GB compressed. Use `gzip` if `zstd` is unavailable on either side.
 
@@ -323,6 +356,14 @@ point `MODELS_DIR` in `.env` at that path instead of moving anything.
 ```bash
 docker compose run --rm trainer python -c \
   "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+On the `cu128-fa3-py312` image, verify the FlashAttention 3 wheel first — this
+is the machine that can finally execute it, and it fails in one second rather
+than after a model load:
+
+```bash
+docker compose run --rm trainer python scripts/verify_flash_attn3.py
 ```
 
 Then, in order — each step is cheap and fails fast:
@@ -517,10 +558,10 @@ This only bites when `model.use_4bit: true`. With the current bf16 default,
 `bitsandbytes` is imported but never asked for a quantised kernel, so a
 Blackwell host can appear healthy right up until someone re-enables QLoRA.
 
-### 6.7 FlashAttention 3 is not in this image
+### 6.7 FlashAttention 3 lives in a separate image tag
 
-`model.attn_implementation` must remain `sdpa` here. Setting
-`flash_attention_3` raises at model load:
+`model.attn_implementation` must remain `sdpa` in the **default** image. Setting
+`flash_attention_3` there raises at model load:
 
 ```
 ImportError: FlashAttention3 has been toggled on, but it cannot be used due to
@@ -541,22 +582,133 @@ that CUDA-sensitive setup script during resolution. The CUDA requirement begins
 at `uv sync --extra speed`, when the extension is actually built.
 
 FA3 requires a Hopper-class GPU (H100/H800; compute capability >= 9.0) and CUDA
->=12.3; upstream recommends CUDA 12.8. Keep `sdpa` on Ada/Ampere hardware.
+>=12.3; upstream recommends CUDA 12.8. Keep `sdpa` on Ada/Ampere/Blackwell
+hardware — the compiled kernels are sm_90 only.
 
 This costs less than it sounds. On Hopper, SDPA already dispatches to fused
 flash-attention kernels; the meaningful gap opens only with packed or
-padding-free batches, which this pipeline does not yet do. Adding a toolkit
-stage to the image is tracked in `DEPLOYMENT_BACKLOG.md` and is only worth doing
-alongside packing.
+padding-free batches, which this pipeline does not yet do.
 
 **Nothing in the smoke test needs it.** `--dry-run`, `--smoke-test` and the
-length analysis all run on `sdpa`. If `uv sync --extra speed` is failing, skip
-the extra and validate with the plain environment; the extra is an optimisation
-to benchmark later, not a prerequisite.
+length analysis all run on `sdpa`. FA3 is an optimisation to benchmark later,
+not a prerequisite.
 
-#### Building it on a host that does have a toolkit
+#### The `cu128-fa3-py312` variant
 
-Two distinct failures, in the order they appear:
+For a Hopper host, build the separate tag rather than changing the default one:
+
+```bash
+scripts/build_flash_attn3_wheel.sh                                     # once, 1-3 h
+IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
+```
+
+Three deliberate choices there, each of which has a failure mode attached:
+
+**The wheel is built outside the image.** `scripts/build_flash_attn3_wheel.sh`
+runs the compile inside `nvidia/cuda:12.8.1-devel-ubuntu22.04` and drops a wheel
+into `wheels/`. The Dockerfile then installs that wheel in seconds. Compiling in
+a build stage instead would repeat 1–3 hours of nvcc on every rebuild and pull a
+~3 GB toolkit into the build. The build host needs Docker and internet; it needs
+neither a GPU nor a local toolkit.
+
+**The base image is Ubuntu 22.04, not 24.04.** The wheel is installed into
+`python:3.12-slim-bookworm` (glibc 2.36). Ubuntu 22.04 is glibc 2.35, so the
+wheel links against an older glibc than the runtime image. Building on 24.04
+(glibc 2.39) produces a wheel that fails to load in the shipped image.
+
+**The install is `--no-index --no-deps`, after `uv sync --locked`.** The locked
+environment is the validated one and nothing may re-resolve it. FA3's runtime
+dependencies — torch, einops, packaging, ninja — are already in `uv.lock`, so
+`--no-deps` drops nothing. The consequence is that FA3 is *out of lock* by
+design; `/opt/resolved-requirements.txt` is written afterwards and records it,
+so the shipped image still describes itself accurately.
+
+`TORCH_VERSION` and `FA3_TAG` in the script duplicate the pins in
+`pyproject.toml`. Change all of them together. A wheel built against a different
+Torch installs cleanly and then fails at import with an undefined-symbol error,
+which is much harder to diagnose than a version mismatch.
+
+The image is a superset of the default one and still defaults to `sdpa`, so it
+is safe to run everything through it on a Hopper host. Flip
+`model.attn_implementation: "flash_attention_3"` per run and benchmark it
+against `sdpa` — measuring non-padding tokens/second, not samples/second —
+rather than assuming it wins.
+
+#### Verifying the wheel when the build host is not a Hopper machine
+
+This is the normal case: the wheel is compiled on a machine with a CUDA toolkit
+and internet, and executed on an H100 that has neither. The build host cannot
+run the kernels it just produced, so the build "succeeding" proves very little.
+
+Two failure modes are silent until the image reaches the H100, and each costs a
+full rebuild-and-transfer cycle to fix:
+
+| Failure | Where it comes from | How it looks on the H100 |
+| --- | --- | --- |
+| glibc mismatch | wheel built on a newer distro than `bookworm` | `version 'GLIBC_2.38' not found` at import |
+| Torch ABI mismatch | wheel built against a Torch other than the pinned one | `undefined symbol: _ZN3c10...` at import |
+| Wrong architecture | kernels compiled without `sm_90a` | `no kernel image is available for execution on the device` at the first attention call |
+
+The first two are **fully detectable without a GPU**, because they are dynamic
+linking problems, not execution problems. Do not defer them to the H100.
+
+Run this on the build host, immediately after building the image and *before*
+`docker save`:
+
+```bash
+docker run --rm -v "$PWD/scripts:/scripts:ro" \
+    translategemma:cu128-fa3-py312 python /scripts/verify_flash_attn3.py
+```
+
+`scripts/verify_flash_attn3.py` splits its checks by what they require. On a
+non-Hopper host it loads the compiled extension, resolves its symbols against
+the installed Torch, and reports the kernel checks as `SKIP` rather than
+failing. A `PASSED, with N check(s) skipped` line there means the image is worth
+transferring; a `FAILED` line means rebuild now, while the toolkit is still in
+reach.
+
+Also confirm the binary actually contains Hopper kernels. This needs
+`cuobjdump`, which lives in the CUDA toolkit image rather than the training
+image, so run it against the wheel directly:
+
+```bash
+docker run --rm -v "$PWD/wheels:/w:ro" nvidia/cuda:12.8.1-devel-ubuntu22.04 \
+    bash -c 'cd /tmp && python3 -m zipfile -e /w/flash_attn_3-*.whl . \
+             && cuobjdump --list-elf $(find . -name "*.so" | head -1) | sort -u'
+```
+
+Every listed entry should be `sm_90a`. An empty listing, or one naming only
+other architectures, is the third failure mode caught before transfer instead of
+after.
+
+What genuinely cannot be checked before the H100:
+
+- that a kernel launches and returns correct numbers,
+- that `transformers.utils.is_flash_attn_3_available()` returns `True` (the
+  probe inspects the current device, so it is legitimately `False` on the build
+  host — the script reports this as `SKIP`, not `FAIL`),
+- throughput.
+
+So re-run the same script on the offline host after loading the image, where it
+executes every tier:
+
+```bash
+docker compose run --rm trainer python scripts/verify_flash_attn3.py
+```
+
+There it launches `flash_attn_func` on a small causal batch and compares the
+output against SDPA. Comparing rather than merely catching exceptions matters: a
+numerically wrong build produces plausible-looking training that quietly
+converges worse, which is far more expensive than a crash.
+
+Only after that is clean, set `model.attn_implementation: "flash_attention_3"`
+and run the normal `--smoke-test` (§5.3) before committing to a long run.
+
+#### Building the extra directly on a host that has a toolkit
+
+`uv sync --extra speed` remains available for a developer environment with a
+local CUDA toolkit, and is what the wheel build performs in miniature. Two
+distinct failures, in the order they appear:
 
 ```
 ModuleNotFoundError: No module named 'torch'
@@ -571,7 +723,9 @@ this with `match-runtime = true`: FA3 exposes dynamic rather than static package
 metadata, so uv cannot determine the runtime requirement early enough and aborts
 before compilation. Building against a different Torch can succeed and then fail
 at import with an undefined-symbol error, which is much harder to diagnose.
-Whenever the project Torch pin changes, update both occurrences together.
+Whenever the project Torch pin changes, update all three occurrences together:
+`[project.dependencies]`, `[tool.uv.extra-build-dependencies]`, and
+`TORCH_VERSION` in `scripts/build_flash_attn3_wheel.sh`.
 
 ```
 RuntimeError: The current installed version of nvcc ... / nvcc: not found
@@ -591,7 +745,9 @@ MAX_JOBS=4 uv sync --extra speed
 ```
 
 Only then set `model.attn_implementation: "flash_attention_3"`, and benchmark it
-against `sdpa` rather than assuming it wins.
+against `sdpa` rather than assuming it wins. Note that this path installs into
+the *developer* environment only; the offline image gets FA3 through the wheel
+route above, never through `uv sync --extra speed`.
 
 ### 6.8 vLLM serving
 

@@ -16,27 +16,32 @@ It also needs regenerating: `liger-kernel` was added to `pyproject.toml` for
 - Confirm `git ls-files uv.lock` is non-empty in CI or in a staging checklist,
   since the failure mode only appears on the air-gapped host.
 
-## Ship a toolkit-bearing image variant for FlashAttention 3
+## Benchmark and adopt the FlashAttention 3 image variant
 
-`model.attn_implementation` is pinned to `sdpa` offline because `flash-attn-3`
-compiles against `nvcc`, which `python:3.12-slim` does not carry (§6.7 of the
-deployment guide). SDPA already reaches fused kernels on Hopper, so the gap is
-small **today**.
+The packaging half of this is **done**. `scripts/build_flash_attn3_wheel.sh`
+compiles `flash_attn_3` once inside `nvidia/cuda:*-devel` and drops a wheel into
+`wheels/`; `INSTALL_FLASH_ATTN3=1` then installs that wheel into a separately
+tagged `cu128-fa3-py312` image with `--no-index --no-deps`, so the CUDA toolkit
+never enters the shipped image and the 1–3 hour compile never repeats on a
+rebuild. §6.7 of the deployment guide covers the glibc and Torch-ABI
+constraints.
 
-It stops being small once sequence packing lands: padding-free batching is
-where FlashAttention 3 earns its cost. Do these together, not separately:
+What remains is the decision to use it. SDPA already reaches fused kernels on
+Hopper, so the gap is small **today**; it stops being small once sequence
+packing lands, because padding-free batching is where FlashAttention 3 earns its
+cost.
 
-- Add a build stage carrying the CUDA toolkit, install the `speed` extra there,
-  and copy only the built `flash_attn_3` wheel into the runtime image — a full
-  toolkit in the shipped image would add roughly 3 GB. The stage must inherit
-  `[tool.uv.extra-build-dependencies]` from `pyproject.toml`; without it the
-  build fails on a missing `torch` during PEP 517 isolation.
-- Cache the built wheel as a transferable artefact. A 1–3 hour CUDA compile
-  repeated on every image rebuild is worse than the problem it solves.
-- Pin the wheel to the exact Torch, Python, CUDA and ABI combination it was
-  built against, and record it next to the resolved requirements.
-- Re-benchmark against `sdpa` on the target GPU before adopting it. Measure
-  non-padding tokens/second, not samples/second.
+- Benchmark `flash_attention_3` against `sdpa` on the H100 host, measuring
+  non-padding tokens/second rather than samples/second. Do this as part of the
+  throughput grid below, not as a separate exercise.
+- Implement sequence packing, then re-measure. Adopting FA3 before packing
+  buys little and adds an out-of-lock binary to the deployment surface.
+- If adopted, record the wheel's Torch/Python/CUDA/glibc combination next to
+  `/opt/resolved-requirements.txt`, and add a Hopper-host build/smoke-test to
+  the release checklist alongside the r570 and r580+ hosts.
+- Decide then whether `cu128-fa3` replaces `cu128` as the Hopper default or
+  stays an opt-in tag. It is a strict superset and still defaults to `sdpa`,
+  so replacement is cheap — but only once it is measured.
 
 ## Replace the temporary dual-CUDA build selection
 

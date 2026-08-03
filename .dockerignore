@@ -1,6 +1,8 @@
-# The build context only needs the dependency manifest and its lockfile.
-# Everything else is bind-mounted
+# The build context only needs the dependency manifest, its lockfile, and the
+# optional prebuilt FlashAttention 3 wheel. Everything else is bind-mounted
 # at run time, so excluding it keeps the context (and rebuild times) tiny.
 *
 !pyproject.toml
 !uv.lock
+!wheels
+!wheels/**

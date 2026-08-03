@@ -11,6 +11,9 @@
 #   * The default cu128 image is installed with `uv sync --locked`, so it uses
 #     exactly the dependency set validated before staging. The retained cu130
 #     image has no independent lockfile yet; see DEPLOYMENT_BACKLOG.md.
+#   * FlashAttention 3 is opt-in via INSTALL_FLASH_ATTN3=1 and is installed
+#     from a prebuilt wheel, never compiled here. It produces a separate,
+#     Hopper-only image tag; the default tag stays FA3-free.
 #
 # Target GPUs: sm_89 (RTX 6000 Ada), sm_90 (H100 / H100 NVL) and sm_120
 # (RTX 5090 / RTX PRO 6000 Blackwell). All are covered by the default cu128
@@ -83,6 +86,34 @@ RUN case "$PYTORCH_CUDA" in \
 # bitsandbytes>=0.48.0 is declared in pyproject.toml and therefore locked for
 # cu128. Older versions lack sm_120 (Blackwell) kernels and fail QLoRA with
 # "no kernel image is available for execution on the device".
+
+# FlashAttention 3, installed from a wheel that was compiled *outside* this
+# build by scripts/build_flash_attn3_wheel.sh.
+#
+# Compiling it here instead would mean a CUDA toolkit (~3 GB) in the build and
+# a 1-3 hour nvcc run on every rebuild, to produce a binary that only a Hopper
+# GPU can execute. Building it once into a transferable wheel keeps this layer
+# at a few seconds and keeps the toolkit out of the shipped image entirely.
+#
+# --no-index and --no-deps are load-bearing: the wheel is installed *after*
+# `uv sync --locked`, so nothing may re-resolve or perturb the locked
+# environment. FA3's runtime dependencies (torch, einops, packaging, ninja) are
+# already present in the lock, so --no-deps drops nothing.
+#
+# The wheel is ABI-pinned to the Torch, Python, CUDA and glibc combination it
+# was built against. Rebuild it whenever the Torch pin changes.
+#
+# Produces a separate image; tag it accordingly rather than overwriting the
+# default one:
+#   IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
+ARG INSTALL_FLASH_ATTN3=0
+COPY wheels/ /tmp/wheels/
+RUN if [ "$INSTALL_FLASH_ATTN3" = "1" ]; then \
+        ls /tmp/wheels/flash_attn_3-*.whl >/dev/null 2>&1 \
+            || { echo "INSTALL_FLASH_ATTN3=1 but wheels/ holds no flash_attn_3 wheel; run scripts/build_flash_attn3_wheel.sh first" >&2; exit 2; } \
+        && uv pip install --no-index --no-deps --find-links /tmp/wheels flash-attn-3; \
+    fi \
+    && rm -rf /tmp/wheels
 
 # MetricX is optional (evaluation.metricx_enabled in config.yaml). Build with
 # --build-arg INSTALL_METRICX=0 to skip it and drop the git dependency.
