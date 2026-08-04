@@ -17,7 +17,7 @@
 #
 # Usage:
 #   scripts/build_flash_attn3_wheel.sh            # defaults below
-#   MAX_JOBS=8 scripts/build_flash_attn3_wheel.sh
+#   MAX_JOBS=2 scripts/build_flash_attn3_wheel.sh
 #
 # Output: wheels/flash_attn_3-3.0.0b1-cp312-cp312-linux_x86_64.whl
 set -euo pipefail
@@ -37,44 +37,84 @@ CUDA_IMAGE="${CUDA_IMAGE:-nvidia/cuda:12.8.1-devel-ubuntu22.04}"
 
 # The compile is memory-hungry per job, not CPU-bound. Unbounded parallelism is
 # the usual cause of the build being OOM-killed after an hour of work.
-MAX_JOBS="${MAX_JOBS:-4}"
+MAX_JOBS="${MAX_JOBS:-2}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$repo_root/wheels"
 
+# Keep downloads, the source checkout, and Ninja objects across disposable
+# containers. The key prevents ABI-incompatible build products from being
+# reused after changing one of the important pins.
+cache_key="${FA3_TAG//\//_}-torch${TORCH_VERSION}-$(basename "$CUDA_IMAGE")-py312"
+build_cache="$repo_root/.cache/flash-attn3/$cache_key"
+mkdir -p \
+    "$build_cache/apt-archives/partial" \
+    "$build_cache/apt-lists/partial" \
+    "$build_cache/uv" \
+    "$build_cache/python"
+
 echo "Building flash-attn-3 $FA3_TAG against torch==$TORCH_VERSION in $CUDA_IMAGE"
 echo "MAX_JOBS=$MAX_JOBS -- expect 1-3 hours."
+echo "Persistent build cache: $build_cache"
 
 docker run --rm \
-    -e TORCH_VERSION -e TORCH_INDEX -e FA3_TAG -e MAX_JOBS \
+    -e "TORCH_VERSION=$TORCH_VERSION" \
+    -e "TORCH_INDEX=$TORCH_INDEX" \
+    -e "FA3_TAG=$FA3_TAG" \
+    -e "MAX_JOBS=$MAX_JOBS" \
+    -e FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    -e UV_CACHE_DIR=/cache/uv \
+    -e UV_PYTHON_INSTALL_DIR=/cache/python \
+    -v "$build_cache:/cache" \
     -v "$repo_root/wheels:/out" \
     "$CUDA_IMAGE" \
     bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -o Acquire::Retries=5
+        apt-get update \
+            -o Acquire::Retries=5 \
+            -o Dir::Cache::archives=/cache/apt-archives \
+            -o Dir::State::lists=/cache/apt-lists
         apt-get install -y --no-install-recommends \
             -o Acquire::Retries=5 -o Acquire::Queue-Mode=access \
+            -o Binary::apt::APT::Keep-Downloaded-Packages=true \
+            -o Dir::Cache::archives=/cache/apt-archives \
+            -o Dir::State::lists=/cache/apt-lists \
             ca-certificates curl git
-        rm -rf /var/lib/apt/lists/*
 
-        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+        if [[ ! -x /cache/bin/uv ]]; then
+            mkdir -p /cache/bin
+            curl -LsSf https://astral.sh/uv/install.sh \
+                | env UV_INSTALL_DIR=/cache/bin sh
+        fi
+        export PATH=/cache/bin:$PATH
 
         # --seed provides pip: the build itself is driven by pip rather than uv
         # because it needs --no-build-isolation. FA3s setup.py imports torch at
         # module level, so it must run in an environment that already has it;
         # the [tool.uv.extra-build-dependencies] table in pyproject.toml solves
         # the same problem for `uv sync`, and this is its equivalent here.
-        uv venv --seed --python 3.12 /opt/build-venv
-        export VIRTUAL_ENV=/opt/build-venv
-        export PATH=/opt/build-venv/bin:$PATH
+        if [[ ! -x /cache/build-venv/bin/python ]]; then
+            uv venv --seed --python 3.12 /cache/build-venv
+        fi
+        export VIRTUAL_ENV=/cache/build-venv
+        export PATH=/cache/build-venv/bin:$PATH
 
         uv pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX}"
         uv pip install packaging wheel ninja setuptools einops
 
         nvcc --version
 
+        if [[ ! -d /cache/source/.git ]]; then
+            git clone --branch "${FA3_TAG}" --depth 1 --recurse-submodules \
+                --shallow-submodules \
+                https://github.com/Dao-AILab/flash-attention.git /cache/source
+        fi
+        git -C /cache/source submodule update --init --recursive --depth 1
+
+        # Building a local checkout keeps build/temp.* and its completed object
+        # files in /cache/source. Ninja can reuse them after a failed attempt.
         pip wheel --no-build-isolation --no-deps --wheel-dir /out \
-            "git+https://github.com/Dao-AILab/flash-attention.git@${FA3_TAG}#subdirectory=hopper"
+            /cache/source/hopper 2>&1 | tee /cache/latest-build.log
     '
 
 echo

@@ -10,16 +10,22 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
-from train import resolve_dtype
+from train import load_generation_safe_model_config, make_deterministic_generation_config, resolve_dtype
 
 
 def generate_translations(test_df, config, adapter_path=None):
     model_cfg, eval_cfg, data_cfg = config["model"], config["evaluation"], config["data"]
-    processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"])
+    processor = AutoProcessor.from_pretrained(
+        model_cfg["base_model_id"], use_fast=True, fix_mistral_regex=False
+    )
+    model_config = load_generation_safe_model_config(model_cfg["base_model_id"])
     # Same model.dtype / model.attn_implementation the adapter was trained
     # under, so evaluation never silently measures a different numeric setup.
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["base_model_id"], device_map=model_cfg["device_map"],
+        model_cfg["base_model_id"],
+        config=model_config,
+        generation_config=make_deterministic_generation_config(model_config, processor),
+        device_map=model_cfg["device_map"],
         dtype=resolve_dtype(model_cfg["dtype"]),
         attn_implementation=model_cfg["attn_implementation"],
     )
@@ -29,14 +35,31 @@ def generate_translations(test_df, config, adapter_path=None):
     for _, row in test_df.iterrows():
         source = row[data_cfg["source_column"]]
         messages = [{"role": "user", "content": [{"type": "text", "source_lang_code": data_cfg["source_lang"], "target_lang_code": data_cfg["target_lang"], "text": source}]}]
-        inputs = processor.apply_chat_template(messages, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(model.device)
+        # Processor chat templates render text unless tokenization is requested
+        # explicitly. return_tensors only configures the tokenizer output; it
+        # does not imply tokenize=True.
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
         with torch.inference_mode():
+            pad_token_id = processor.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = processor.tokenizer.eos_token_id
             generation_kwargs = {
                 "max_new_tokens": eval_cfg["max_new_tokens"], "do_sample": eval_cfg["do_sample"],
-                "num_beams": eval_cfg["num_beams"],
+                "num_beams": eval_cfg["num_beams"], "pad_token_id": pad_token_id,
             }
             if eval_cfg["do_sample"]:
                 generation_kwargs.update(temperature=eval_cfg["temperature"], top_p=eval_cfg["top_p"])
+            else:
+                # TranslateGemma's saved generation config contains sampling
+                # values. Neutralize them when evaluation requests greedy or
+                # beam decoding so they are neither misleading nor ignored.
+                generation_kwargs.update(temperature=1.0, top_p=1.0, top_k=50)
             outputs = model.generate(**inputs, **generation_kwargs)
         hypotheses.append(processor.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True))
     del model, base_model, processor

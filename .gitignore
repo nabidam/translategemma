@@ -23,6 +23,8 @@ logs/
 # Prebuilt CUDA wheels (FlashAttention 3). Hundreds of MB of ABI-specific
 # binary, rebuilt by scripts/build_flash_attn3_wheel.sh rather than tracked.
 wheels/*.whl
+wheels/*.whl.part*
+.cache/flash-attn3/
 
 __pycache__/
 *.pyc

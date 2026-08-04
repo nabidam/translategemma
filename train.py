@@ -15,9 +15,11 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoProcessor,
     BitsAndBytesConfig,
+    GenerationConfig,
     Trainer,
     TrainerCallback,
     TrainingArguments,
@@ -54,6 +56,12 @@ class TranslationDataCollator:
     def __init__(self, tokenizer, pad_to_multiple_of=None):
         self.tokenizer = tokenizer
         self.pad_to_multiple_of = pad_to_multiple_of
+        # The dataset is deliberately tokenized once (and can be cached and
+        # processed in parallel) because labels need prompt-token masking.
+        # Calling the tokenizer on raw text here would discard those labels,
+        # so Transformers' generic fast-tokenizer padding advice does not
+        # apply to this collator.
+        self.tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
     def __call__(self, features):
         model_inputs = [
@@ -92,6 +100,41 @@ def resolve_dtype(name):
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"model.dtype must name a torch dtype (for example bfloat16); got {name!r}")
     return dtype
+
+
+def load_generation_safe_model_config(base_model_id):
+    """Load model config without TranslateGemma's invalid sampling defaults."""
+    config = AutoConfig.from_pretrained(base_model_id)
+    # Apply this to both multimodal wrappers and their decoder config. Model
+    # construction creates GenerationConfig objects for nested models too.
+    for candidate in (config, config.get_text_config()):
+        candidate.temperature = 1.0
+        candidate.top_p = 1.0
+        candidate.top_k = 50
+    return config
+
+
+def make_deterministic_generation_config(model_config, processor):
+    """Return explicit, warning-free defaults for translation generation."""
+    tokenizer = processor.tokenizer
+    generation_config = GenerationConfig.from_model_config(model_config)
+    generation_config.do_sample = False
+    generation_config.temperature = 1.0
+    generation_config.top_p = 1.0
+    generation_config.top_k = 50
+    if generation_config.bos_token_id is None:
+        generation_config.bos_token_id = tokenizer.bos_token_id
+    if generation_config.eos_token_id is None:
+        generation_config.eos_token_id = tokenizer.eos_token_id
+    if generation_config.pad_token_id is None:
+        generation_config.pad_token_id = tokenizer.pad_token_id
+    if generation_config.pad_token_id is None:
+        generation_config.pad_token_id = tokenizer.eos_token_id
+    # from_pretrained reconstructs a supplied GenerationConfig via from_dict,
+    # which does not preserve _original_object_hash. Leaving this marked as
+    # model-derived makes generate() enter a legacy hash check and crash.
+    generation_config._from_model_config = False
+    return generation_config
 
 
 def map_workers(requested, dataset_size):
@@ -197,7 +240,12 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
 
 def setup_model_and_processor(config):
     model_cfg, train_cfg = config["model"], config["training"]
-    processor = AutoProcessor.from_pretrained(model_cfg["base_model_id"], use_fast=True)
+    # Transformers 4.57.6 can misclassify locally bundled non-Mistral models
+    # as needing its Mistral regex patch. TranslateGemma uses a single Split
+    # pre-tokenizer, while that patch assumes an indexable Sequence and crashes.
+    processor = AutoProcessor.from_pretrained(
+        model_cfg["base_model_id"], use_fast=True, fix_mistral_regex=False
+    )
     # Without an explicit dtype, transformers materialises every unquantised
     # parameter in float32 -- embeddings, norms and a 262k-row lm_head.
     dtype = resolve_dtype(model_cfg["dtype"])
@@ -205,7 +253,10 @@ def setup_model_and_processor(config):
     # (parameter storage and autocast). Disagreeing values cast on every matmul.
     if (dtype == torch.bfloat16) != bool(train_cfg["bf16"]):
         raise ValueError(f"model.dtype={model_cfg['dtype']!r} contradicts training.bf16={train_cfg['bf16']}.")
+    model_config = load_generation_safe_model_config(model_cfg["base_model_id"])
     load_kwargs = {
+        "config": model_config,
+        "generation_config": make_deterministic_generation_config(model_config, processor),
         "dtype": dtype,
         "device_map": model_cfg["device_map"],
         "attn_implementation": model_cfg["attn_implementation"],
@@ -231,7 +282,11 @@ def setup_model_and_processor(config):
         # no graph to recompute through, and the LoRA adapters get no gradient.
         model.enable_input_require_grads()
     if train_cfg["gradient_checkpointing"]:
+        # Gemma 3/TranslateGemma keeps the cache setting used by the decoder
+        # on its nested text config. Set both levels so checkpointed training
+        # never enters forward with use_cache=True.
         model.config.use_cache = False
+        model.config.get_text_config().use_cache = False
     lora_cfg = LoraConfig(
         r=config["lora"]["r"], lora_alpha=config["lora"]["alpha"], lora_dropout=config["lora"]["dropout"],
         target_modules=config["lora"]["target_modules"], bias="none", task_type="CAUSAL_LM",
@@ -366,7 +421,9 @@ def run_dry_run(config):
     logger.info("Dry run: validating enabled pipeline stages; no model weights or outputs will be created.")
     processor = None
     if config["training"]["run_sft"]:
-        processor = AutoProcessor.from_pretrained(config["model"]["base_model_id"])
+        processor = AutoProcessor.from_pretrained(
+            config["model"]["base_model_id"], use_fast=True, fix_mistral_regex=False
+        )
         train_data = tokenize_sft_dataset(load_sft_split(config["data"]["train_sft_dataset_path"], config, "train", 10), processor, config, "train")
         validation_path = config["data"]["validation_sft_dataset_path"]
         validation_data = (

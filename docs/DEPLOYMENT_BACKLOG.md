@@ -18,13 +18,14 @@ It also needs regenerating: `liger-kernel` was added to `pyproject.toml` for
 
 ## Benchmark and adopt the FlashAttention 3 image variant
 
-The packaging half of this is **done**. `scripts/build_flash_attn3_wheel.sh`
-compiles `flash_attn_3` once inside `nvidia/cuda:*-devel` and drops a wheel into
-`wheels/`; `INSTALL_FLASH_ATTN3=1` then installs that wheel into a separately
-tagged `cu128-fa3-py312` image with `--no-index --no-deps`, so the CUDA toolkit
-never enters the shipped image and the 1–3 hour compile never repeats on a
-rebuild. §6.7 of the deployment guide covers the glibc and Torch-ABI
-constraints.
+The packaging half of this is **done**. The preferred
+`scripts/fetch_flash_attn3_wheel.sh` path fetches one checksum-pinned community
+wheel matching CUDA 12.8 / Torch 2.8.0; `scripts/build_flash_attn3_wheel.sh`
+retains a cached official-source fallback. `INSTALL_FLASH_ATTN3=1` requires
+exactly one wheel, installs that explicit file with `--no-index --no-deps`, and
+runs the no-GPU import/ABI verifier while building the separately tagged
+`cu128-fa3-py312` image. §6.7 of the deployment guide covers provenance, glibc,
+Torch ABI, and Hopper execution checks.
 
 What remains is the decision to use it. SDPA already reaches fused kernels on
 Hopper, so the gap is small **today**; it stops being small once sequence

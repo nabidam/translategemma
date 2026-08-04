@@ -32,13 +32,13 @@ import sys
 import traceback
 from types import ModuleType
 
-# FA3's package name moved: the upstream hopper/ directory historically
-# installed `flash_attn_interface`, while the 3.0.0b1 distribution installs
-# `flash_attn_3`. Transformers probes for `flash_attn_3`, so that name is the
-# one that matters for model.attn_implementation, but accept either here and
-# report which was found -- a wheel exposing only the old name explains an
-# ImportError from transformers that otherwise looks like a missing install.
-CANDIDATE_MODULES = ("flash_attn_3", "flash_attn_interface")
+# The distribution is named `flash-attn-3`, but its public Python module is
+# `flash_attn_interface`; importing that module loads the binary extension at
+# `flash_attn_3._C`. Transformers uses this same top-level module when mapping
+# the installed distribution to the `flash_attention_3` backend. Importing the
+# `flash_attn_3` namespace alone is insufficient: it intentionally exports no
+# attention functions and commonly has `__file__ = None`.
+API_MODULE = "flash_attn_interface"
 
 # Hopper. FA3 emits sm_90a kernels only; anything below cannot launch them.
 REQUIRED_CAPABILITY = (9, 0)
@@ -66,27 +66,21 @@ def skip(name: str, detail: str) -> None:
 
 def check_import() -> ModuleType | None:
     """Tier 1. Loads the compiled .so and resolves its symbols against torch."""
-    for name in CANDIDATE_MODULES:
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        except OSError as exc:
-            # A glibc mismatch surfaces here, not as ImportError:
-            #   /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found
-            fail("import", f"{name} present but its extension will not load: {exc}")
-            return None
-        report("ok", "import", f"{name} from {getattr(module, '__file__', '?')}")
-        if name != "flash_attn_3":
-            fail(
-                "module name",
-                f"found {name}, but transformers probes for flash_attn_3; "
-                "model.attn_implementation='flash_attention_3' will not find it",
-            )
-        return module
+    try:
+        module = importlib.import_module(API_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name == API_MODULE:
+            fail("import", f"{API_MODULE} not installed")
+        else:
+            fail("import", f"{API_MODULE} dependency {exc.name!r} is missing: {exc}")
+        return None
+    except (ImportError, OSError) as exc:
+        # glibc and Torch ABI mismatches surface while flash_attn_3._C loads.
+        fail("import", f"{API_MODULE} extension will not load: {exc}")
+        return None
 
-    fail("import", f"none of {CANDIDATE_MODULES} importable -- wheel not installed")
-    return None
+    report("ok", "import", f"{API_MODULE} from {getattr(module, '__file__', '?')}")
+    return module
 
 
 def check_symbols(module: ModuleType) -> None:

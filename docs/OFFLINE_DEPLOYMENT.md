@@ -118,16 +118,20 @@ build the retained CUDA 13.0 image for an r580+ host:
 IMAGE_TAG=cu130-py312 PYTORCH_CUDA=cu130 docker compose build trainer
 ```
 
-To build the FlashAttention 3 variant for a Hopper host, first produce the
-wheel (once, ~1–3 hours), then build against it (seconds):
+To build the FlashAttention 3 variant for a Hopper host, first fetch the pinned
+matching wheel, then build against it:
 
 ```bash
-scripts/build_flash_attn3_wheel.sh
+scripts/fetch_flash_attn3_wheel.sh
 IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
 ```
 
-The build fails fast with a clear message if `INSTALL_FLASH_ATTN3=1` is set but
-`wheels/` holds no wheel.
+The fetch is resumable and verifies a pinned SHA-256. The wheel is a reviewed
+community build, not an official Dao-AILab binary. Use
+`scripts/build_flash_attn3_wheel.sh` to compile the pinned official source when
+third-party binaries are unacceptable or an ABI pin changes. The image build
+requires exactly one wheel, validates its Torch/CUDA/package versions, and runs
+the no-GPU import/ABI checks before completing.
 
 **Verify that image before exporting it.** The build host is not a Hopper
 machine, so a successful build does not mean a working wheel — but the two
@@ -142,10 +146,10 @@ Full procedure, including the architecture check and what must wait for the
 H100, is in §6.7.
 
 Expect roughly **9–11 GB** uncompressed. The build context contains only
-`pyproject.toml`, `uv.lock` and `wheels/`, so rebuilds after a dependency
-change are the only slow ones. The default `cu128` build uses `uv sync --locked`; it fails if
-`uv.lock` does not match `pyproject.toml` rather than silently resolving newer
-packages.
+`pyproject.toml`, `uv.lock`, `wheels/`, and the FA3 verifier, so rebuilds after
+a dependency change are the only slow ones. The default `cu128` build uses
+`uv sync --locked`; it fails if `uv.lock` does not match `pyproject.toml`
+rather than silently resolving newer packages.
 
 Sanity-check the resolved environment (no GPU needed):
 
@@ -598,18 +602,24 @@ not a prerequisite.
 For a Hopper host, build the separate tag rather than changing the default one:
 
 ```bash
-scripts/build_flash_attn3_wheel.sh                                     # once, 1-3 h
+scripts/fetch_flash_attn3_wheel.sh                                     # preferred, ~440 MB
+# Or compile the pinned official source (once, 1-3 h):
+# scripts/build_flash_attn3_wheel.sh
 IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
 ```
 
 Three deliberate choices there, each of which has a failure mode attached:
 
-**The wheel is built outside the image.** `scripts/build_flash_attn3_wheel.sh`
-runs the compile inside `nvidia/cuda:12.8.1-devel-ubuntu22.04` and drops a wheel
-into `wheels/`. The Dockerfile then installs that wheel in seconds. Compiling in
-a build stage instead would repeat 1–3 hours of nvcc on every rebuild and pull a
-~3 GB toolkit into the build. The build host needs Docker and internet; it needs
-neither a GPU nor a local toolkit.
+**The wheel is staged outside the image.** The preferred
+`scripts/fetch_flash_attn3_wheel.sh` path downloads one exact community wheel
+for CUDA 12.8 / Torch 2.8.0 / Linux x86-64, resumes interrupted transfers, and
+verifies its pinned SHA-256. `scripts/build_flash_attn3_wheel.sh` remains the
+official-source fallback: it compiles tag `v2.8.3.post1` inside
+`nvidia/cuda:12.8.1-devel-ubuntu22.04`, with persistent dependency and Ninja
+object caches. Both paths drop exactly one wheel into `wheels/`; the Dockerfile
+rejects zero or multiple candidates, installs the explicit file without
+dependency resolution, and runs the tier-1 import/ABI verifier during the image
+build.
 
 **The base image is Ubuntu 22.04, not 24.04.** The wheel is installed into
 `python:3.12-slim-bookworm` (glibc 2.36). Ubuntu 22.04 is glibc 2.35, so the

@@ -1,8 +1,12 @@
 # The build context only needs the dependency manifest, its lockfile, and the
-# optional prebuilt FlashAttention 3 wheel. Everything else is bind-mounted
-# at run time, so excluding it keeps the context (and rebuild times) tiny.
+# optional prebuilt FlashAttention 3 wheel plus its build-time verifier.
+# Everything else is bind-mounted at run time, so excluding it keeps the
+# context (and rebuild times) tiny.
 *
 !pyproject.toml
 !uv.lock
 !wheels
 !wheels/**
+wheels/*.part*
+!scripts/
+!scripts/verify_flash_attn3.py

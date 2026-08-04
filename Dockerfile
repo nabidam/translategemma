@@ -5,9 +5,9 @@
 #     torch CUDA wheels vendor their own CUDA runtime libraries, so a CUDA
 #     base image would only add a second, conflicting toolkit and ~4 GB. The
 #     host contributes the driver via nvidia-container-toolkit; nothing else.
-#   * Only pyproject.toml and uv.lock are copied at build time. The project
-#     source, models, data and outputs are bind-mounted at run time so scripts
-#     stay editable and debuggable on the offline host without rebuilding.
+#   * Only dependency inputs, the optional FA3 wheel, and its verifier are
+#     copied at build time. Project source, models, data and outputs are
+#     bind-mounted at run time so they stay editable without rebuilding.
 #   * The default cu128 image is installed with `uv sync --locked`, so it uses
 #     exactly the dependency set validated before staging. The retained cu130
 #     image has no independent lockfile yet; see DEPLOYMENT_BACKLOG.md.
@@ -87,8 +87,9 @@ RUN case "$PYTORCH_CUDA" in \
 # cu128. Older versions lack sm_120 (Blackwell) kernels and fail QLoRA with
 # "no kernel image is available for execution on the device".
 
-# FlashAttention 3, installed from a wheel that was compiled *outside* this
-# build by scripts/build_flash_attn3_wheel.sh.
+# FlashAttention 3, installed from a wheel that was fetched or compiled
+# *outside* this build by scripts/fetch_flash_attn3_wheel.sh or
+# scripts/build_flash_attn3_wheel.sh.
 #
 # Compiling it here instead would mean a CUDA toolkit (~3 GB) in the build and
 # a 1-3 hour nvcc run on every rebuild, to produce a binary that only a Hopper
@@ -108,12 +109,16 @@ RUN case "$PYTORCH_CUDA" in \
 #   IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
 ARG INSTALL_FLASH_ATTN3=0
 COPY wheels/ /tmp/wheels/
+COPY scripts/verify_flash_attn3.py /tmp/verify_flash_attn3.py
 RUN if [ "$INSTALL_FLASH_ATTN3" = "1" ]; then \
-        ls /tmp/wheels/flash_attn_3-*.whl >/dev/null 2>&1 \
-            || { echo "INSTALL_FLASH_ATTN3=1 but wheels/ holds no flash_attn_3 wheel; run scripts/build_flash_attn3_wheel.sh first" >&2; exit 2; } \
-        && uv pip install --no-index --no-deps --find-links /tmp/wheels flash-attn-3; \
+        set -- /tmp/wheels/flash_attn_3-*.whl; \
+        [ "$#" -eq 1 ] && [ -f "$1" ] \
+            || { echo "INSTALL_FLASH_ATTN3=1 requires exactly one flash_attn_3 wheel in wheels/; run scripts/fetch_flash_attn3_wheel.sh or scripts/build_flash_attn3_wheel.sh" >&2; exit 2; }; \
+        uv pip install --no-index --no-deps "$1"; \
+        python -c 'import importlib.metadata as m, torch; assert torch.__version__.split("+")[0] == "2.8.0", torch.__version__; assert torch.version.cuda == "12.8", torch.version.cuda; assert torch._C._GLIBCXX_USE_CXX11_ABI is True; assert m.version("flash-attn-3").startswith("3.0.0b1"), m.version("flash-attn-3")'; \
+        python /tmp/verify_flash_attn3.py; \
     fi \
-    && rm -rf /tmp/wheels
+    && rm -rf /tmp/wheels /tmp/verify_flash_attn3.py
 
 # MetricX is optional (evaluation.metricx_enabled in config.yaml). Build with
 # --build-arg INSTALL_METRICX=0 to skip it and drop the git dependency.

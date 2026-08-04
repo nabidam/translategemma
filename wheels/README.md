@@ -6,11 +6,32 @@ because they need a CUDA toolkit that `python:3.12-slim` does not carry.
 Currently this means exactly one package: **FlashAttention 3**
 (`flash_attn_3-3.0.0b1-cp312-cp312-linux_x86_64.whl`).
 
-Build it with:
+The preferred path downloads a checksum-pinned community wheel for
+the project's exact Linux x86-64 / CUDA 12.8 / Torch 2.8.0 ABI:
+
+```bash
+scripts/fetch_flash_attn3_wheel.sh
+```
+
+The download is resumable and its SHA-256 is verified before it is moved into
+this directory. It comes from the community-maintained
+`windreamer/flash-attention3-wheels` project, not an official Dao-AILab
+release. The filename records upstream source commit `c8abdd`; its pinned
+SHA-256 is `6a00f0ba0fd063f228809260c64225cd83aa43ee1c99f7d718f8f104e7e2fd86`.
+To avoid that third-party binary or to change any ABI pin, compile the official
+pinned source instead:
 
 ```bash
 scripts/build_flash_attn3_wheel.sh
 ```
+
+The build keeps downloads, its source checkout, and completed Ninja object
+files under `.cache/flash-attn3/`. If compilation fails, rerunning the same
+command reuses that cache instead of downloading everything and compiling every
+successful object again. The latest complete compiler log is also retained as
+`latest-build.log` inside the pin-specific cache directory printed by the
+script. Use `MAX_JOBS=1` if the compiler is killed because the build host is
+short on RAM; the default is 2.
 
 Then build the Hopper-only image variant:
 

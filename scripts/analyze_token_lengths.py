@@ -97,7 +97,9 @@ def main():
 
     dataset = load_dataset("json", data_files=path, split="train")
     dataset = limit_dataset(dataset, analysis_cfg["max_examples"], "length analysis")
-    processor = AutoProcessor.from_pretrained(config["model"]["base_model_id"], use_fast=True)
+    processor = AutoProcessor.from_pretrained(
+        config["model"]["base_model_id"], use_fast=True, fix_mistral_regex=False
+    )
 
     report = summarize(measure_lengths(dataset, processor, config), config)
     report["dataset_path"] = path
