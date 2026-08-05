@@ -29,6 +29,8 @@ from trl import DPOTrainer
 
 from logging_utils import logger, setup_logging, log_config_summary, load_config
 
+from accelerate import Accelerator
+
 
 class RichLoggingCallback(TrainerCallback):
     """Send Trainer metrics to the project log file and console."""
@@ -258,7 +260,6 @@ def setup_model_and_processor(config):
         "config": model_config,
         "generation_config": make_deterministic_generation_config(model_config, processor),
         "dtype": dtype,
-        "device_map": model_cfg["device_map"],
         "attn_implementation": model_cfg["attn_implementation"],
     }
     if model_cfg["use_4bit"]:
@@ -268,8 +269,11 @@ def setup_model_and_processor(config):
             bnb_4bit_quant_type=model_cfg["bnb_4bit_quant_type"],
             bnb_4bit_compute_dtype=dtype,
         )
+    
+    accelerator = Accelerator()
     logger.info("Loading %s: dtype=%s 4bit=%s attn=%s", model_cfg["base_model_id"], dtype, model_cfg["use_4bit"], model_cfg["attn_implementation"])
     model = AutoModelForCausalLM.from_pretrained(model_cfg["base_model_id"], **load_kwargs)
+    model = model.to(accelerator.device)
     if model_cfg["use_4bit"]:
         model = prepare_model_for_kbit_training(
             model,

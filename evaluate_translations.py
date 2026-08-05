@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from accelerate import Accelerator
 
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
 from train import load_generation_safe_model_config, make_deterministic_generation_config, resolve_dtype
@@ -21,14 +22,16 @@ def generate_translations(test_df, config, adapter_path=None):
     model_config = load_generation_safe_model_config(model_cfg["base_model_id"])
     # Same model.dtype / model.attn_implementation the adapter was trained
     # under, so evaluation never silently measures a different numeric setup.
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["base_model_id"],
-        config=model_config,
-        generation_config=make_deterministic_generation_config(model_config, processor),
-        device_map=model_cfg["device_map"],
-        dtype=resolve_dtype(model_cfg["dtype"]),
-        attn_implementation=model_cfg["attn_implementation"],
-    )
+    accelerator = Accelerator()
+    load_kwargs = {
+        "config": model_config,
+        "generation_config": make_deterministic_generation_config(model_config, processor),
+        "dtype": resolve_dtype(model_cfg["dtype"]),
+        "attn_implementation": model_cfg["attn_implementation"],
+    }
+    
+    base_model = AutoModelForCausalLM.from_pretrained(model_cfg["base_model_id"], **load_kwargs)
+    base_model = base_model.to(accelerator.device)
     model = PeftModel.from_pretrained(base_model, adapter_path) if adapter_path else base_model
     model.eval()
     hypotheses = []

@@ -1,5 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
+from accelerate import Accelerator
 from peft import PeftModel
 from train import load_generation_safe_model_config, make_deterministic_generation_config
 
@@ -10,13 +11,15 @@ processor = AutoProcessor.from_pretrained(
 )
 model_config = load_generation_safe_model_config(base_model_id)
 
-base_model = AutoModelForCausalLM.from_pretrained(
-    base_model_id,
-    config=model_config,
-    generation_config=make_deterministic_generation_config(model_config, processor),
-    device_map="auto",
-    torch_dtype=torch.bfloat16,
-)
+accelerator = Accelerator()
+load_kwargs = {
+    "config": model_config,
+    "generation_config": make_deterministic_generation_config(model_config, processor),
+    "torch_dtype": torch.bfloat16,
+}
+
+base_model = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
+base_model = base_model.to(accelerator.device)
 
 # 2. Merge your trained Farsi domain adapter
 model = PeftModel.from_pretrained(base_model, "./final_farsi_adapter")
