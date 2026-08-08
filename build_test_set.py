@@ -243,59 +243,72 @@ def _shingles(text: str, k: int = 3) -> set[str]:
 
 
 def dedup_exact(df: pd.DataFrame, src_col: str) -> pd.DataFrame:
-    norm = df[src_col].map(lambda t: " ".join(tokenize(t)))
+    # Use fast vectorized lowercase and space normalization
+    norm = df[src_col].str.lower().str.replace(r"\s+", " ", regex=True)
     keep = ~norm.duplicated(keep="first")
     logger.info("Exact dedup: removed %d rows", (~keep).sum())
     return df[keep].reset_index(drop=True)
 
+from concurrent.futures import ProcessPoolExecutor
+
+def _compute_minhash(text: str):
+    from datasketch import MinHash
+    m = MinHash(num_perm=128)
+    for sh in _shingles(text):
+        m.update(sh.encode("utf-8"))
+    return m
 
 def dedup_minhash(df: pd.DataFrame, src_col: str, threshold: float) -> pd.DataFrame:
     try:
-        from datasketch import MinHash, MinHashLSH
+        from datasketch import MinHashLSH
     except ImportError:
-        logger.warning(
-            "datasketch not installed — skipping MinHash near-dup pass "
-            "(pip install datasketch). Embedding dedup still applies."
-        )
+        logger.warning("datasketch not installed — skipping MinHash near-dup pass.")
         return df
+
     logger.info("MinHash near-dup pass (threshold=%.2f) ...", threshold)
     lsh = MinHashLSH(threshold=threshold, num_perm=128)
     drop = set()
-    with _make_progress("Deduping with MinHash") as prog:
-        task = prog.add_task("minhash dedup", total=len(df))
-        for idx, text in zip(df.index, df[src_col]):
-            m = MinHash(num_perm=128)
-            for sh in _shingles(text):
-                m.update(sh.encode("utf-8"))
-            if lsh.query(m):
-                drop.add(idx)
-            else:
-                lsh.insert(str(idx), m)
-            prog.advance(task)
+
+    texts = df[src_col].tolist()
+    
+    # Process MinHashes across CPU cores in chunks
+    with ProcessPoolExecutor() as executor:
+        minhashes = list(executor.map(_compute_minhash, texts, chunksize=10000))
+
+    for idx, m in enumerate(minhashes):
+        if lsh.query(m):
+            drop.add(idx)
+        else:
+            lsh.insert(str(idx), m)
+
     logger.info("MinHash dedup: removed %d rows", len(drop))
     return df.drop(index=drop).reset_index(drop=True)
 
-
 def dedup_embeddings(
-    df: pd.DataFrame, emb: np.ndarray, threshold: float
+    df: pd.DataFrame, emb: np.ndarray, threshold: float, batch_size: int = 10000
 ) -> tuple[pd.DataFrame, np.ndarray]:
-    """Greedy removal of rows whose nearest already-kept neighbor exceeds threshold."""
-    from sklearn.neighbors import NearestNeighbors
-
     logger.info("Embedding near-dup pass (cosine >= %.2f) ...", threshold)
-    nn = NearestNeighbors(n_neighbors=min(6, len(df)), metric="cosine").fit(emb)
-    dist, idx = nn.kneighbors(emb)
-    sim = 1.0 - dist
+    
+    n = len(df)
     drop: set[int] = set()
-    with _make_progress("Deduping Embeddings") as prog:
-        task = prog.add_task("emb dedup", total=len(df))
-        for i in range(len(df)):
-            if i not in drop:
-                for j, s in zip(idx[i][1:], sim[i][1:]):
-                    if s >= threshold and j not in drop and j > i:
-                        drop.add(int(j))
+    with _make_progress("Generating drop list") as prog:
+        task = prog.add_task("drop item", total=len(range(0, n, batch_size)))
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            # Batch dot product against preceding embeddings
+            sims = emb[start:end] @ emb[:end].T
+            
+            for i_local in range(end - start):
+                i_global = start + i_local
+                if i_global in drop:
+                    continue
+                # Find elements in preceding embeddings above threshold
+                matches = np.where(sims[i_local, :i_global] >= threshold)[0]
+                if len(matches) > 0:
+                    drop.add(i_global)
             prog.advance(task)
-    keep_mask = np.array([i not in drop for i in range(len(df))])
+
+    keep_mask = np.array([i not in drop for i in range(n)])
     logger.info("Embedding dedup: removed %d rows", len(drop))
     return df[keep_mask].reset_index(drop=True), emb[keep_mask]
 
@@ -309,7 +322,13 @@ def compute_embeddings(df: pd.DataFrame, cfg: dict) -> np.ndarray:
     ecfg = cfg["embeddings"]
 
     cache = Path(ecfg.get("cache_path", "")) if ecfg.get("cache_path") else None
-    data_hash = hashlib.sha256("\n".join(texts).encode("utf-8")).hexdigest()[:16]
+
+    hasher = hashlib.sha256()
+    for text in texts:
+        hasher.update(text.encode("utf-8"))
+        hasher.update(b"\n")
+    data_hash = hasher.hexdigest()[:16]
+
     if cache:
         meta = cache.with_suffix(".json")
         if cache.exists() and meta.exists():
@@ -512,13 +531,20 @@ def restrict_candidate_documents(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
     # --- score every document ------------------------------------------
     grp = df.groupby("document_id", observed=True)
-    doc_stats = pd.DataFrame(
-        {
-            "domain": grp["domain"].first(),
-            "n_chunks": grp.size(),
-            "n_buckets": grp["length_bucket"].nunique(),
-        }
-    )
+    agg_dict = {
+        "domain": "first",
+        "length_bucket": "nunique",
+        "n_chunks": ("domain", "size")
+    }
+    for c in flag_cols:
+        agg_dict[f"share_{c}"] = (c, "mean")
+
+    doc_stats = df.groupby("document_id", observed=True).agg(**{
+        "domain": ("domain", "first"),
+        "n_buckets": ("length_bucket", "nunique"),
+        "n_chunks": ("domain", "size"),
+        **{f"share_{c}": (c, "mean") for c in flag_cols}
+    })
     for c in flag_cols:
         doc_stats[f"share_{c}"] = grp[c].mean()
 
