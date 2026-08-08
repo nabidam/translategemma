@@ -19,7 +19,7 @@ model:
   # Hopper. Set "flash_attention_3" after installing the `speed` extra
   # (see pyproject.toml). FA3 requires compute capability >= 9.0 and CUDA
   # >= 12.3; CUDA 12.8 is recommended.
-  attn_implementation: "sdpa"
+  attn_implementation: "flash_attention_3"
   # QLoRA. On an H100 the 4-bit weights save VRAM you do not need and add a
   # dequantisation step to every matmul, so bf16 LoRA is usually faster.
   # Benchmark both; see docs/2026-08-03_training_speed_tier1_tier2_applied.md.
@@ -75,9 +75,9 @@ training:
   run_sft: true
   run_dpo: false
   seed: 42
-  batch_size: 4
-  eval_batch_size: 4
-  gradient_accumulation_steps: 4
+  batch_size: 64
+  eval_batch_size: 2
+  gradient_accumulation_steps: 1
   learning_rate: 2.0e-4
   dpo_learning_rate: 5.0e-6
   dpo_epochs: 1
@@ -97,7 +97,7 @@ training:
   # is what makes a large batch_size worth setting; see the measured numbers in
   # docs/2026-08-03_training_speed_tier1_tier2_applied.md. SFT only -- DPO
   # examples are not tokenized when the sampler is built.
-  group_by_length: true
+  group_by_length: false
   length_column_name: "length"
   gradient_checkpointing: true
   # Non-reentrant checkpointing is the supported path for LoRA: the reentrant
@@ -111,14 +111,14 @@ training:
   warmup_ratio: 0.03
   lr_scheduler_type: "cosine"
   logging_steps: 10
-  evaluation_strategy: "epoch"
+  evaluation_strategy: "steps"
   # Used when evaluation_strategy is "steps". Integers count optimizer update
   # steps (after gradient accumulation), not individual micro-batches.
   eval_steps: 500
-  save_strategy: "epoch"
+  save_strategy: "steps"
   # Used when save_strategy is "steps". When load_best_model_at_end is true,
   # save_steps must be a multiple of eval_steps.
-  save_steps: 500
+  save_steps: 250
   save_total_limit: 2
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
