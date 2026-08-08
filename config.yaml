@@ -112,11 +112,20 @@ training:
   lr_scheduler_type: "cosine"
   logging_steps: 10
   evaluation_strategy: "epoch"
+  # Used when evaluation_strategy is "steps". Integers count optimizer update
+  # steps (after gradient accumulation), not individual micro-batches.
+  eval_steps: 500
   save_strategy: "epoch"
+  # Used when save_strategy is "steps". When load_best_model_at_end is true,
+  # save_steps must be a multiple of eval_steps.
+  save_steps: 500
   save_total_limit: 2
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   greater_is_better: false
+  # null starts a new run; true resumes the newest checkpoint in the enabled
+  # stage's checkpoint directory; a string selects an explicit checkpoint-*.
+  # Resume only one of SFT/DPO at a time when using an explicit path.
   resume_from_checkpoint: null
   dataloader_num_workers: 2
   dataloader_pin_memory: true

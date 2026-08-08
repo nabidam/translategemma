@@ -87,6 +87,65 @@ test split is never used during training; after training, the evaluator optional
 compares the base model and adapter with deterministic decoding, COMET, MetricX, and a
 per-domain human-review CSV sample.
 
+## Checkpointing and resume
+
+SFT checkpoints are written below
+`<model.output_dir>/<model.sft_checkpoint_subdir>/checkpoint-<step>`; DPO checkpoints
+use `model.dpo_checkpoint_subdir`. A Trainer checkpoint contains the adapter weights
+and training state needed to continue, including optimizer, scheduler, global-step,
+and RNG state. The `sft_final` and `dpo_final` directories contain final adapters and
+are not resumable Trainer checkpoints.
+
+The default `save_strategy: "epoch"` writes a checkpoint after each completed epoch,
+so an interruption loses work since the previous epoch boundary. To checkpoint and
+evaluate by optimizer update step instead, configure matching step strategies:
+
+```yaml
+training:
+  evaluation_strategy: "steps"
+  eval_steps: 500
+  save_strategy: "steps"
+  save_steps: 500
+```
+
+An optimizer update happens after `gradient_accumulation_steps` micro-batches. When
+`load_best_model_at_end` is enabled, the save strategy must match the evaluation
+strategy and `save_steps` must be a multiple of `eval_steps`. `save_total_limit`
+controls how many checkpoints are retained. `gradient_checkpointing` is a separate
+memory-saving feature and does not create resumable checkpoints.
+
+To resume the latest SFT checkpoint automatically:
+
+```yaml
+training:
+  run_sft: true
+  run_dpo: false
+  resume_from_checkpoint: true
+```
+
+To select a checkpoint explicitly, use its directory (relative paths are resolved
+from the directory where `train.py` is launched):
+
+```yaml
+training:
+  run_sft: true
+  run_dpo: false
+  resume_from_checkpoint: "./translategemma-farsi-science/sft/checkpoint-12500"
+```
+
+Run the ordinary training command after changing the configuration. Keep the dataset,
+base model, LoRA parameters, batch/accumulation settings, optimizer, scheduler, and
+seed consistent with the interrupted run. The configured epoch count remains the
+total target, rather than a number of additional epochs.
+
+There is one shared `resume_from_checkpoint` setting for both stages. When using an
+explicit path, enable only the stage that owns that checkpoint. For example, resume
+DPO with `run_sft: false`, `run_dpo: true`, and a path below the DPO checkpoint
+directory. Passing an SFT path while both stages are enabled would also pass that path
+to the DPO trainer. With `resume_from_checkpoint: true`, each enabled stage searches
+its own checkpoint directory, but a stage with no checkpoint will fail rather than
+start fresh. Resume stages in separate invocations to avoid either ambiguity.
+
 ## Notes
 
 - Review `split_dataset.py`'s manifest before training. It records row counts,

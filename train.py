@@ -29,7 +29,7 @@ from trl import DPOTrainer
 
 from logging_utils import logger, setup_logging, log_config_summary, load_config
 
-from accelerate import Accelerator
+from accelerate import Accelerator, PartialState
 
 
 class RichLoggingCallback(TrainerCallback):
@@ -308,6 +308,7 @@ def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_
         "per_device_eval_batch_size": cfg["eval_batch_size"], "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
         "learning_rate": float(learning_rate), "num_train_epochs": epochs, "bf16": cfg["bf16"],
         "logging_steps": cfg["logging_steps"], "save_strategy": cfg["save_strategy"],
+        "save_steps": cfg["save_steps"], "eval_steps": cfg["eval_steps"],
         "save_total_limit": cfg["save_total_limit"], "load_best_model_at_end": cfg["load_best_model_at_end"] and has_eval_dataset,
         "metric_for_best_model": cfg["metric_for_best_model"], "greater_is_better": cfg["greater_is_better"],
         "warmup_ratio": cfg["warmup_ratio"], "lr_scheduler_type": cfg["lr_scheduler_type"],
@@ -440,7 +441,9 @@ def run_dry_run(config):
         dataset = validate_dpo_split(config["data"]["dpo_train_dataset_path"], config, 10)
         make_training_arguments(config, Path(config["model"]["output_dir"]) / config["model"]["dpo_checkpoint_subdir"], config["training"]["dpo_learning_rate"], config["training"]["dpo_epochs"], False)
         logger.info("DPO preflight passed: train=%s", len(dataset))
-    if config["evaluation"]["run_after_training"]:
+
+    state = PartialState()
+    if state.is_main_process and config["evaluation"]["run_after_training"]:
         test_data = load_sft_split(config["data"]["test_dataset_path"], config, "test", 10)
         required = {config["data"]["domain_column"]}
         if missing := required - set(test_data.column_names):
@@ -482,7 +485,9 @@ def run_pipeline(config, max_examples=None, max_steps=None):
         model, adapter_path = run_sft(model, processor, config, max_examples, max_steps)
     if config["training"]["run_dpo"]:
         adapter_path = run_dpo(model, processor, config, max_examples, max_steps)
-    if config["evaluation"]["run_after_training"]:
+        
+    state = PartialState()
+    if state.is_main_process and config["evaluation"]["run_after_training"]:
         del model, processor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

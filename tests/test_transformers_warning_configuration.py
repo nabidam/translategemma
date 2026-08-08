@@ -50,3 +50,28 @@ def test_checkpointed_training_disables_nested_text_cache():
 def test_pretokenized_collator_suppresses_inapplicable_padding_advice():
     source = Path("train.py").read_text(encoding="utf-8")
     assert 'deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True' in source
+
+
+def test_step_checkpoint_intervals_are_wired_from_config():
+    source = Path("train.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="train.py")
+    make_arguments = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "make_training_arguments"
+    )
+    arguments_dict = next(
+        node.value
+        for node in make_arguments.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "args" for target in node.targets)
+        and isinstance(node.value, ast.Dict)
+    )
+    configured_arguments = {
+        key.value: ast.unparse(value)
+        for key, value in zip(arguments_dict.keys, arguments_dict.values)
+        if isinstance(key, ast.Constant)
+    }
+
+    assert configured_arguments["save_steps"] == "cfg['save_steps']"
+    assert configured_arguments["eval_steps"] == "cfg['eval_steps']"
