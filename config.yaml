@@ -206,22 +206,64 @@ canary:
   evaluation_output_dir: "./evaluation-canary"
   resume_from_checkpoint: null
 
-# Runs the real SFT model/data/collator/Trainer path once for each local GPU
-# count. The 12B H200 recipe uses a per-device batch of 6 and reduces gradient
-# accumulation as GPUs increase, keeping the effective global batch at 48.
+# Runs the real SFT model/data/collator/Trainer path for the selected model-size
+# profiles and benchmark dimensions. Defaults follow the H200F size table in
+# docs/refs/multi_gpu_h200f.md. Profile values are recursively merged over the
+# built-in 4b/12b/27b definitions, so only deviations need to be listed here.
 benchmark:
+  types: [gpu_count, batch_size, training_options]
+  model_sizes: [4b, 12b, 27b]
+  model_profiles:
+    4b:
+      model:
+        base_model_id: "google/translategemma-4b-it"
+      per_device_batch_size: 12
+      effective_batch_size: 96
+      batch_sizes: [3, 6, 12]
+    12b:
+      model:
+        base_model_id: "google/translategemma-12b-it"
+      per_device_batch_size: 6
+      effective_batch_size: 48
+      batch_sizes: [2, 3, 6]
+    27b:
+      model:
+        base_model_id: "google/translategemma-27b-it"
+      per_device_batch_size: 2
+      effective_batch_size: 16
+      batch_sizes: [1, 2]
+
+  # GPU scaling varies world size and derives accumulation while preserving the
+  # selected model profile's effective global batch.
   gpu_counts: [1, 2, 4, 8]
-  # The placeholder is replaced for each gpu_counts entry. Every profile is
-  # validated to have the matching num_processes before the benchmark starts.
+
+  # The other two dimensions use a fixed GPU count so only the setting under
+  # study changes. Every batch_sizes entry must divide effective_batch_size
+  # after multiplication by batch_gpu_count.
+  batch_gpu_count: 1
+  training_options_gpu_count: 1
+  training_option_profiles:
+    - { name: checkpointing_packing, gradient_checkpointing: true, packing: true }
+    - { name: checkpointing_only, gradient_checkpointing: true, packing: false }
+    - { name: packing_only, gradient_checkpointing: false, packing: true }
+    - { name: neither, gradient_checkpointing: false, packing: false }
+
+  # The placeholder is replaced for every matrix entry and validated against
+  # the profile's num_processes before any training process starts.
   accelerate_config_pattern: "accelerate_configs/h200_{gpu_count}gpu.yaml"
-  per_device_batch_size: 6
-  effective_batch_size: 48
   max_examples: 20000
   max_steps: 200
-  # Discarded 1-GPU optimizer steps used to populate Triton/FA3 JIT caches
-  # before timing the matrix.
+  # Discarded 1-GPU optimizer steps per model size populate its shape-specific
+  # Triton/FA3 JIT caches before timing that model's matrix.
   warmup_steps: 5
   run_evaluation: true
+  # Sample device-level VRAM, utilization, power, temperature, and clocks with
+  # nvidia-smi during every measured job. Raw samples stay beside result.json.
+  collect_gpu_telemetry: true
+  telemetry_interval_seconds: 1.0
+  # Keep the matrix running after a worker failure (for example, an expected
+  # out-of-memory result with checkpointing disabled) and include it in reports.
+  fail_fast: false
   output_dir: "logs/training_benchmark"
   report_filename: "benchmark_results.json"
   # null preserves the process's CUDA_VISIBLE_DEVICES. Alternatively list the

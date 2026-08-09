@@ -53,17 +53,27 @@ accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
 accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
   train.py --config config.yaml --canary
 
-# Compare the same configured training path on each configured GPU count.
-# The bounded subset/step count and report paths come from `benchmark`.
+# Run the configured model-size and benchmark-dimension matrix. Built-in H200F
+# profiles select 4B=12/96, 12B=6/48, and 27B=2/16 micro/global batches.
+# The run ends with a Rich summary and writes JSON, CSV, Markdown, HTML, per-job
+# logs, and sampled GPU telemetry. See docs/TRAINING_BENCHMARKS.md.
 python scripts/benchmark_training.py --config config.yaml
 
-# Benchmark a smaller matrix or override its bounds without editing YAML.
+# Benchmark only GPU scaling for one model size.
 python scripts/benchmark_training.py --config config.yaml \
+  --benchmark-types gpu_count --model-sizes 12b \
   --gpu-counts 1 2 4 --max-examples 20000 --max-steps 200
 
-# Batch targets can also be overridden; accumulation is derived automatically.
+# Compare per-device batches on 4 GPUs while keeping the effective global batch
+# fixed. Accumulation is derived and non-divisible combinations fail early.
 python scripts/benchmark_training.py --config config.yaml \
-  --per-device-batch-size 6 --effective-batch-size 48
+  --benchmark-types batch_size --model-sizes 4b \
+  --batch-gpu-count 4 --batch-sizes 3 6 12
+
+# Compare all configured checkpointing/packing combinations at a fixed GPU count.
+python scripts/benchmark_training.py --config config.yaml \
+  --benchmark-types training_options --model-sizes 12b \
+  --training-options-gpu-count 4
 
 # 4. Evaluate an existing adapter (or inspect final outputs again).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
@@ -73,6 +83,8 @@ Throughput settings (`model.dtype`, `model.attn_implementation`,
 `model.use_4bit`, `training.use_liger_kernel`, `training.max_length`) and the
 measurements they still need are documented in
 [docs/2026-08-03_training_speed_tier1_tier2_applied.md](docs/2026-08-03_training_speed_tier1_tier2_applied.md).
+Benchmark profiles, comparison rules, and output fields are documented in
+[docs/TRAINING_BENCHMARKS.md](docs/TRAINING_BENCHMARKS.md).
 The production DDP recipe keeps an effective packed-block batch of 48 by deriving
 gradient accumulation from the active GPU count. Rank zero tokenizes and BFD-packs
 the SFT split into `data.prepared_cache_dir` before model weights are loaded; other
