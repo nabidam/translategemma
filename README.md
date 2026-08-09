@@ -79,6 +79,32 @@ python scripts/benchmark_training.py --config config.yaml \
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
 ```
 
+## Finding the evaluation batch size
+
+`scripts/benchmark_eval_batch.py` performs one tiny SFT run using the normal
+configuration, then evaluates the resulting model on the configured validation
+split with each candidate `per-device` evaluation batch size. It does not load
+or evaluate the test split. The default search trains on one example for one
+optimizer step and tests the values in `eval_batch_search.eval_batch_sizes`.
+
+Run it with the Accelerate profile matching the hardware:
+
+```bash
+accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
+  scripts/benchmark_eval_batch.py --config config.yaml
+```
+
+The script prints a Rich results table and summary, stops at the first
+out-of-memory candidate in the ascending sweep, and writes the machine-readable
+report to `logs/eval_batch_search/eval_batch_results.json`. To test a different
+candidate set:
+
+```bash
+accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
+  scripts/benchmark_eval_batch.py --config config.yaml \
+  --eval-batch-sizes 2 4 6 8 12 16
+```
+
 Throughput settings (`model.dtype`, `model.attn_implementation`,
 `model.use_4bit`, `training.use_liger_kernel`, `training.max_length`) and the
 measurements they still need are documented in

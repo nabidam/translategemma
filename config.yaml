@@ -275,3 +275,13 @@ benchmark:
   # null preserves the process's CUDA_VISIBLE_DEVICES. Alternatively list the
   # physical GPU IDs all benchmark jobs may use, for example [0, 1, 2, 3].
   devices: null
+
+# Fast, config-driven search for the validation per-device batch size. The helper
+# script performs one tiny SFT step, then evaluates the same trained model with
+# each candidate. It never loads or evaluates the held-out test split.
+eval_batch_search:
+  train_max_examples: 1
+  validation_max_examples: null # null evaluates the complete configured validation split.
+  max_steps: 1
+  eval_batch_sizes: [2, 4, 6, 8, 12]
+  output_dir: "logs/eval_batch_search"
