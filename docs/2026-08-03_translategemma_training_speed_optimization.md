@@ -226,7 +226,8 @@ Recommended setup:
 Launch example:
 
 ```bash
-accelerate launch   --multi_gpu   --num_processes 4   train.py   --config config.yaml
+accelerate launch --config_file accelerate_configs/h200_4gpu.yaml \
+  train.py --config config.yaml
 ```
 
 Effective batch size must include the number of GPUs:
