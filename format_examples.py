@@ -6,15 +6,15 @@ from language_pairs import resolve_language_pair
 def format_to_translategemma_schema(examples):
     conversations = []
     row_count = len(examples["english"])
-    source_langs = examples.get("source_lang_code", [None] * row_count)
-    target_langs = examples.get("target_lang_code", [None] * row_count)
+    source_langs = examples.get("src_lang", [None] * row_count)
+    target_langs = examples.get("tgt_lang", [None] * row_count)
     for source_text, target_text, row_source_lang, row_target_lang in zip(
         examples["english"], examples["farsi"], source_langs, target_langs
     ):
         source_lang, target_lang = resolve_language_pair(
             {
-                "source_lang_code": row_source_lang,
-                "target_lang_code": row_target_lang,
+                "src_lang": row_source_lang,
+                "tgt_lang": row_target_lang,
             },
             {"source_lang": "en", "target_lang": "fa"},
         )

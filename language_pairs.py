@@ -1,7 +1,7 @@
 """Language-pair resolution shared by training, analysis, and evaluation."""
 
-DEFAULT_SOURCE_LANG_COLUMN = "source_lang_code"
-DEFAULT_TARGET_LANG_COLUMN = "target_lang_code"
+DEFAULT_SOURCE_LANG_COLUMN = "src_lang"
+DEFAULT_TARGET_LANG_COLUMN = "tgt_lang"
 
 
 def _language_code(value):

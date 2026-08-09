@@ -27,13 +27,13 @@ SFT JSONL records must contain the text columns configured in `data`: by default
 segments from the same document, for example `42:17`. The splitter uses the part
 before `:` so a document can never appear in more than one split.
 
-Each record may also contain `source_lang_code` and `target_lang_code`. These values
+Each record may also contain `src_lang` and `tgt_lang`. These values
 override the config-level `data.source_lang` and `data.target_lang` for that record,
 so one dataset can mix directions such as English→Persian and Russian→Persian:
 
 ```json
-{"id":"1:1","domain":"science","source_text":"Hello","target_text":"سلام","source_lang_code":"en","target_lang_code":"fa"}
-{"id":"2:1","domain":"science","source_text":"Привет","target_text":"سلام","source_lang_code":"ru","target_lang_code":"fa"}
+{"id":"1:1","domain":"science","source_text":"Hello","target_text":"سلام","src_lang":"en","tgt_lang":"fa"}
+{"id":"2:1","domain":"science","source_text":"Привет","target_text":"سلام","src_lang":"ru","tgt_lang":"fa"}
 ```
 
 Old records without these fields continue to use the config-level pair. The column

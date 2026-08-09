@@ -66,8 +66,8 @@ def test_create_splits_with_zero_validation_and_test_copies_input_to_train(tmp_p
 def test_create_splits_does_not_deduplicate_across_language_pairs(tmp_path):
     source = tmp_path / "source.jsonl"
     rows = [
-        {"id": "a:1", "domain": "science", "source": "radio", "target": "رادیو", "source_lang_code": "en", "target_lang_code": "fa"},
-        {"id": "b:1", "domain": "science", "source": "radio", "target": "رادیو", "source_lang_code": "ru", "target_lang_code": "fa"},
+        {"id": "a:1", "domain": "science", "source": "radio", "target": "رادیو", "src_lang": "en", "tgt_lang": "fa"},
+        {"id": "b:1", "domain": "science", "source": "radio", "target": "رادیو", "src_lang": "ru", "tgt_lang": "fa"},
     ]
     source.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
     config = {

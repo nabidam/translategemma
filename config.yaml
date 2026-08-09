@@ -34,8 +34,8 @@ data:
   target_lang: "fa"
   # Optional per-row overrides. A row may set these fields to train/evaluate a
   # different direction; absent fields fall back to source_lang/target_lang.
-  source_lang_column: "source_lang_code"
-  target_lang_column: "target_lang_code"
+  source_lang_column: "src_lang"
+  target_lang_column: "tgt_lang"
   source_column: "source_text"
   target_column: "target_text"
   # Optional DPO response column names; defaults remain compatible with old data.

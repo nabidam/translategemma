@@ -6,6 +6,7 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from language_pairs import DEFAULT_SOURCE_LANG_COLUMN, DEFAULT_TARGET_LANG_COLUMN
 from logging_utils import load_config
 
 
@@ -86,8 +87,8 @@ def create_splits(config):
             original,
             data_cfg["source_column"],
             (
-                data_cfg.get("source_lang_column", "source_lang_code"),
-                data_cfg.get("target_lang_column", "target_lang_code"),
+                data_cfg.get("source_lang_column", DEFAULT_SOURCE_LANG_COLUMN),
+                data_cfg.get("target_lang_column", DEFAULT_TARGET_LANG_COLUMN),
             ),
         ) if split_cfg["deduplicate_by_source"] else original
     )
