@@ -32,8 +32,8 @@ data:
   dpo_train_dataset_path: "data/dpo_train_farsi_science.jsonl"
   source_lang: "en"
   target_lang: "fa"
-  source_column: "english"
-  target_column: "farsi"
+  source_column: "source_text"
+  target_column: "target_text"
   id_column: "id"
   domain_column: "domain"
   # Rank zero writes immutable tokenized/packed datasets here; other ranks wait
