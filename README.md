@@ -111,6 +111,19 @@ production verification procedure. A concrete four-candidate Docker walkthrough
 is in
 [`docs/TRANSLATION_BENCHMARK_RUNBOOK.md`](docs/TRANSLATION_BENCHMARK_RUNBOOK.md).
 
+Generated candidates support data-parallel inference with the existing
+Accelerate profiles. For example, use four GPUs with:
+
+```bash
+docker compose run --rm trainer accelerate launch \
+  --config_file accelerate_configs/h200_4gpu.yaml \
+  benchmark_translations.py --config benchmark_config.yaml generate \
+  --candidates translategemma-12b-lora
+```
+
+Each GPU holds one full model replica. Run scoring and report generation later
+as ordinary single-process Compose commands.
+
 ## Finding the evaluation batch size
 
 `scripts/benchmark_eval_batch.py` performs one tiny SFT run using the normal

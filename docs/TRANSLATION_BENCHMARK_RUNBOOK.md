@@ -335,6 +335,21 @@ On an out-of-memory error, lower only this candidate's `generation.batch_size`
 and rerun. If a completed candidate configuration changed, replacement requires
 an explicit `--force`.
 
+### Multi-GPU NLLB generation
+
+To distribute the 500 rows over four GPUs, use the existing four-GPU
+Accelerate profile:
+
+```bash
+docker compose run --rm trainer accelerate launch \
+  --config_file accelerate_configs/h200_4gpu.yaml \
+  benchmark_translations.py --config benchmark_config.yaml generate \
+  --candidates nllb-finetuned
+```
+
+Use the matching 2-, 4-, or 8-GPU profile for the GPUs exposed through `GPUS`.
+`generation.batch_size` remains a per-GPU value.
+
 ## 10. Generate the fine-tuned TranslateGemma output
 
 ```bash
@@ -342,6 +357,21 @@ docker compose run --rm trainer python benchmark_translations.py \
   --config benchmark_config.yaml generate \
   --candidates translategemma-finetuned
 ```
+
+Four-GPU generation uses the same candidate and output contract:
+
+```bash
+docker compose run --rm trainer accelerate launch \
+  --config_file accelerate_configs/h200_4gpu.yaml \
+  benchmark_translations.py --config benchmark_config.yaml generate \
+  --candidates translategemma-finetuned
+```
+
+This is data-parallel inference: each GPU holds a complete model and processes
+a different row shard. It increases throughput but does not combine GPU memory
+to fit a model that is too large for one device. Rank shards are retained under
+`benchmark_output/candidates/<candidate-id>/distributed_shards/`, while rank
+zero produces the same canonical `translations.csv` used by scoring.
 
 Expected output:
 
@@ -389,6 +419,9 @@ Use a new container so no translation model occupies GPU memory:
 docker compose run --rm trainer python benchmark_translations.py \
   --config benchmark_config.yaml score
 ```
+
+Do not launch `score` or `report` with Accelerate. Those stages intentionally
+run once and reject a multi-process launch.
 
 This calculates transparent metrics, optional COMET and MetricX scores,
 preservation/failure metrics, paired bootstrap confidence intervals,
@@ -485,3 +518,27 @@ explorer.
   again for that candidate.
 - Keep `benchmark_output/candidates/*/manifest.json` and
   `benchmark_output/score_manifest.json` with any published result.
+
+## 16. Understanding the two length limits
+
+`training.max_length: 2048` in `config.yaml` and benchmark
+`max_new_tokens: 1024` do not describe the same quantity:
+
+- training `max_length` is the total rendered prompt, reference response, and
+  special-token length used by SFT;
+- benchmark `max_new_tokens` is only the maximum number of target tokens a
+  model may produce after receiving its inference prompt.
+
+The generation limit need not equal 2048. The model context window ultimately
+limits prompt plus output together. The configured 1024 is a generous safety
+ceiling for scientific translations. After generation, inspect the cap flag:
+
+```bash
+docker compose run --rm trainer python -c \
+  "import pandas as pd; from pathlib import Path; paths=Path('benchmark_output/candidates').glob('*/translations.csv'); [(lambda f, p: print(p.parent.name, int(f['hit_max_new_tokens'].fillna(False).sum())) if 'hit_max_new_tokens' in f else None)(pd.read_csv(p), p) for p in paths]"
+```
+
+Run it after every generated candidate completes. A non-zero count requires
+human inspection. If outputs are genuinely truncated, increase
+`max_new_tokens`, regenerate every affected generated candidate with `--force`,
+then score and report again.

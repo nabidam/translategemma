@@ -507,6 +507,21 @@ docker compose run --rm trainer python benchmark_translations.py \
     --config benchmark_config.yaml import
 ```
 
+Generation can use the same Accelerate profiles as training. For example, to
+split one candidate's evaluation rows over four GPUs:
+
+```bash
+docker compose run --rm trainer accelerate launch \
+    --config_file accelerate_configs/h200_4gpu.yaml \
+    benchmark_translations.py --config benchmark_config.yaml generate \
+    --candidates translategemma-finetuned
+```
+
+The 2-, 4-, and 8-GPU profiles provide single-node data-parallel inference:
+one complete model replica per GPU, deterministic row shards, and rank-zero
+assembly. They improve throughput but do not pool VRAM for an oversized model.
+Run `score` and `report` afterward without Accelerate.
+
 Open `benchmark_output/report.html` directly from the host. The companion
 `all_model_outputs.csv` contains one aligned translation column per candidate.
 The complete benchmark configuration and artifact contract are documented in

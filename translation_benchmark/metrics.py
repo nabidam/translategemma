@@ -25,6 +25,7 @@ METRIC_DIRECTIONS = {
     "formula_preservation": "higher",
     "empty_output": "lower",
     "source_copy": "lower",
+    "hit_max_new_tokens": "lower",
     "comet": "higher",
     "metricx": "lower",
 }
@@ -143,6 +144,8 @@ def summarize_scores(frame: pd.DataFrame) -> pd.DataFrame:
     aggregations = {metric: "mean" for metric in metrics}
     if "latency_seconds" in frame.columns:
         aggregations["latency_seconds"] = "mean"
+    if "output_tokens" in frame.columns:
+        aggregations["output_tokens"] = "mean"
     group_columns = [
         column for column in ["candidate_id", "candidate_label", "candidate_family", "candidate_size"]
         if column in frame.columns

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from accelerate import PartialState
 from rich.console import Console
 
 from translation_benchmark.config import load_benchmark_config
@@ -34,26 +35,37 @@ def main() -> None:
     args = parse_args()
     config = load_benchmark_config(args.config)
     console = Console()
+    state = PartialState()
+    if args.command == "run" and state.num_processes > 1:
+        raise RuntimeError(
+            "The combined `run` command is single-process. Use Accelerate only for `generate` or `collect`, "
+            "then run `score` and `report` in fresh single-process containers."
+        )
     if args.command == "validate":
-        console.print_json(json.dumps(validate(config), ensure_ascii=False))
+        if state.is_main_process:
+            console.print_json(json.dumps(validate(config), ensure_ascii=False))
         return
     if args.command in {"collect", "generate", "import"}:
         kind = {"generate": "generated", "import": "imported"}.get(args.command)
         paths = collect(config, args.candidates, kind, args.force)
-        console.print(f"Collected {len(paths)} candidate output(s).")
+        if state.is_main_process:
+            console.print(f"Collected {len(paths)} candidate output(s) with {state.num_processes} process(es).")
         return
     if args.command == "score":
         paths = score(config, args.candidates)
-        console.print(f"Scores written to {config.output_dir}")
+        if state.is_main_process:
+            console.print(f"Scores written to {config.output_dir}")
         return
     if args.command == "report":
         html_path, _ = report(config)
-        console.print(f"HTML report: {html_path}")
+        if state.is_main_process:
+            console.print(f"HTML report: {html_path}")
         return
     collect(config, args.candidates, None, args.force)
     score(config, args.candidates)
     html_path, _ = report(config)
-    console.print(f"Benchmark complete. HTML report: {html_path}")
+    if state.is_main_process:
+        console.print(f"Benchmark complete. HTML report: {html_path}")
 
 
 if __name__ == "__main__":

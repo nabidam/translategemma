@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import platform
 import time
+import json
 from typing import Any, Protocol
 
 import pandas as pd
+from accelerate import PartialState
 
 from .config import BenchmarkConfig
-from .io import write_candidate_output
+from .io import candidate_dir, candidate_output_path, write_candidate_output
 
 
 class TranslationRunner(Protocol):
-    def translate(self, texts: list[str]) -> tuple[list[str], list[float]]: ...
+    def translate(self, texts: list[str]) -> tuple[list[str], list[float], list[int]]: ...
     def close(self) -> None: ...
 
 
@@ -63,7 +65,7 @@ class TranslateGemmaRunner:
             self.model = PeftModel.from_pretrained(self.model, adapter, **adapter_kwargs)
         self.model.eval()
 
-    def translate(self, texts: list[str]) -> tuple[list[str], list[float]]:
+    def translate(self, texts: list[str]) -> tuple[list[str], list[float], list[int]]:
         conversations = [[{"role": "user", "content": [{
             "type": "text", "source_lang_code": self.source_lang,
             "target_lang_code": self.target_lang, "text": text,
@@ -88,8 +90,10 @@ class TranslateGemmaRunner:
             output = self.model.generate(**inputs, **kwargs)
         elapsed = time.perf_counter() - started
         input_width = inputs["input_ids"].shape[1]
-        translations = self.processor.batch_decode(output[:, input_width:], skip_special_tokens=True)
-        return [text.strip() for text in translations], [elapsed / len(texts)] * len(texts)
+        generated_tokens = output[:, input_width:]
+        translations = self.processor.batch_decode(generated_tokens, skip_special_tokens=True)
+        token_counts = (generated_tokens != pad_id).sum(dim=1).tolist()
+        return [text.strip() for text in translations], [elapsed / len(texts)] * len(texts), token_counts
 
     def close(self) -> None:
         del self.model, self.processor
@@ -121,7 +125,7 @@ class NllbRunner:
         self.model.eval()
         self.target_lang = candidate["target_lang"]
 
-    def translate(self, texts: list[str]) -> tuple[list[str], list[float]]:
+    def translate(self, texts: list[str]) -> tuple[list[str], list[float], list[int]]:
         tokenize_kwargs = {"padding": True, "truncation": True, "return_tensors": "pt"}
         if self.settings.get("max_source_tokens"):
             tokenize_kwargs["max_length"] = int(self.settings["max_source_tokens"])
@@ -142,7 +146,14 @@ class NllbRunner:
             output = self.model.generate(**inputs, **kwargs)
         elapsed = time.perf_counter() - started
         translations = self.tokenizer.batch_decode(output, skip_special_tokens=True)
-        return [text.strip() for text in translations], [elapsed / len(texts)] * len(texts)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            token_counts = [int(output.shape[1])] * len(texts)
+        else:
+            # Seq2seq outputs include one decoder-start token. Exclude it from
+            # the count so this stays comparable to causal generated tokens.
+            token_counts = [max(0, int(value) - 1) for value in (output != pad_id).sum(dim=1).tolist()]
+        return [text.strip() for text in translations], [elapsed / len(texts)] * len(texts), token_counts
 
     def close(self) -> None:
         del self.model, self.tokenizer
@@ -153,13 +164,14 @@ class NllbRunner:
 RUNNERS = {"translategemma": TranslateGemmaRunner, "nllb": NllbRunner}
 
 
-def generate_candidate(config: BenchmarkConfig, candidate: dict[str, Any], dataset: pd.DataFrame, dataset_manifest: dict[str, Any]):
-    profiles = config.raw.get("generation_profiles", {})
-    settings = {**profiles.get(candidate.get("generation_profile"), {}), **candidate.get("generation", {})}
-    batch_size = int(settings.get("batch_size", 1))
-    if batch_size <= 0:
-        raise ValueError("generation batch_size must be positive.")
-    runner = RUNNERS[candidate["runner"]](candidate, settings)
+def _generate_local_shard(
+    candidate: dict[str, Any],
+    settings: dict[str, Any],
+    dataset: pd.DataFrame,
+    device: Any,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    runtime_candidate = {**candidate, "device": str(device)}
+    runner = RUNNERS[candidate["runner"]](runtime_candidate, settings)
     environment = {
         "python": platform.python_version(),
         "torch": runner.torch.__version__,
@@ -168,28 +180,89 @@ def generate_candidate(config: BenchmarkConfig, candidate: dict[str, Any], datas
     }
     translations: list[str] = []
     latencies: list[float] = []
+    output_token_counts: list[int] = []
+    batch_size = int(settings.get("batch_size", 1))
     try:
         sources = dataset["source"].tolist()
         for offset in range(0, len(sources), batch_size):
-            batch_translations, batch_latencies = runner.translate(sources[offset:offset + batch_size])
+            batch_translations, batch_latencies, batch_token_counts = runner.translate(
+                sources[offset:offset + batch_size]
+            )
             translations.extend(batch_translations)
             latencies.extend(batch_latencies)
+            output_token_counts.extend(batch_token_counts)
     finally:
         runner.close()
-    if len(translations) != len(dataset) or len(latencies) != len(dataset):
+    lengths = {len(translations), len(latencies), len(output_token_counts), len(dataset)}
+    if len(lengths) != 1:
         raise RuntimeError(
-            f"Runner returned {len(translations)} translations and {len(latencies)} latencies "
-            f"for {len(dataset)} examples."
+            f"Runner returned translations={len(translations)}, latencies={len(latencies)}, "
+            f"token_counts={len(output_token_counts)} for {len(dataset)} examples."
         )
+    max_new_tokens = int(settings.get("max_new_tokens", 512))
     output = pd.DataFrame({
-        "example_id": dataset["example_id"],
+        "example_id": dataset["example_id"].tolist(),
         "translation": translations,
         "status": ["ok" if value else "empty" for value in translations],
         "latency_seconds": latencies,
-        "source_chars": dataset["source"].str.len(),
+        "source_chars": dataset["source"].str.len().tolist(),
         "output_chars": [len(value) for value in translations],
+        "output_tokens": output_token_counts,
+        "hit_max_new_tokens": [count >= max_new_tokens for count in output_token_counts],
     })
-    return write_candidate_output(config, candidate, output, dataset_manifest, {
-        "generation_settings": settings,
-        "environment": environment,
-    })
+    return output, environment
+
+
+def generate_candidate(config: BenchmarkConfig, candidate: dict[str, Any], dataset: pd.DataFrame, dataset_manifest: dict[str, Any]):
+    profiles = config.raw.get("generation_profiles", {})
+    settings = {**profiles.get(candidate.get("generation_profile"), {}), **candidate.get("generation", {})}
+    batch_size = int(settings.get("batch_size", 1))
+    if batch_size <= 0:
+        raise ValueError("generation batch_size must be positive.")
+    state = PartialState()
+    local_dataset = dataset.iloc[state.process_index::state.num_processes].copy()
+    if local_dataset.empty:
+        local_output = pd.DataFrame(columns=[
+            "example_id", "translation", "status", "latency_seconds", "source_chars",
+            "output_chars", "output_tokens", "hit_max_new_tokens",
+        ])
+        environment = {"python": platform.python_version(), "device": str(state.device)}
+    else:
+        device = state.device if state.num_processes > 1 else candidate.get("device", state.device)
+        local_output, environment = _generate_local_shard(candidate, settings, local_dataset, device)
+
+    shard_dir = candidate_dir(config, candidate["id"]) / "distributed_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_dir / f"rank-{state.process_index:05d}.csv"
+    local_output.to_csv(shard_path, index=False)
+    (shard_dir / f"rank-{state.process_index:05d}.json").write_text(
+        json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    state.wait_for_everyone()
+
+    if state.is_main_process:
+        shard_frames = [
+            pd.read_csv(shard_dir / f"rank-{rank:05d}.csv", dtype={"example_id": str})
+            for rank in range(state.num_processes)
+        ]
+        combined = pd.concat(shard_frames, ignore_index=True)
+        if combined["example_id"].duplicated().any():
+            raise RuntimeError(f"Distributed generation produced duplicate IDs for {candidate['id']}.")
+        ordered = dataset[["example_id"]].merge(combined, on="example_id", how="left", validate="one_to_one")
+        if ordered["translation"].isna().any():
+            missing = ordered.loc[ordered["translation"].isna(), "example_id"].tolist()
+            raise RuntimeError(f"Distributed generation missed {len(missing)} IDs for {candidate['id']}.")
+        environments = [
+            json.loads((shard_dir / f"rank-{rank:05d}.json").read_text(encoding="utf-8"))
+            for rank in range(state.num_processes)
+        ]
+        write_candidate_output(config, candidate, ordered, dataset_manifest, {
+            "generation_settings": settings,
+            "distributed": {
+                "strategy": "data_parallel",
+                "num_processes": state.num_processes,
+                "environments": environments,
+            },
+        })
+    state.wait_for_everyone()
+    return candidate_output_path(config, candidate["id"])

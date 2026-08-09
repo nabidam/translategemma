@@ -55,6 +55,38 @@ The stages have independent commands:
 - `report`: rebuild HTML/Markdown from already-calculated scores;
 - `run`: collect, score, and report in one invocation.
 
+## Multi-GPU generation
+
+Generation supports single-node data parallelism through the checked-in
+Accelerate profiles. Every process loads one complete model replica on its
+assigned GPU and translates a deterministic strided subset of evaluation rows.
+Each rank writes an auditable shard below the candidate directory; rank zero
+validates IDs, restores dataset order, and publishes the canonical
+`translations.csv` and manifest.
+
+For four GPUs:
+
+```bash
+docker compose run --rm trainer accelerate launch \
+  --config_file accelerate_configs/h200_4gpu.yaml \
+  benchmark_translations.py --config benchmark_config.yaml generate \
+  --candidates translategemma-12b-lora
+```
+
+Select the matching `h200_2gpu.yaml`, `h200_4gpu.yaml`, or `h200_8gpu.yaml`
+profile. Compose must expose at least that many devices through `GPUS`. The
+candidate `generation.batch_size` is per process/GPU, so aggregate batch
+throughput is approximately that value multiplied by the process count.
+
+This mode accelerates a model that already fits on one GPU. It is not tensor or
+pipeline parallelism and cannot make an oversized checkpoint fit by combining
+VRAM. Run different candidates sequentially, not one candidate per rank.
+
+Use Accelerate only for `generate` (or `collect` when all generated candidates
+should run). Run `score` and `report` normally in fresh single-process
+containers. The combined `run` command deliberately rejects a multi-process
+launch, preventing ranks from racing on score/report artifacts.
+
 ## Dataset contract
 
 CSV, TSV, JSON, JSONL, and Parquet inputs are supported. Configure the column
@@ -239,6 +271,7 @@ The transparent metrics run by default:
 | formula preservation | higher | Fraction of detected formula-like strings retained |
 | empty output | lower | Candidate returned no text |
 | source copy | lower | Candidate copied the complete source unchanged |
+| generation-cap hit | lower | Generated output reached configured `max_new_tokens` |
 
 Preservation scores are blank when the source contains no applicable item; the
 summary mean therefore describes only relevant examples.
@@ -251,6 +284,26 @@ directions explicitly.
 Do not interpret any single metric as ground truth. Use learned metrics for
 semantic quality, chrF++ for a transparent second view, preservation checks for
 scientific content, and the aligned HTML examples for direct inspection.
+
+### `max_new_tokens` versus training `max_length`
+
+These settings have different scopes:
+
+- `training.max_length: 2048` limits the complete tokenized training sequence:
+  rendered source prompt plus reference target and special tokens. It controls
+  training truncation and packed-block size.
+- `generation_profiles.*.max_new_tokens: 1024` limits only tokens generated
+  after the inference prompt. The source prompt is not included in this count.
+
+There is therefore no requirement that the two values match. The model's own
+context window still constrains prompt tokens plus generated tokens. A value of
+1024 is a conservative ceiling for long scientific translations, not a target
+output length. Every generated candidate CSV records `output_tokens` and
+`hit_max_new_tokens`; the latter is also summarized as a lower-is-better
+failure metric. If any legitimate rows reach the ceiling, inspect them and
+raise the shared generation cap before the final comparison. Keep the cap and
+decoding profile identical across candidates unless the report explicitly
+defines a separate best-configured track.
 
 ## Paired model comparisons
 

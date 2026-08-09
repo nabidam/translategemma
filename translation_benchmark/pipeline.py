@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from accelerate import PartialState
 
 from .config import BenchmarkConfig, stable_hash
 from .generation import generate_candidate
@@ -36,6 +37,7 @@ def _should_reuse(config: BenchmarkConfig, candidate: dict[str, Any], dataset_ma
 
 
 def collect(config: BenchmarkConfig, requested: list[str] | None = None, kind: str | None = None, force: bool = False) -> list[Path]:
+    state = PartialState()
     dataset, dataset_manifest = load_dataset(config)
     outputs: list[Path] = []
     for candidate in config.selected_candidates(requested, kind):
@@ -43,13 +45,22 @@ def collect(config: BenchmarkConfig, requested: list[str] | None = None, kind: s
             outputs.append(candidate_output_path(config, candidate["id"]))
             continue
         if candidate["type"] == "imported":
-            outputs.append(import_candidate(config, candidate, dataset, dataset_manifest))
+            if state.is_main_process:
+                import_candidate(config, candidate, dataset, dataset_manifest)
+            state.wait_for_everyone()
+            outputs.append(candidate_output_path(config, candidate["id"]))
         else:
             outputs.append(generate_candidate(config, candidate, dataset, dataset_manifest))
     return outputs
 
 
 def score(config: BenchmarkConfig, requested: list[str] | None = None) -> dict[str, Path]:
+    state = PartialState()
+    if state.num_processes > 1:
+        raise RuntimeError(
+            "Scoring is a single-process stage. Run it with `docker compose run --rm trainer python ... score` "
+            "after multi-GPU generation completes."
+        )
     dataset, dataset_manifest = load_dataset(config)
     candidates = config.selected_candidates(requested)
     frames: list[pd.DataFrame] = []
@@ -103,6 +114,9 @@ def score(config: BenchmarkConfig, requested: list[str] | None = None) -> dict[s
 
 
 def report(config: BenchmarkConfig) -> tuple[Path, Path]:
+    state = PartialState()
+    if state.num_processes > 1:
+        raise RuntimeError("Report rendering is single-process; do not launch it with Accelerate.")
     _, dataset_manifest = load_dataset(config)
     output = config.output_dir
     score_manifest_path = output / "score_manifest.json"

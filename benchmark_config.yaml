@@ -78,6 +78,8 @@ candidates:
 generation_profiles:
   deterministic:
     batch_size: 4
+    # Independent from training.max_length: this limits newly generated target
+    # tokens only. Rows that reach it are flagged in the candidate output.
     max_new_tokens: 1024
     do_sample: false
     num_beams: 1
