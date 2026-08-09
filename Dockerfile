@@ -120,8 +120,9 @@ RUN if [ "$INSTALL_FLASH_ATTN3" = "1" ]; then \
     fi \
     && rm -rf /tmp/wheels /tmp/verify_flash_attn3.py
 
-# MetricX is optional (evaluation.metricx_enabled in config.yaml). Build with
-# --build-arg INSTALL_METRICX=0 to skip it and drop the git dependency.
+# MetricX is optional (`evaluation.metricx_enabled` in config.yaml or
+# `metrics.metricx.enabled` in benchmark_config.yaml). Build with
+# --build-arg INSTALL_METRICX=0 to skip it and drop the vendored source.
 #
 # It is vendored as a source checkout on PYTHONPATH rather than pip-installed:
 # the repository has no pyproject.toml or setup.py, so `pip install git+...`

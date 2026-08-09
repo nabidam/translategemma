@@ -156,12 +156,26 @@ Sanity-check the resolved environment (no GPU needed):
 
 ```bash
 docker run --rm translategemma:cu128-py312 \
-  python -c "import torch, peft, trl, bitsandbytes, liger_kernel; print(torch.__version__, torch.version.cuda)"
+  python -c "import torch, peft, trl, bitsandbytes, liger_kernel, sacrebleu; print(torch.__version__, torch.version.cuda, sacrebleu.__version__)"
 docker run --rm translategemma:cu128-py312 cat /opt/resolved-requirements.txt
 ```
 
 `torch.version.cuda` must print `12.8`. For the named CUDA 13.0 image, replace
 the tag in both commands with `cu130-py312`; it must print `13.0`.
+
+Translation-benchmark compatibility by component:
+
+| Capability | Docker image status | Additional offline requirement |
+| --- | --- | --- |
+| CSV/JSON import, BLEU, chrF++, preservation metrics, HTML report | Included | Frozen dataset and imported files under `/workspace` |
+| TranslateGemma generation | Included through Transformers/PEFT | Every enabled size staged under `/models`; local LoRA directory under `/workspace` |
+| NLLB generation/fine-tuning comparison | Included through Transformers/PEFT | Enabled NLLB checkpoint staged under `/models`; adapter transferred or staged |
+| COMET scoring | Included | COMET checkpoint and indirect XLM-R tokenizer/config staged |
+| MetricX scoring | Included when `INSTALL_METRICX=1` | MetricX checkpoint and mT5 tokenizer staged |
+
+Thus the existing image design is compatible with the benchmark. The image
+provides code dependencies; §3.4 is what makes each configured model and metric
+actually runnable without a network.
 
 ### 3.3 Export the image
 
@@ -179,16 +193,23 @@ Roughly 5–6 GB compressed. Use `gzip` if `zstd` is unavailable on either side.
 
 ### 3.4 Stage the model weights
 
-Six repositories are needed, not one. `scripts/fetch_offline_assets.py` reads
-the ids out of `config.yaml` and `testset_config.yaml`, so the list follows your
-run configuration; the two indirect dependencies are resolved automatically.
+The required repository count follows the enabled training, test-set, and
+multi-model benchmark configuration. `scripts/fetch_offline_assets.py` reads
+IDs from `config.yaml`, `testset_config.yaml`, and `benchmark_config.yaml`; the
+indirect evaluator dependencies are resolved automatically. Enable every
+generated benchmark candidate that must be runnable on the offline host before
+staging. Disabled candidates are intentionally skipped to avoid transferring
+unused multi-gigabyte checkpoints; use repeated `--repo` arguments when a
+disabled candidate must still travel.
 
 | Repository | Used by | Staged | Approx. size |
 | --- | --- | --- | --- |
-| `google/translategemma-12b-it` | `train.py`, `evaluate_translations.py`, `inference.py` | full | ~24 GB |
-| `google/metricx-24-hybrid-large-v2p6` | `evaluate_translations.py` (`metricx_enabled`) | full | ~4.9 GB |
+| `google/translategemma-12b-it` | training, quick evaluation, and configured benchmark candidates | full | ~24 GB |
+| Other enabled TranslateGemma sizes | `benchmark_translations.py` | full | size-dependent |
+| Enabled NLLB checkpoints | `benchmark_translations.py` | full | size-dependent |
+| `google/metricx-24-hybrid-large-v2p6` | quick evaluation or benchmark MetricX | full | ~4.9 GB |
 | `google/mt5-xl` | MetricX tokenizer (`metricx_tokenizer_id`) | tokenizer only | ~20 MB |
-| `Unbabel/wmt22-comet-da` | `evaluate_translations.py` (`comet_enabled`) | full | ~2.3 GB |
+| `Unbabel/wmt22-comet-da` | quick evaluation or benchmark COMET | full | ~2.3 GB |
 | `xlm-roberta-large` | COMET's encoder — **indirect**, see below | tokenizer only | ~20 MB |
 | `sentence-transformers/LaBSE` | `build_test_set.py` embeddings | full | ~1.8 GB |
 
@@ -206,9 +227,10 @@ correct if you switch COMET models. It stages the id **literally as COMET
 requests it**: the hub cache is keyed by the exact string, so staging the
 canonical alias `FacebookAI/xlm-roberta-large` would miss.
 
-Only `google/translategemma-12b-it` is gated, and it is gated **manually** —
-request access on huggingface.co and wait for approval, which is not instant.
-The other five are open.
+TranslateGemma repositories may require manual access approval on
+huggingface.co. Request access for every configured size before staging and
+export an authorized `HF_TOKEN`. NLLB and the listed evaluator repositories are
+open at the time of writing.
 
 The staging script needs nothing from the project environment, so run it without
 installing the full dependency set:
@@ -216,14 +238,21 @@ installing the full dependency set:
 ```bash
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxx
 uv run --no-project --with huggingface_hub --with pyyaml \
-    python scripts/fetch_offline_assets.py --dest offline_assets/models
+    python scripts/fetch_offline_assets.py \
+    --config config.yaml \
+    --testset-config testset_config.yaml \
+    --benchmark-config benchmark_config.yaml \
+    --dest offline_assets/models
 
 tar -I 'zstd -10 -T0' -cf translategemma-models.tar.zst offline_assets/models
 ```
 
 The script prints every repository it staged and exits non-zero if any failed.
 `--dest` becomes `HF_HOME` in the container and must match `MODELS_DIR` in
-`.env`; snapshots land in `<dest>/hub`.
+`.env`; snapshots land in `<dest>/hub`. Explicit `processor`, `tokenizer`, and
+`adapter_repo` values on enabled generated candidates are also staged, including
+their configured model/adapter revision pins. A local
+`adapter` path is not a Hub asset and must travel with the run artifacts.
 
 ### 3.5 Stage the runtime packages (only if the GPU host lacks them)
 
@@ -251,6 +280,9 @@ translategemma-cu128-image.tar.zst (or translategemma-cu130-image.tar.zst) ~5-6 
 translategemma-models.tar.zst     ~30 GB
 translategemma-src.tar            (git archive HEAD, a few MB)
 data/sft_farsi_science.jsonl      ~140 MB  (corpus, not in the git archive)
+data/.../frozen_test.jsonl         evaluation set (if not already in data/)
+translategemma-farsi-science/...  local LoRA adapters used by benchmark candidates
+existing_translations/...         imported model outputs, if configured
 nvidia-*.deb / *.rpm / *.run      (only if needed)
 ```
 
@@ -353,6 +385,13 @@ mkdir -p data
 cp /media/usb/sft_farsi_science.jsonl data/
 ```
 
+Place the frozen benchmark dataset, local LoRA adapters, and imported
+translation files at the paths configured in `benchmark_config.yaml`. All must
+live inside the project tree (or another explicitly added bind mount) so they
+appear below `/workspace` in the container. The default
+`benchmark_output/` directory also lives there, so CSV and HTML reports remain
+on the host after each `docker compose run --rm` container exits.
+
 If the weights live elsewhere on the host (a shared NFS mount, a second disk),
 point `MODELS_DIR` in `.env` at that path instead of moving anything.
 
@@ -374,6 +413,12 @@ docker compose run --rm trainer python scripts/verify_flash_attn3.py
 Then, in order — each step is cheap and fails fast:
 
 ```bash
+# 0. Import every multi-model benchmark runtime dependency without loading
+#    model weights. This checks TranslateGemma/NLLB runners, CSV/HTML reporting,
+#    transparent metrics, COMET, and the vendored MetricX source.
+docker compose run --rm trainer python -c \
+  "import pandas, sacrebleu, torch, yaml; from comet import download_model, load_from_checkpoint; from metricx24.models import MT5ForRegression; from peft import PeftModel; from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoProcessor, AutoTokenizer; import translation_benchmark.config, translation_benchmark.generation, translation_benchmark.io, translation_benchmark.metrics, translation_benchmark.pipeline, translation_benchmark.report; print('translation benchmark dependency preflight: OK')"
+
 # 1. Config, paths and chat template only. No weights loaded.
 docker compose run --rm trainer python train.py --config config.yaml --dry-run
 
@@ -384,7 +429,20 @@ docker compose run --rm trainer python train.py --config config.yaml --smoke-tes
 #    from this before committing to a multi-day run.
 docker compose run --rm trainer \
     python scripts/analyze_token_lengths.py --config config.yaml
+
+# 4. Benchmark config, frozen dataset columns/IDs, and candidate definitions.
+#    No translation or evaluator weights are loaded.
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml validate
 ```
+
+The dependency preflight assumes the standard `INSTALL_METRICX=1` image. If the
+image was deliberately built with `INSTALL_METRICX=0`, remove only
+`from metricx24.models import MT5ForRegression` from that command and keep
+`metrics.metricx.enabled: false` in `benchmark_config.yaml`. An import failure
+here is an image/dependency problem; a missing Hugging Face snapshot appears
+later during generation or scoring and points to the staging procedure in
+§3.4.
 
 A successful `--smoke-test` proves the model loads from the offline cache, the
 configured precision path (`model.use_4bit`, `model.dtype`) runs on this GPU,
@@ -416,6 +474,44 @@ docker compose run --rm trainer python train.py       --config config.yaml
 docker compose run --rm trainer python evaluate_translations.py \
     --config config.yaml --adapter-path translategemma-farsi-science/sft_final
 ```
+
+Run the final multi-model benchmark as separate containers. This guarantees
+that translation-model VRAM is released before learned evaluators are loaded:
+
+```bash
+# Generate enabled TranslateGemma/NLLB candidates and canonicalize enabled
+# imported outputs. Existing candidate artifacts with matching hashes are reused.
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml collect
+
+# Score all collected outputs. Enable COMET/MetricX in benchmark_config.yaml
+# only when their checkpoints were staged in §3.4.
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml score
+
+# CPU-only report rendering; writes report.html plus CSV/Markdown artifacts.
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml report
+```
+
+For models with different VRAM requirements, collect one candidate at a time:
+
+```bash
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml generate \
+    --candidates translategemma-12b-base
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml generate \
+    --candidates nllb-600m-base
+docker compose run --rm trainer python benchmark_translations.py \
+    --config benchmark_config.yaml import
+```
+
+Open `benchmark_output/report.html` directly from the host. The companion
+`all_model_outputs.csv` contains one aligned translation column per candidate.
+The complete benchmark configuration and artifact contract are documented in
+`docs/TRANSLATION_BENCHMARK.md`. The complete four-candidate production command
+sequence is in `docs/TRANSLATION_BENCHMARK_RUNBOOK.md`.
 
 Or take an interactive shell and work normally — `pdb`, re-running scripts after
 editing them on the host, inspecting `logs/`:
@@ -466,13 +562,17 @@ above, because the `batch × seq × 262144` logit tensor is never materialised.
 The figures assume it is on. Turning it off may reintroduce OOMs that the
 old QLoRA defaults did not hit.
 
-Evaluation loads the base model, then the adapter, then MetricX, then COMET.
-On a 32 GB card, run evaluation as a separate step rather than via
+Quick evaluation loads the base model, then the adapter, then MetricX, then
+COMET. On a 32 GB card, run evaluation as a separate step rather than via
 `evaluation.run_after_training: true`, so training memory is fully released.
+For the multi-model benchmark, prefer separate `generate`, `score`, and
+`report` Compose commands. Each generated candidate is loaded and released in
+turn; a separate scoring container then loads COMET and MetricX without a
+translation model occupying VRAM.
 
 ### 6.2 MetricX-24 integration
 
-`evaluate_metricx()` was aligned with the reference implementation
+Both `evaluate_metricx()` and the benchmark MetricX scorer are aligned with the reference implementation
 (`metricx24/predict.py`, pinned at commit `fc4978eb`). Four things had to match,
 and all four fail *silently* — wrong scores, not exceptions — if changed:
 
@@ -502,7 +602,8 @@ docker compose run --rm trainer python -c \
 If `metricx24/models.py` ever breaks against a newer `transformers` (it
 subclasses `MT5PreTrainedModel`), change the commit SHA in the Dockerfile's
 `ADD https://codeload.github.com/...` line, or set
-`evaluation.metricx_enabled: false` and rely on COMET.
+`evaluation.metricx_enabled: false` plus `metrics.metricx.enabled: false` in
+`benchmark_config.yaml`, and rely on COMET.
 
 ### 6.3 The image needs a C compiler at runtime
 
@@ -536,7 +637,8 @@ from a loaded proxy.
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` make any missed download raise
 immediately instead of hanging on a connection timeout. If a run dies with
 "Cannot find the requested files in the disk cache", a repository was missed in
-§3.4 — add it with `--repo <id>` and re-stage.
+§3.4 — enable the relevant benchmark candidate, or add it with `--repo <id>`,
+and re-stage.
 
 ### 6.5 The model mount is writable on purpose
 

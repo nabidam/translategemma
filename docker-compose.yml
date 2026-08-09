@@ -23,8 +23,8 @@ services:
         #   IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
         INSTALL_FLASH_ATTN3: ${INSTALL_FLASH_ATTN3:-0}
 
-    # Run as the invoking host user so adapters, logs and evaluation CSVs
-    # written into the bind mounts are not owned by root.
+    # Run as the invoking host user so adapters, logs, benchmark HTML, and
+    # evaluation CSVs written into the bind mounts are not owned by root.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
 
     working_dir: /workspace

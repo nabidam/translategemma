@@ -1,0 +1,108 @@
+# Multi-model translation quality benchmark. This file is intentionally
+# independent from config.yaml: training-time evaluation and cross-model
+# comparison have different lifecycles.
+benchmark:
+  title: "English → Persian Translation Benchmark"
+  output_dir: "benchmark_output"
+  dataset:
+    path: "data/splits/test.jsonl"
+    source_lang: "en"
+    target_lang: "fa"
+    # max_examples: 500  # Optional deterministic prefix for a smoke run.
+    columns:
+      id: "id"
+      source: "source_text"
+      reference: "target_text"
+      domain: "domain"
+
+# CLI --candidates selects IDs from this list. Set enabled: false to keep an
+# example/configuration without including it in default runs.
+candidates:
+  - id: "translategemma-12b-base"
+    label: "TranslateGemma 12B — base"
+    family: "translategemma"
+    size: "12b"
+    type: "generated"
+    runner: "translategemma"
+    model: "google/translategemma-12b-it"
+    # revision: "<immutable Hub commit>"  # Recommended for published results.
+    source_lang: "en"
+    target_lang: "fa"
+    dtype: "bfloat16"
+    attn_implementation: "sdpa"
+    generation_profile: "deterministic"
+
+  - id: "translategemma-12b-lora"
+    label: "TranslateGemma 12B — LoRA"
+    family: "translategemma"
+    size: "12b"
+    type: "generated"
+    runner: "translategemma"
+    model: "google/translategemma-12b-it"
+    adapter: "translategemma-farsi-science/sft_final"
+    # For a Hub adapter use adapter_repo plus optional adapter_revision instead.
+    source_lang: "en"
+    target_lang: "fa"
+    dtype: "bfloat16"
+    attn_implementation: "sdpa"
+    generation_profile: "deterministic"
+
+  # NLLB language tags are model-specific, not ISO-639-1 codes.
+  - id: "nllb-600m-base"
+    label: "NLLB 600M — base"
+    family: "nllb"
+    size: "600m"
+    type: "generated"
+    runner: "nllb"
+    model: "facebook/nllb-200-distilled-600M"
+    source_lang: "eng_Latn"
+    target_lang: "pes_Arab"
+    dtype: "bfloat16"
+    generation_profile: "deterministic"
+    enabled: false
+
+  # Existing outputs can come from CSV, TSV, JSON/JSONL, or Parquet. IDs are
+  # joined strictly; row order is never trusted.
+  - id: "nllb-existing"
+    label: "NLLB — existing translations"
+    family: "nllb"
+    type: "imported"
+    path: "existing_translations/nllb.csv"
+    columns:
+      id: "id"
+      translation: "translation"
+    # Set true when this file covers a superset of the frozen evaluation IDs.
+    allow_extra_ids: false
+    enabled: false
+
+generation_profiles:
+  deterministic:
+    batch_size: 4
+    max_new_tokens: 1024
+    do_sample: false
+    num_beams: 1
+
+metrics:
+  transparent:
+    enabled: true
+    chrf_word_order: 2  # chrF++
+  comet:
+    enabled: false
+    model: "Unbabel/wmt22-comet-da"
+    batch_size: 8
+    gpus: 1
+  metricx:
+    enabled: false
+    model: "google/metricx-24-hybrid-large-v2p6"
+    tokenizer: "google/mt5-xl"
+    max_length: 1536
+
+statistics:
+  bootstrap_samples: 2000
+  seed: 42
+
+report:
+  # Any existing dataset columns can be used. Missing columns are ignored.
+  slices: ["domain", "has_math", "has_numbers_units", "has_acronyms", "has_mixed_script"]
+  # Omit example_metrics to show every calculated metric in the HTML explorer.
+  # A shorter view could use: [sentence_chrf, comet, metricx]

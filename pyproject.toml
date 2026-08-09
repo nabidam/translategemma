@@ -32,6 +32,8 @@ dependencies = [
     "datasketch>=2.0.0",
     "scikit-learn>=1.9.0",
     "sentence-transformers>=5.6.0",
+    # Direct dependency of the benchmark's auditable sentence BLEU/chrF scores.
+    "sacrebleu>=2.5.0",
 ]
 
 # Optional, and deliberately not a default dependency: FlashAttention 3 is a
