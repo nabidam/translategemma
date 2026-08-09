@@ -27,6 +27,7 @@ from transformers import (
 )
 from trl import DPOTrainer
 
+from canary_config import canary_run_config
 from logging_utils import logger, setup_logging, log_config_summary, load_config
 
 from accelerate import Accelerator, PartialState
@@ -406,6 +407,7 @@ def parse_args():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--dry-run", action="store_true", help="Validate enabled data and tokenization without loading the model or writing outputs.")
     modes.add_argument("--smoke-test", action="store_true", help="Run enabled stages with at most 10 examples and one training step in a temporary directory.")
+    modes.add_argument("--canary", action="store_true", help="Run the configured training loop on the smaller canary dataset subset.")
     return parser.parse_args()
 
 
@@ -511,6 +513,15 @@ if __name__ == "__main__":
                 smoke_config = smoke_test_config(config, Path(temp_dir))
                 logger.info("Smoke test: at most 10 rows per split, one training step, temporary outputs in %s", temp_dir)
                 run_pipeline(smoke_config, max_examples=10, max_steps=1)
+        elif args.canary:
+            canary_config, max_examples, max_steps = canary_run_config(config)
+            logger.info(
+                "Canary training: at most %s rows per split, max_steps=%s, outputs in %s",
+                max_examples,
+                max_steps or "configured epochs",
+                canary_config["model"]["output_dir"],
+            )
+            run_pipeline(canary_config, max_examples=max_examples, max_steps=max_steps)
         else:
             run_pipeline(config)
         logger.info("Pipeline complete.")

@@ -185,3 +185,15 @@ logging:
   logs_dir: "logs"
   level: "INFO"
   file_level: "DEBUG"
+
+# A real, isolated training run for validating the current model/data/trainer
+# stack before spending time on the full corpus. The same enabled stages and
+# training settings are used; only the dataset size and output locations differ.
+# Pass --canary to train.py to activate this section.
+canary:
+  max_examples: 32
+  max_steps: null # null uses the configured epoch count; set a positive integer to cap updates.
+  output_dir: "./translategemma-farsi-science-canary"
+  run_after_training: false
+  evaluation_output_dir: "./evaluation-canary"
+  resume_from_checkpoint: null

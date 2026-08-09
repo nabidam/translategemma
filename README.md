@@ -46,6 +46,9 @@ python train.py --config config.yaml --dry-run
 # Optional: run enabled stages with ≤10 rows per split and one train step in temporary outputs.
 python train.py --config config.yaml --smoke-test
 
+# Optional: run the actual configured training loop on the smaller canary subset.
+python train.py --config config.yaml --canary
+
 # 4. Evaluate an existing adapter (or inspect final outputs again).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
 ```
@@ -54,6 +57,13 @@ Throughput settings (`model.dtype`, `model.attn_implementation`,
 `model.use_4bit`, `training.use_liger_kernel`, `training.max_length`) and the
 measurements they still need are documented in
 [docs/2026-08-03_training_speed_tier1_tier2_applied.md](docs/2026-08-03_training_speed_tier1_tier2_applied.md).
+
+The canary run reads its limits and isolated output paths from the `canary` section
+of `config.yaml`. It uses the normal Trainer loop, including all configured enabled
+stages; `canary.max_examples` limits each loaded train/validation split. Set
+`canary.max_steps` to cap optimizer updates, or leave it `null` to use the configured
+epoch count. Canary runs start without a checkpoint unless a canary-specific resume
+path is configured.
 
 Locking is GPU- and toolkit-independent because `pyproject.toml` supplies FA3's
 static dependency metadata. Building the optional package requires CUDA >=12.3
