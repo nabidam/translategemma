@@ -29,8 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from datasets import load_dataset  # noqa: E402
 from transformers import AutoProcessor  # noqa: E402
 
+from language_pairs import resolve_language_pair  # noqa: E402
 from logging_utils import load_config, logger  # noqa: E402
-from train import format_translategemma_message, limit_dataset, map_workers  # noqa: E402
+from train import (  # noqa: E402
+    format_translategemma_message,
+    limit_dataset,
+    map_workers,
+)
 
 
 def measure_lengths(dataset, processor, config):
@@ -39,9 +44,10 @@ def measure_lengths(dataset, processor, config):
     tokenizer = processor.tokenizer
 
     def measure(example):
+        source_lang, target_lang = resolve_language_pair(example, data_cfg)
         messages = format_translategemma_message(
             example[data_cfg["source_column"]], example[data_cfg["target_column"]],
-            data_cfg["source_lang"], data_cfg["target_lang"],
+            source_lang, target_lang,
         )
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         return {"token_length": len(tokenizer(text, add_special_tokens=False)["input_ids"])}

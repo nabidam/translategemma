@@ -1,24 +1,38 @@
 import json
 
+from language_pairs import resolve_language_pair
+
 
 def format_to_translategemma_schema(examples):
     conversations = []
-    for en_text, fa_text in zip(examples["english"], examples["farsi"]):
+    row_count = len(examples["english"])
+    source_langs = examples.get("source_lang_code", [None] * row_count)
+    target_langs = examples.get("target_lang_code", [None] * row_count)
+    for source_text, target_text, row_source_lang, row_target_lang in zip(
+        examples["english"], examples["farsi"], source_langs, target_langs
+    ):
+        source_lang, target_lang = resolve_language_pair(
+            {
+                "source_lang_code": row_source_lang,
+                "target_lang_code": row_target_lang,
+            },
+            {"source_lang": "en", "target_lang": "fa"},
+        )
         message = [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "source_lang_code": "en",
-                        "target_lang_code": "fa",
-                        "text": en_text,
+                        "source_lang_code": source_lang,
+                        "target_lang_code": target_lang,
+                        "text": source_text,
                     }
                 ],
             },
             {
                 "role": "assistant",
-                "content": str(fa_text),  # Ensure this is a raw string
+                "content": str(target_text),  # Ensure this is a raw string
             },
         ]
         conversations.append(

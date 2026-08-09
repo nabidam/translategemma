@@ -61,3 +61,26 @@ def test_create_splits_with_zero_validation_and_test_copies_input_to_train(tmp_p
     assert (tmp_path / "splits" / "train.jsonl").read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
     assert not (tmp_path / "splits" / "validation.jsonl").exists()
     assert not (tmp_path / "splits" / "test.jsonl").exists()
+
+
+def test_create_splits_does_not_deduplicate_across_language_pairs(tmp_path):
+    source = tmp_path / "source.jsonl"
+    rows = [
+        {"id": "a:1", "domain": "science", "source": "radio", "target": "رادیو", "source_lang_code": "en", "target_lang_code": "fa"},
+        {"id": "b:1", "domain": "science", "source": "radio", "target": "رادیو", "source_lang_code": "ru", "target_lang_code": "fa"},
+    ]
+    source.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    config = {
+        "data": {"id_column": "id", "domain_column": "domain", "source_column": "source", "target_column": "target"},
+        "splitting": {
+            "input_dataset_path": str(source), "output_dir": str(tmp_path / "splits"),
+            "train_filename": "train.jsonl", "validation_filename": "validation.jsonl", "test_filename": "test.jsonl",
+            "group_id_delimiter": ":", "train_ratio": 0.5, "validation_ratio": 0.5, "test_ratio": 0.0,
+            "seed": 9, "deduplicate_by_source": True, "stratify_by_domain": False, "manifest_filename": "manifest.json",
+        },
+    }
+
+    manifest = create_splits(config)
+
+    assert manifest["duplicates_removed"] == 0
+    assert sum(split["rows"] for split in manifest["splits"].values()) == 2

@@ -10,8 +10,13 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from accelerate import Accelerator
 
+from language_pairs import resolve_language_pair
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
-from train import load_generation_safe_model_config, make_deterministic_generation_config, resolve_dtype
+from train import (
+    load_generation_safe_model_config,
+    make_deterministic_generation_config,
+    resolve_dtype,
+)
 
 
 def generate_translations(test_df, config, adapter_path=None):
@@ -37,7 +42,8 @@ def generate_translations(test_df, config, adapter_path=None):
     hypotheses = []
     for _, row in test_df.iterrows():
         source = row[data_cfg["source_column"]]
-        messages = [{"role": "user", "content": [{"type": "text", "source_lang_code": data_cfg["source_lang"], "target_lang_code": data_cfg["target_lang"], "text": source}]}]
+        source_lang, target_lang = resolve_language_pair(row, data_cfg)
+        messages = [{"role": "user", "content": [{"type": "text", "source_lang_code": source_lang, "target_lang_code": target_lang, "text": source}]}]
         # Processor chat templates render text unless tokenization is requested
         # explicitly. return_tensors only configures the tokenizer output; it
         # does not imply tokenize=True.

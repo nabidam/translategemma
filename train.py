@@ -1,4 +1,4 @@
-"""Config-driven QLoRA training for scientific English-to-Farsi TranslateGemma."""
+"""Config-driven QLoRA training for TranslateGemma."""
 
 import argparse
 import copy
@@ -32,12 +32,17 @@ from trl import DPOTrainer, pack_dataset
 from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
 from canary_config import canary_run_config
+from language_pairs import (
+    DEFAULT_SOURCE_LANG_COLUMN,
+    DEFAULT_TARGET_LANG_COLUMN,
+    resolve_language_pair,
+)
 from logging_utils import logger, setup_logging, log_config_summary, load_config
 
 from accelerate import Accelerator, PartialState
 
 
-PREPARED_CACHE_VERSION = 1
+PREPARED_CACHE_VERSION = 2
 
 
 class RichLoggingCallback(TrainerCallback):
@@ -215,9 +220,10 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
     boundary_marker = "<|translategemma-target-boundary|>"
 
     def tokenize_example(example):
+        source_lang, target_lang = resolve_language_pair(example, data_cfg)
         messages = format_translategemma_message(
             example[data_cfg["source_column"]], example[data_cfg["target_column"]],
-            data_cfg["source_lang"], data_cfg["target_lang"],
+            source_lang, target_lang,
         )
         full_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         # TranslateGemma's generation prompt is not guaranteed to be a literal token
@@ -292,8 +298,10 @@ def _prepared_cache_path(path, config, split_name, max_examples, packed, selecti
         "base_model_id": config["model"]["base_model_id"],
         "transformers_version": importlib.metadata.version("transformers"),
         "trl_version": importlib.metadata.version("trl"),
-        "source_lang": config["data"]["source_lang"],
-        "target_lang": config["data"]["target_lang"],
+        "source_lang": config["data"].get("source_lang"),
+        "target_lang": config["data"].get("target_lang"),
+        "source_lang_column": config["data"].get("source_lang_column", DEFAULT_SOURCE_LANG_COLUMN),
+        "target_lang_column": config["data"].get("target_lang_column", DEFAULT_TARGET_LANG_COLUMN),
         "source_column": config["data"]["source_column"],
         "target_column": config["data"]["target_column"],
         "max_length": train_cfg["max_length"],
@@ -614,15 +622,28 @@ def run_sft(model, processor, config, max_examples=None, max_steps=None, prepare
 def run_dpo(model, processor, config, max_examples=None, max_steps=None):
     data_cfg, model_cfg = config["data"], config["model"]
     dataset = load_dataset("json", data_files=data_cfg["dpo_train_dataset_path"], split="train")
-    required = {data_cfg["source_column"], "farsi_chosen", "farsi_rejected"}
+    chosen_column = data_cfg.get("dpo_chosen_column", "farsi_chosen")
+    rejected_column = data_cfg.get("dpo_rejected_column", "farsi_rejected")
+    required = {data_cfg["source_column"], chosen_column, rejected_column}
     if missing := required - set(dataset.column_names):
         raise ValueError(f"DPO dataset is missing columns: {sorted(missing)}")
     if not len(dataset):
         raise ValueError("DPO dataset contains no examples")
     dataset = limit_dataset(dataset, max_examples, "DPO train")
+
     def format_dpo(example):
-        prompt = format_translategemma_message(example[data_cfg["source_column"]], "", data_cfg["source_lang"], data_cfg["target_lang"])[0]
-        return {"prompt": [prompt], "chosen": [{"role": "assistant", "content": example["farsi_chosen"]}], "rejected": [{"role": "assistant", "content": example["farsi_rejected"]}]}
+        source_lang, target_lang = resolve_language_pair(example, data_cfg)
+        prompt = format_translategemma_message(
+            example[data_cfg["source_column"]], "", source_lang, target_lang
+        )[0]
+        return {
+            "prompt": [prompt],
+            "chosen": [{"role": "assistant", "content": example[chosen_column]}],
+            "rejected": [
+                {"role": "assistant", "content": example[rejected_column]}
+            ],
+        }
+
     dataset = dataset.map(format_dpo, remove_columns=dataset.column_names)
     args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["dpo_checkpoint_subdir"], config["training"]["dpo_learning_rate"], config["training"]["dpo_epochs"], False, max_steps)
     trainer = DPOTrainer(model=model, args=args, beta=config["training"]["dpo_beta"], train_dataset=dataset, processing_class=processor, callbacks=[RichLoggingCallback()])
@@ -650,7 +671,11 @@ def validate_dpo_split(path, config, max_examples=None):
     """Load and validate the DPO schema without constructing a trainer."""
     data_cfg = config["data"]
     dataset = load_dataset("json", data_files=path, split="train")
-    required = {data_cfg["source_column"], "farsi_chosen", "farsi_rejected"}
+    required = {
+        data_cfg["source_column"],
+        data_cfg.get("dpo_chosen_column", "farsi_chosen"),
+        data_cfg.get("dpo_rejected_column", "farsi_rejected"),
+    }
     if missing := required - set(dataset.column_names):
         raise ValueError(f"DPO dataset is missing columns: {sorted(missing)}")
     if not len(dataset):

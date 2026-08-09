@@ -32,8 +32,15 @@ data:
   dpo_train_dataset_path: "data/dpo_train_farsi_science.jsonl"
   source_lang: "en"
   target_lang: "fa"
+  # Optional per-row overrides. A row may set these fields to train/evaluate a
+  # different direction; absent fields fall back to source_lang/target_lang.
+  source_lang_column: "source_lang_code"
+  target_lang_column: "target_lang_code"
   source_column: "source_text"
   target_column: "target_text"
+  # Optional DPO response column names; defaults remain compatible with old data.
+  dpo_chosen_column: "farsi_chosen"
+  dpo_rejected_column: "farsi_rejected"
   id_column: "id"
   domain_column: "domain"
   # Rank zero writes immutable tokenized/packed datasets here; other ranks wait

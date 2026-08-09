@@ -32,13 +32,16 @@ def _load_records(path, required_columns):
     return records
 
 
-def _deduplicate(records, source_column):
+def _deduplicate(records, source_column, language_columns=()):
     unique, seen = [], set()
     for record in records:
-        source = record[source_column]
-        if source not in seen:
+        # The same text in two translation directions is not a duplicate.
+        key = tuple(record.get(column) for column in language_columns) + (
+            record[source_column],
+        )
+        if key not in seen:
             unique.append(record)
-            seen.add(source)
+            seen.add(key)
     return unique
 
 
@@ -79,7 +82,14 @@ def create_splits(config):
     # A zero/zero split request deliberately means "copy input to train". Do not
     # de-duplicate or repartition it, so the output is byte-for-record equivalent.
     records = original if copy_train_only else (
-        _deduplicate(original, data_cfg["source_column"]) if split_cfg["deduplicate_by_source"] else original
+        _deduplicate(
+            original,
+            data_cfg["source_column"],
+            (
+                data_cfg.get("source_lang_column", "source_lang_code"),
+                data_cfg.get("target_lang_column", "target_lang_code"),
+            ),
+        ) if split_cfg["deduplicate_by_source"] else original
     )
     assignments = _assign_groups(records, config)
     output_dir = Path(split_cfg["output_dir"])

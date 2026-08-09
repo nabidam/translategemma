@@ -1,8 +1,8 @@
-# TranslateGemma: scientific English → Farsi fine-tuning
+# TranslateGemma: multilingual scientific translation fine-tuning
 
-This directory contains the data preparation, QLoRA SFT, optional DPO, and evaluation
-tools for a scientific English-to-Farsi TranslateGemma adapter. All run choices are in
-`config.yaml`; save that file with every released adapter.
+This directory contains data preparation, QLoRA SFT, optional DPO, and evaluation
+tools for a scientific TranslateGemma adapter. `config.yaml` contains the run
+settings; save it with every released adapter.
 
 ## Setup
 
@@ -22,10 +22,25 @@ For an air-gapped machine, use the Docker environment instead — see
 
 ## Data contract
 
-SFT JSONL records must contain the columns configured in `data`: by default `id`,
-`domain`, `english`, and `farsi`. IDs must group neighbouring segments from the same
-document, for example `42:17`. The splitter uses the part before `:` so a document can
-never appear in more than one split.
+SFT JSONL records must contain the text columns configured in `data`: by default
+`id`, `domain`, `source_text`, and `target_text`. IDs must group neighbouring
+segments from the same document, for example `42:17`. The splitter uses the part
+before `:` so a document can never appear in more than one split.
+
+Each record may also contain `source_lang_code` and `target_lang_code`. These values
+override the config-level `data.source_lang` and `data.target_lang` for that record,
+so one dataset can mix directions such as English→Persian and Russian→Persian:
+
+```json
+{"id":"1:1","domain":"science","source_text":"Hello","target_text":"سلام","source_lang_code":"en","target_lang_code":"fa"}
+{"id":"2:1","domain":"science","source_text":"Привет","target_text":"سلام","source_lang_code":"ru","target_lang_code":"fa"}
+```
+
+Old records without these fields continue to use the config-level pair. The column
+names can be changed with `data.source_lang_column` and `data.target_lang_column`.
+Codes must be supported by TranslateGemma's
+[chat template](https://huggingface.co/google/translategemma-27b-it/blob/main/chat_template.jinja),
+which accepts its listed codes and supported regional variants such as `en-US`.
 
 ## Reproducible workflow
 
@@ -294,8 +309,8 @@ start fresh. Resume stages in separate invocations to avoid either ambiguity.
 
 - Review `split_dataset.py`'s manifest before training. It records row counts,
   duplicate removals, and document IDs for each split.
-- The SFT objective masks the source prompt, so loss is calculated only on the Farsi
-  response.
+- The SFT objective masks the source prompt, so loss is calculated only on the
+  target-language response.
 - `max_length` and `max_new_tokens` must be large enough for scientific passages.
   The pipeline logs any training examples truncated to `max_length`.
 - Keep DPO disabled until preference pairs have genuine curated rejected translations.
