@@ -10,6 +10,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -181,15 +182,17 @@ def map_workers(requested, dataset_size):
     return workers if workers > 1 else None
 
 
-def limit_dataset(dataset, max_examples, split_name):
-    """Return at most max_examples rows, preserving the dataset's order."""
+def limit_dataset(dataset, max_examples, split_name, selection_seed=None):
+    """Return at most max_examples rows, optionally sampling deterministically."""
     if max_examples is None or len(dataset) <= max_examples:
         return dataset
     logger.info("Limiting %s split from %s to %s examples.", split_name, len(dataset), max_examples)
+    if selection_seed is not None:
+        dataset = dataset.shuffle(seed=selection_seed)
     return dataset.select(range(max_examples))
 
 
-def load_sft_split(path, config, split_name, max_examples=None):
+def load_sft_split(path, config, split_name, max_examples=None, selection_seed=None):
     data_cfg = config["data"]
     dataset = load_dataset("json", data_files=path, split="train")
     required = {data_cfg["source_column"], data_cfg["target_column"]}
@@ -198,7 +201,7 @@ def load_sft_split(path, config, split_name, max_examples=None):
         raise ValueError(f"{split_name} dataset {path} is missing columns: {sorted(missing)}")
     if not len(dataset):
         raise ValueError(f"{split_name} dataset {path} contains no examples")
-    dataset = limit_dataset(dataset, max_examples, split_name)
+    dataset = limit_dataset(dataset, max_examples, split_name, selection_seed)
     logger.info("Loaded %s split: %s examples from %s", split_name, len(dataset), path)
     return dataset
 
@@ -274,7 +277,7 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
     return tokenized.remove_columns(["has_target", "was_truncated"])
 
 
-def _prepared_cache_path(path, config, split_name, max_examples, packed):
+def _prepared_cache_path(path, config, split_name, max_examples, packed, selection_seed=None):
     """Return a stable cache path that changes with the input and preprocessing recipe."""
     source = Path(path).expanduser().resolve()
     stat = source.stat()
@@ -298,6 +301,8 @@ def _prepared_cache_path(path, config, split_name, max_examples, packed):
         "packed": packed,
         "packing_strategy": train_cfg["packing_strategy"] if packed else None,
     }
+    if selection_seed is not None:
+        identity["selection_seed"] = selection_seed
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
     safe_split = re.sub(r"[^A-Za-z0-9_.-]+", "-", split_name).strip("-") or "split"
     return Path(config["data"]["prepared_cache_dir"]) / f"{safe_split}-{digest}"
@@ -314,17 +319,30 @@ def validate_packing_config(config):
         )
 
 
-def prepare_sft_dataset(path, processor, config, split_name, max_examples=None, packed=False):
+def prepare_sft_dataset(
+    path,
+    processor,
+    config,
+    split_name,
+    max_examples=None,
+    packed=False,
+    selection_seed=None,
+):
     """Tokenize and optionally pack once on rank zero, then load on every rank."""
     if packed:
         validate_packing_config(config)
     state = PartialState()
-    cache_path = _prepared_cache_path(path, config, split_name, max_examples, packed)
+    cache_path = _prepared_cache_path(
+        path, config, split_name, max_examples, packed, selection_seed
+    )
     ready_path = cache_path / "_READY"
     if state.is_main_process and not ready_path.is_file():
         logger.info("Building rank-zero %s cache at %s", split_name, cache_path)
         dataset = tokenize_sft_dataset(
-            load_sft_split(path, config, split_name, max_examples), processor, config, split_name
+            load_sft_split(path, config, split_name, max_examples, selection_seed),
+            processor,
+            config,
+            split_name,
         )
         if packed:
             # TRL's BFD packer records seq_lengths. Its padding-free collator
@@ -352,7 +370,15 @@ def prepare_sft_dataset(path, processor, config, split_name, max_examples=None, 
                 # cache first. Its ready marker makes it safe to reuse.
                 if not ready_path.is_file():
                     raise
-    state.wait_for_everyone()
+    if not state.is_main_process:
+        # Do not use an NCCL barrier while rank zero performs CPU-bound
+        # preprocessing. A cold multi-million-row cache can take longer than
+        # the process group's timeout, causing every waiting rank to fail just
+        # before rank zero publishes the cache. The directory rename above is
+        # atomic, so the ready marker is the synchronization primitive here.
+        logger.info("Waiting for rank-zero %s cache at %s", split_name, cache_path)
+        while not ready_path.is_file():
+            time.sleep(1)
     if not ready_path.is_file():
         raise RuntimeError(f"Prepared dataset cache was not completed: {cache_path}")
     dataset = load_from_disk(cache_path)
@@ -519,6 +545,24 @@ def write_run_metadata(config, split_sizes):
     logger.info("Run metadata saved to %s", path)
 
 
+def resolve_validation_max_examples(config, run_max_examples=None):
+    """Combine the configured validation cap with a bounded-run cap."""
+    configured_max = config["training"].get("validation_max_examples")
+    if configured_max is not None and (
+        not isinstance(configured_max, int)
+        or isinstance(configured_max, bool)
+        or configured_max <= 0
+    ):
+        raise ValueError(
+            "training.validation_max_examples must be null or a positive integer"
+        )
+    if run_max_examples is None:
+        return configured_max
+    if configured_max is None:
+        return run_max_examples
+    return min(configured_max, run_max_examples)
+
+
 def prepare_sft_splits(processor, config, max_examples=None):
     """Prepare the configured SFT splits before allocating model weights."""
     data_cfg = config["data"]
@@ -527,8 +571,17 @@ def prepare_sft_splits(processor, config, max_examples=None):
         packed=config["training"]["packing"],
     )
     validation_path = data_cfg["validation_sft_dataset_path"]
+    validation_max_examples = resolve_validation_max_examples(config, max_examples)
     validation_data = (
-        prepare_sft_dataset(validation_path, processor, config, "validation", max_examples, packed=False)
+        prepare_sft_dataset(
+            validation_path,
+            processor,
+            config,
+            "validation",
+            validation_max_examples,
+            packed=False,
+            selection_seed=config["training"]["seed"],
+        )
         if validation_path else None
     )
     return train_data, validation_data

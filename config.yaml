@@ -87,6 +87,9 @@ training:
   # 8/4/2/1 for 1/2/4/8 GPUs.
   batch_size: 6
   eval_batch_size: 2
+  # Deterministic validation subset used during training. null uses the full
+  # validation file; the subset is sampled with training.seed before tokenizing.
+  validation_max_examples: 10000
   effective_batch_size: 48
   # Used only when effective_batch_size is null.
   gradient_accumulation_steps: 8

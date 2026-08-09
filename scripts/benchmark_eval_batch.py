@@ -152,9 +152,14 @@ def prepare_search_config(config: dict, output_dir: Path) -> dict:
 
 def clear_eval_dataloader_cache(trainer: Trainer) -> None:
     """Ensure changing eval batch size creates a new DataLoader if supported."""
-    # Current Transformers constructs the evaluation loader per call. Keep this
-    # guard for versions that cache it, without touching a possible read-only
-    # public property.
+    # Transformers 4.57 caches persistent evaluation loaders by dataset key in
+    # the plural `_eval_dataloaders` mapping. Clear it so the next evaluate()
+    # call constructs a loader with the newly selected batch size.
+    eval_dataloaders = trainer.__dict__.get("_eval_dataloaders")
+    if isinstance(eval_dataloaders, dict):
+        eval_dataloaders.clear()
+
+    # Retain compatibility with versions that used a singular cached loader.
     if "_eval_dataloader" in trainer.__dict__:
         trainer._eval_dataloader = None
 
