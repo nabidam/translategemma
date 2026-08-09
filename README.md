@@ -94,6 +94,15 @@ TRL's resetting position IDs preserve attention boundaries between examples.
 the full corpus. Shared metadata and processor files are written only by rank zero,
 while every rank receives a distinct file log.
 
+TranslateGemma includes a vision tower, but this pipeline prepares text-only
+batches. `lora.exclude_modules` therefore excludes `vision_tower` from PEFT's
+suffix-based target matching, preventing `q_proj`, `k_proj`, and `v_proj` adapters
+from being added to unused vision layers. The name follows Transformers' upstream
+[Gemma 3 implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modular_gemma3.py),
+which exposes the image encoder as `vision_tower`. Normal, smoke, canary, DPO-only,
+and benchmark runs all use the same model setup and exclusion. Remove the exclusion
+only after adding image inputs and `pixel_values` handling to the data pipeline.
+
 The canary run reads its limits and isolated output paths from the `canary` section
 of `config.yaml`. It uses the normal Trainer loop, including all configured enabled
 stages; `canary.max_examples` limits each loaded train/validation split. Set

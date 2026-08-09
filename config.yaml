@@ -61,6 +61,12 @@ lora:
   r: 16
   alpha: 32
   dropout: 0.05
+  # TranslateGemma is multimodal, but this pipeline supplies text-only batches.
+  # PEFT matches target_modules by suffix, so q/k/v projections would otherwise
+  # also add unused adapters inside the vision tower. Transformers names the
+  # Gemma 3 module `vision_tower`; see:
+  # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modular_gemma3.py
+  exclude_modules: ".*vision_tower.*"
   target_modules:
     [
       "q_proj",

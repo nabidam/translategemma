@@ -439,9 +439,19 @@ def setup_model_and_processor(config, processor=None):
         model.config.get_text_config().use_cache = False
     lora_cfg = LoraConfig(
         r=config["lora"]["r"], lora_alpha=config["lora"]["alpha"], lora_dropout=config["lora"]["dropout"],
-        target_modules=config["lora"]["target_modules"], bias="none", task_type="CAUSAL_LM",
+        target_modules=config["lora"]["target_modules"],
+        exclude_modules=config["lora"].get("exclude_modules"),
+        bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
+    vision_targets = [
+        name for name in model.targeted_module_names if "vision_tower" in name
+    ]
+    if config["lora"].get("exclude_modules") and vision_targets:
+        raise RuntimeError(
+            "LoRA unexpectedly targeted vision-tower modules despite "
+            f"lora.exclude_modules: {vision_targets[:10]}"
+        )
     trainable, total = model.get_nb_trainable_parameters()
     logger.info("Trainable parameters: %s/%s (%.2f%%)", trainable, total, 100 * trainable / total)
     return model, processor
