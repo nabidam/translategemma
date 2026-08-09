@@ -1,5 +1,6 @@
 """Shared rich + file logging setup used by train.py and evaluate_translations.py."""
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -42,7 +43,9 @@ def setup_logging(config, run_name=None, logs_dir=None, console_level=None, file
 
     run = _resolve_run_name(config, run_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{timestamp}_{run}.log"
+    rank = int(os.environ.get("RANK", "0"))
+    rank_suffix = "" if rank == 0 else f".rank{rank}"
+    log_filename = f"{timestamp}_{run}{rank_suffix}.log"
     log_path = Path(logs_dir) / log_filename
 
     root = logging.getLogger()
@@ -51,7 +54,9 @@ def setup_logging(config, run_name=None, logs_dir=None, console_level=None, file
 
     rich_handler = RichHandler(
         console=console,
-        level=console_level,
+        # Keep the shared terminal readable; non-main failures remain visible
+        # and every rank still gets its own full log file.
+        level=console_level if rank == 0 else logging.WARNING,
         show_time=True,
         show_level=True,
         show_path=False,
@@ -86,7 +91,7 @@ def setup_logging(config, run_name=None, logs_dir=None, console_level=None, file
     ]:
         logging.getLogger(name).setLevel(lvl)
 
-    logger.info(f"Logging initialized. Console level={logging.getLevelName(console_level)}, "
+    logger.info(f"Logging initialized for rank={rank}. Console level={logging.getLevelName(console_level)}, "
                 f"file level={logging.getLevelName(file_level)}")
     logger.info(f"Log file: [bold]{log_path}[/bold]")
     return log_path

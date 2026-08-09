@@ -31,3 +31,7 @@ __pycache__/
 .venv/
 .ruff_cache/
 .pytest_cache/
+
+# Local/reference design documents used during implementation review.
+docs/refs/
+docs/MULTI_GPU_TRAINING.md

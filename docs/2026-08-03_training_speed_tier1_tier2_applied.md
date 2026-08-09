@@ -42,23 +42,24 @@ Triton-only, so it adds no compiler requirement to the offline image.
 If the fused kernels ever fail to bind to this model, `--smoke-test` is where
 that surfaces — the smoke config deliberately leaves `use_liger_kernel` alone.
 
-### 3. `device_map: "auto"` on a single GPU
+### 3. Device placement
 
-`auto` exists to spread a model that does not fit on one device. Given one
-H100 it is still free to place layers on CPU, converting a training step into a
-PCIe round trip. Now `{"": 0}`.
+`device_map` is intentionally absent. Each Accelerate process moves its model
+replica to its own local device. A fixed `{"": 0}` map would incorrectly place
+every DDP rank on GPU 0.
 
 ### 4. Attention implementation was never specified
 
-`model.attn_implementation` is now explicit. The default is `sdpa`, which
-already dispatches to fused kernels on Hopper.
+`model.attn_implementation` is explicit. The packed production recipe now uses
+`flash_attention_3`, because TRL's padding-free position boundaries require a
+supported FlashAttention implementation.
 
-`flash_attention_3` is available but **not** the default: `flash-attn-3` is
+`flash-attn-3` is
 built from the official repository's `hopper/` source and compiles against `nvcc`, which the
 `python:3.12-slim` base image does not carry. It is declared as an optional
-extra (`uv sync --extra speed`) for hosts with the CUDA toolkit. Against SDPA
-the gain is modest today; it becomes significant only once sequences are packed
-or padding-free batching is used, which is future work.
+extra (`uv sync --extra speed`) for hosts with the CUDA toolkit. Unpacked runs
+may still use SDPA, but packing fails fast under SDPA to prevent cross-example
+attention.
 
 The extra needs `[tool.uv.extra-build-dependencies]` to build at all —
 flash-attn-3 imports its build modules before declaring dependencies, so an
@@ -176,7 +177,7 @@ that a 94 GB card does not need is a bad trade.
 
 The corpus is also 2.72M examples, not the 3M the review document assumed.
 
-### 8b. Length grouping — where the padding waste actually was
+### 8b. Cached packing — where the padding waste actually was
 
 Batches are padded to their own maximum, and for a distribution with this tail
 the expected batch maximum climbs steeply with batch size. Estimating each at
@@ -194,23 +195,17 @@ obvious suspect. But batch 4 badly underuses an H100 once items 1, 2 and 9 have
 freed the memory — and the moment the batch size is raised to use the card,
 roughly two-thirds of the compute goes into padding.
 
-`training.group_by_length: true` puts similar-length examples in the same batch,
-holding efficiency near 90% at any batch size. That is what makes "raise
-`batch_size`" a win rather than a trap: roughly **3x fewer padded token slots
-per epoch at batch 32** compared with ungrouped batching.
+Length grouping was tried in production and disabled: building Trainer's
+length-grouped sampler over the full corpus produced a long apparently frozen
+startup on every launch. The replacement is cached BFD sequence packing.
 
-`tokenize_sft_dataset` now records a post-truncation `length` column
-(`training.length_column_name`) for Trainer's `LengthGroupedSampler` to read.
-It is enabled for SFT only: DPO examples are not tokenized when the sampler is
-built, so Trainer would fall back to deriving lengths from raw features and
-fail. `make_training_arguments` takes the flag as an explicit argument rather
-than reading it from config, so that distinction cannot be lost by accident.
-
-This was listed as future work in the first draft of this document, on the
-grounds that a corpus might not be skewed enough to justify it. It is.
-
-Sequence packing would reach ~100% instead of ~90%, but at much higher risk —
-see "Not done" below. Grouping captures most of the benefit for about ten lines.
+Rank zero tokenizes and packs the SFT training split once, writes an immutable
+Hugging Face Dataset cache, and releases the other ranks after the ready marker
+exists. TRL's packer retains the existing completion-only `labels` and records
+the constituent `seq_lengths`. Its padding-free collator resets `position_ids`
+at those boundaries so FlashAttention 3 prevents cross-example attention.
+Later runs load the prepared cache instead of repeating either tokenization or
+packing. Validation remains unpacked.
 
 ### 9. QLoRA vs bf16 LoRA
 
@@ -231,9 +226,10 @@ model:
 
 ### 10. Batch size and gradient checkpointing
 
-`training.batch_size` is still 4 and `training.gradient_checkpointing` is still
-`true`. Both are now under-set for this hardware, but the right values depend on
-measurements only the GPU host can supply.
+`training.batch_size` is now 6 per device and
+`training.effective_batch_size` is 48. The runtime derives accumulation as
+8/4/2/1 for 1/2/4/8 GPUs. Gradient checkpointing remains enabled until hardware
+measurements establish safe headroom.
 
 Checkpointing trades roughly 30-40% throughput for memory. Items 1, 2, 8b and 9
 all free memory, so re-test it *after* those land, not before:
@@ -244,11 +240,9 @@ training:
   batch_size: <raise until VRAM is near, but not at, the limit>
 ```
 
-Raise `batch_size` deliberately. With grouping on, a typical batch is roughly
-six times narrower than the 2048 cap implies — the mean example is 336 tokens —
-so the memory headroom is much larger than the cap suggests. Size it against
-the *longest* batches, not the typical ones: with `group_by_length` the long
-examples end up batched together, which is exactly the case that OOMs.
+Raise `batch_size` deliberately. Packing makes each training block close to the
+2048-token cap, so size memory against `batch_size × 2048`, not the old mean
+example length.
 
 An OOM twenty hours into an epoch costs more than the speedup is worth.
 
@@ -269,35 +263,27 @@ Then benchmark on a fixed subset — the review document suggests 20k-50k rows
 and at least 200 optimizer steps per configuration — and record for each run:
 real tokens/second, non-padding tokens/second, samples/second, peak VRAM, and
 train/validation loss. Samples/second alone is misleading once `max_length` or
-`group_by_length` changes between runs.
+packing changes between runs.
 
-Benchmark at the batch size you intend to train at, not at the current 4. The
-padding-efficiency table in §8b shows the two settings interact: `batch_size`
-and `group_by_length` measured together say something that neither says alone.
+Benchmark at the per-device batch of 6 and effective batch of 48 used for the
+intended run. Packed blocks make token throughput the primary comparison.
 
 ## Not done
 
 Deliberately out of scope, in rough order of expected value:
 
-- **Sequence packing.** The largest remaining win, and the most invasive. It
-  needs either a port from `Trainer` to `SFTTrainer` or a packing collator that
-  emits correct `position_ids` and masks labels across example boundaries.
-  Getting it subtly wrong trains on cross-document attention without failing.
-  Do it only after Tier 1+2 are measured, and only with FlashAttention 3
-  working. Note that `group_by_length` has already taken most of what packing
-  was going to deliver — roughly 90% padding efficiency against packing's
-  ~100% — so the remaining headroom is around 10%, not the 1.5-4x the review
-  document estimated against an ungrouped baseline.
-- **Pre-tokenizing to disk.** `datasets` already caches the map output, so this
-  mainly helps repeated experiments across machines.
-- **Multi-GPU.** Do not size a cluster from the old numbers. Re-measure
-  single-GPU throughput after these changes first.
+- **Shared prepared-cache distribution across machines.** The current cache is
+  shared by ranks on one host. Multi-node training would need a shared filesystem
+  or an explicit cache distribution step.
+- **Measured multi-GPU sizing.** The DDP profiles and benchmark harness exist,
+  but GPU count should still be chosen from the new measurements rather than
+  the pre-fix throughput estimates.
 
 ## Changed files
 
 | File | Change |
 |---|---|
-| `config.yaml` | New `model.dtype`, `model.attn_implementation`, `model.bnb_4bit_*`; `model.device_map` pinned; `model.use_4bit` now false; new `training.pad_to_multiple_of`, `gradient_checkpointing_kwargs`, `use_liger_kernel`, `dataloader_pin_memory`, `dataloader_persistent_workers`, `tokenize_num_proc`, `group_by_length`, `length_column_name`; `training.optimizer` changed; new `length_analysis` section |
+| `config.yaml` | New `model.dtype`, `model.attn_implementation`, `model.bnb_4bit_*`; Accelerate-owned device placement; `model.use_4bit` now false; new packing/cache/global-batch and throughput settings; `training.optimizer` changed; new `length_analysis` section |
 | `train.py` | dtype/attn/quantization gating in `setup_model_and_processor`; `resolve_dtype` and `map_workers` helpers; parallel tokenization; `length` column for the grouped sampler; collator padding alignment and width fix; new `TrainingArguments` passthroughs; smoke-test overrides |
 | `evaluate_translations.py` | Loads with the configured dtype and attention implementation; drops deprecated `torch_dtype` |
 | `scripts/analyze_token_lengths.py` | New — token-length percentiles and `max_length` candidate report |

@@ -8,10 +8,8 @@ model:
   dpo_checkpoint_subdir: "dpo"
   dpo_final_subdir: "dpo_final"
   run_metadata_filename: "run_metadata.json"
-  # Pin the whole model to GPU 0. "auto" is for models that do not fit on one
-  # device; on a single GPU it is free to place layers on CPU, which silently
-  # turns a training step into a PCIe round trip.
-  device_map: { "": 0 }
+  # Device placement comes from each Accelerate process's local device. Do not
+  # add a fixed device_map here: under DDP that would place every rank on GPU 0.
   # Dtype of every parameter that is NOT 4-bit quantised: embeddings, norms and
   # the 262k-row lm_head. Left unset, transformers loads them in float32.
   dtype: "bfloat16"
@@ -38,6 +36,9 @@ data:
   target_column: "farsi"
   id_column: "id"
   domain_column: "domain"
+  # Rank zero writes immutable tokenized/packed datasets here; other ranks wait
+  # and load the same cache instead of starting their own process pools.
+  prepared_cache_dir: "./data/prepared_cache"
 
 # Used only by split_dataset.py, never by train.py. Splitting by the document part of
 # id (for example, "42" in "42:17") prevents adjacent segments leaking across splits.
@@ -75,30 +76,37 @@ training:
   run_sft: true
   run_dpo: false
   seed: 42
-  batch_size: 64
+  # Per-device micro-batch (packed blocks when packing is enabled).
+  # effective_batch_size derives accumulation from the active world size:
+  # 8/4/2/1 for 1/2/4/8 GPUs.
+  batch_size: 6
   eval_batch_size: 2
-  gradient_accumulation_steps: 1
+  effective_batch_size: 48
+  # Used only when effective_batch_size is null.
+  gradient_accumulation_steps: 8
   learning_rate: 2.0e-4
   dpo_learning_rate: 5.0e-6
   dpo_epochs: 1
   dpo_beta: 0.1
   epochs: 3
   bf16: true
-  # Run scripts/analyze_token_lengths.py before changing this. Every example is
-  # padded/attended up to the batch maximum, so budgeting 2048 for a corpus
-  # whose P95 is far shorter pays for tokens that carry no signal.
+  # Run scripts/analyze_token_lengths.py before changing this. This is both the
+  # truncation cap and the target BFD packed-block length.
   max_length: 2048
   truncation_side: "right"
-  # Pads each batch up to a multiple of this many tokens so the matmul shapes
-  # stay tensor-core aligned. Set null to pad to the exact batch maximum.
+  # Alignment for unpacked batches (including the validation split). Packed
+  # padding-free training blocks do not add alignment padding.
   pad_to_multiple_of: 8
-  # Batches are padded to their own longest member, so a batch drawn at random
-  # from a skewed corpus is mostly padding. Grouping similar lengths together
-  # is what makes a large batch_size worth setting; see the measured numbers in
-  # docs/2026-08-03_training_speed_tier1_tier2_applied.md. SFT only -- DPO
-  # examples are not tokenized when the sampler is built.
+  # Disabled deliberately: constructing the grouped sampler caused a long,
+  # apparently frozen startup on the production corpus. Packing removes most
+  # padding without that per-run sampler construction.
   group_by_length: false
   length_column_name: "length"
+  # SFT train-only BFD packing. Rank zero builds and caches packed blocks once.
+  # This requires FlashAttention 3 so reset position_ids enforce document
+  # boundaries; validation stays unpacked for directly interpretable loss.
+  packing: true
+  packing_strategy: "bfd"
   gradient_checkpointing: true
   # Non-reentrant checkpointing is the supported path for LoRA: the reentrant
   # implementation drops the graph for inputs that do not require grad.
@@ -118,7 +126,7 @@ training:
   save_strategy: "steps"
   # Used when save_strategy is "steps". When load_best_model_at_end is true,
   # save_steps must be a multiple of eval_steps.
-  save_steps: 250
+  save_steps: 500
   save_total_limit: 2
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
@@ -197,3 +205,25 @@ canary:
   run_after_training: false
   evaluation_output_dir: "./evaluation-canary"
   resume_from_checkpoint: null
+
+# Runs the real SFT model/data/collator/Trainer path once for each local GPU
+# count. The 12B H200 recipe uses a per-device batch of 6 and reduces gradient
+# accumulation as GPUs increase, keeping the effective global batch at 48.
+benchmark:
+  gpu_counts: [1, 2, 4, 8]
+  # The placeholder is replaced for each gpu_counts entry. Every profile is
+  # validated to have the matching num_processes before the benchmark starts.
+  accelerate_config_pattern: "accelerate_configs/h200_{gpu_count}gpu.yaml"
+  per_device_batch_size: 6
+  effective_batch_size: 48
+  max_examples: 20000
+  max_steps: 200
+  # Discarded 1-GPU optimizer steps used to populate Triton/FA3 JIT caches
+  # before timing the matrix.
+  warmup_steps: 5
+  run_evaluation: true
+  output_dir: "logs/training_benchmark"
+  report_filename: "benchmark_results.json"
+  # null preserves the process's CUDA_VISIBLE_DEVICES. Alternatively list the
+  # physical GPU IDs all benchmark jobs may use, for example [0, 1, 2, 3].
+  devices: null

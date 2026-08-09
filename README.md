@@ -37,17 +37,33 @@ python split_dataset.py --config config.yaml
 #    training.max_length. Writes length_analysis.report_path.
 python scripts/analyze_token_lengths.py --config config.yaml
 
-# 3. Train using only the configured train and validation paths.
-python train.py --config config.yaml
+# 3. Train using only the configured train and validation paths. Select the
+#    Accelerate profile matching the hardware/process count.
+accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
+  train.py --config config.yaml
 
 # Optional: validate enabled inputs/template/arguments without model weights or outputs.
 python train.py --config config.yaml --dry-run
 
 # Optional: run enabled stages with ≤10 rows per split and one train step in temporary outputs.
-python train.py --config config.yaml --smoke-test
+accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
+  train.py --config config.yaml --smoke-test
 
 # Optional: run the actual configured training loop on the smaller canary subset.
-python train.py --config config.yaml --canary
+accelerate launch --config_file accelerate_configs/h200_1gpu.yaml \
+  train.py --config config.yaml --canary
+
+# Compare the same configured training path on each configured GPU count.
+# The bounded subset/step count and report paths come from `benchmark`.
+python scripts/benchmark_training.py --config config.yaml
+
+# Benchmark a smaller matrix or override its bounds without editing YAML.
+python scripts/benchmark_training.py --config config.yaml \
+  --gpu-counts 1 2 4 --max-examples 20000 --max-steps 200
+
+# Batch targets can also be overridden; accumulation is derived automatically.
+python scripts/benchmark_training.py --config config.yaml \
+  --per-device-batch-size 6 --effective-batch-size 48
 
 # 4. Evaluate an existing adapter (or inspect final outputs again).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
@@ -57,6 +73,14 @@ Throughput settings (`model.dtype`, `model.attn_implementation`,
 `model.use_4bit`, `training.use_liger_kernel`, `training.max_length`) and the
 measurements they still need are documented in
 [docs/2026-08-03_training_speed_tier1_tier2_applied.md](docs/2026-08-03_training_speed_tier1_tier2_applied.md).
+The production DDP recipe keeps an effective packed-block batch of 48 by deriving
+gradient accumulation from the active GPU count. Rank zero tokenizes and BFD-packs
+the SFT split into `data.prepared_cache_dir` before model weights are loaded; other
+ranks wait and then load that immutable cache. Packing requires FlashAttention 3:
+TRL's resetting position IDs preserve attention boundaries between examples.
+`group_by_length` remains disabled because sampler construction stalled startup on
+the full corpus. Shared metadata and processor files are written only by rank zero,
+while every rank receives a distinct file log.
 
 The canary run reads its limits and isolated output paths from the `canary` section
 of `config.yaml`. It uses the normal Trainer loop, including all configured enabled
@@ -64,6 +88,25 @@ stages; `canary.max_examples` limits each loaded train/validation split. Set
 `canary.max_steps` to cap optimizer updates, or leave it `null` to use the configured
 epoch count. Canary runs start without a checkpoint unless a canary-specific resume
 path is configured.
+
+The benchmark runner first performs a discarded one-GPU warm-up to populate
+the Liger/FA3 JIT cache, then launches the real SFT path sequentially
+for each requested local GPU count. `benchmark.accelerate_config_pattern` maps each
+count to its profile in `accelerate_configs/` and the runner verifies the profile's
+`num_processes` before launching. Model, data, LoRA, precision, batch size, gradient
+accumulation, collator, and optimizer settings all come from the ordinary sections
+of `config.yaml`, except for the benchmark's deliberate batch-math overrides. For the
+12B H200 recipe, `benchmark.per_device_batch_size: 6` and
+`benchmark.effective_batch_size: 48` derive gradient accumulation of `8, 4, 2, 1`
+for `1, 2, 4, 8` GPUs. Every run therefore performs the same-size optimizer update
+and, with a fixed `max_steps`, processes the same sample workload. Invalid GPU/batch
+combinations fail before launch rather than rounding accumulation. Dataset/step
+bounds, the GPU matrix, Accelerate profile pattern, optional validation pass, and
+report location also come from `benchmark` and may be overridden on the command line.
+The report includes samples/second, padded and non-padding tokens/second, padding
+efficiency, peak per-GPU memory, loss, speedup, scaling efficiency, and the derived
+batch math. Results are written as JSON and CSV below `benchmark.output_dir`; each
+result also records the selected Accelerate profile and hash.
 
 Locking is GPU- and toolkit-independent because `pyproject.toml` supplies FA3's
 static dependency metadata. Building the optional package requires CUDA >=12.3
@@ -75,9 +118,9 @@ uv lock
 MAX_JOBS=4 uv sync --extra speed
 ```
 
-Then set `model.attn_implementation: "flash_attention_3"` in `config.yaml`.
-CUDA 12.8 is recommended. The checked-in configuration remains on `sdpa` so
-the default slim Docker image and non-Hopper machines continue to work.
+The checked-in production configuration uses `flash_attention_3` because
+boundary-safe BFD packing depends on its padding-free attention path. CUDA 12.8
+is recommended. Use an unpacked configuration before switching back to `sdpa`.
 
 To convert a held-out CSV with `id`, `domain`, `en`, and `fa` columns directly to the
 configured test location, without creating DPO data:
@@ -106,9 +149,8 @@ and training state needed to continue, including optimizer, scheduler, global-st
 and RNG state. The `sft_final` and `dpo_final` directories contain final adapters and
 are not resumable Trainer checkpoints.
 
-The default `save_strategy: "epoch"` writes a checkpoint after each completed epoch,
-so an interruption loses work since the previous epoch boundary. To checkpoint and
-evaluate by optimizer update step instead, configure matching step strategies:
+The default uses matching step-based evaluation and checkpointing every 500
+optimizer updates:
 
 ```yaml
 training:

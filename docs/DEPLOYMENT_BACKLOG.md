@@ -27,22 +27,31 @@ runs the no-GPU import/ABI verifier while building the separately tagged
 `cu128-fa3-py312` image. §6.7 of the deployment guide covers provenance, glibc,
 Torch ABI, and Hopper execution checks.
 
-What remains is the decision to use it. SDPA already reaches fused kernels on
-Hopper, so the gap is small **today**; it stops being small once sequence
-packing lands, because padding-free batching is where FlashAttention 3 earns its
-cost.
+Packing is now implemented using TRL's BFD packer and padding-free collator.
+The remaining work is hardware validation of the complete FA3 + packing path.
 
 - Benchmark `flash_attention_3` against `sdpa` on the H100 host, measuring
   non-padding tokens/second rather than samples/second. Do this as part of the
   throughput grid below, not as a separate exercise.
-- Implement sequence packing, then re-measure. Adopting FA3 before packing
-  buys little and adds an out-of-lock binary to the deployment surface.
+- Measure the first rank-zero cache build separately from steady-state training.
 - If adopted, record the wheel's Torch/Python/CUDA/glibc combination next to
   `/opt/resolved-requirements.txt`, and add a Hopper-host build/smoke-test to
   the release checklist alongside the r570 and r580+ hosts.
-- Decide then whether `cu128-fa3` replaces `cu128` as the Hopper default or
-  stays an opt-in tag. It is a strict superset and still defaults to `sdpa`,
-  so replacement is cheap — but only once it is measured.
+- Decide whether `cu128-fa3` becomes the shipped Hopper default. It is required
+  by the checked-in packed configuration; the slim image remains usable only
+  with packing disabled and attention changed to SDPA.
+
+## Evaluate DeepSpeed only if DDP becomes limiting
+
+The active 1/2/4/8-GPU profiles intentionally use ordinary DDP. A 12B bf16 base
+model fits on every H200 and LoRA optimizer/gradient state is small, so ZeRO-2
+has no demonstrated benefit yet. `ds_config_lora_z2.json` is retained as a
+future experiment, not an active launch configuration.
+
+- Compare DDP with ZeRO-2 only if measured memory or communication becomes a
+  bottleneck, or if the project moves beyond small-rank LoRA.
+- If adopted later, add separate Accelerate profiles and report memory,
+  non-padding tokens/second, checkpoint/resume behavior, and adapter export.
 
 ## Replace the temporary dual-CUDA build selection
 
@@ -85,13 +94,14 @@ hardware. The per-GPU memory table in §6.1 of the deployment guide is
 correspondingly approximate.
 
 - ~~Run the length analysis~~ Done: 2.72M examples, mean 336, p95 1072, max
-  6509. `training.max_length` stays 2048 and `training.group_by_length` is now
-  on; reasoning recorded in the speed document.
-- Run the 20k–50k-row benchmark grid on the H100 host, **at the intended
-  `batch_size` rather than the current 4**, then replace the estimates in §6.1
+  6509. `training.max_length` stays 2048. `group_by_length` remains off because
+  sampler construction stalled production startup; cached BFD packing is the
+  replacement.
+- Run the 20k–50k-row benchmark grid on the H100 host at the intended
+  per-device batch of 6, then replace the estimates in §6.1
   with observed peak VRAM.
-- Decide `training.batch_size` and `training.gradient_checkpointing` from that
-  grid. These are the last two settings still at pre-measurement defaults.
+- Validate the current per-device batch of 6 and gradient checkpointing from
+  that grid before raising the micro-batch.
 - Only after that, size any multi-GPU plan. The pre-fix throughput numbers in
   `2026-08-03_translategemma_training_speed_optimization.md` were taken while
   the model was loading in float32 with an unfused loss, so they overstate the

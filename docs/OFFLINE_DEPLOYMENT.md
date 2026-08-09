@@ -108,8 +108,9 @@ dependency change means: `uv lock`, commit, rebuild, re-export, re-transfer.
 `flash-attn-3` is not in this image. It is declared as an optional `speed` extra
 and compiles against `nvcc`, which `python:3.12-slim` does not carry;
 `uv sync --no-dev` does not install extras, so the build is unaffected.
-`model.attn_implementation` must stay `sdpa` here — see §6.7 for the
-Hopper-only variant that does carry it.
+This default image cannot run the checked-in packed recipe. To use it, set
+`training.packing: false` and `model.attn_implementation: sdpa`. Use the
+Hopper-only FA3 variant in §6.7 for the production packed configuration.
 
 This builds the default `translategemma:cu128-py312` image. To deliberately
 build the retained CUDA 13.0 image for an r580+ host:
@@ -396,16 +397,16 @@ compiler error here, rather than a CUDA error, points at §6.3.
 
 Step 3 has already been run against the current corpus and its conclusions are
 baked into `config.yaml`: mean 336 tokens, p95 1072, a thin tail to 6509, so
-`training.max_length` stays at 2048 and `training.group_by_length` is on. Re-run
-it whenever the corpus changes materially — it is cheap relative to what it
-decides, and both of those settings follow from the shape of the distribution
-rather than from a default. Full reasoning, including why lowering `max_length`
-is *not* the lever it looks like, is in
+`training.max_length` stays at 2048. Length grouping is disabled because its
+sampler stalled production startup; rank zero now builds and caches BFD-packed
+training blocks instead. Re-run the analysis whenever the corpus changes
+materially. Full reasoning, including why lowering `max_length` is *not* the
+lever it looks like, is in
 `docs/2026-08-03_training_speed_tier1_tier2_applied.md`.
 
-The setting that still needs a decision on this host is `training.batch_size`.
-It is 4, which underuses an H100 now that the memory fixes have landed; with
-grouping on, a typical batch is far narrower than the 2048 cap implies.
+The checked-in H200 starting point is a per-device batch of 6 and effective
+global batch of 48. Packing makes blocks close to 2048 tokens, so validate peak
+memory before raising the per-device batch.
 
 ### 5.4 Real runs
 
@@ -638,11 +639,10 @@ so the shipped image still describes itself accurately.
 Torch installs cleanly and then fails at import with an undefined-symbol error,
 which is much harder to diagnose than a version mismatch.
 
-The image is a superset of the default one and still defaults to `sdpa`, so it
-is safe to run everything through it on a Hopper host. Flip
-`model.attn_implementation: "flash_attention_3"` per run and benchmark it
-against `sdpa` — measuring non-padding tokens/second, not samples/second —
-rather than assuming it wins.
+The image is a superset of the default one and is the required runtime for the
+checked-in `flash_attention_3` + packing configuration. For an SDPA comparison,
+disable packing as well as changing the attention implementation; measure
+non-padding tokens/second rather than samples/second.
 
 #### Verifying the wheel when the build host is not a Hopper machine
 

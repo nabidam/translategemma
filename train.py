@@ -2,17 +2,19 @@
 
 import argparse
 import copy
+import hashlib
 import importlib.metadata
 import inspect
 import json
 import logging
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoConfig,
@@ -25,12 +27,16 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-from trl import DPOTrainer
+from trl import DPOTrainer, pack_dataset
+from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
 from canary_config import canary_run_config
 from logging_utils import logger, setup_logging, log_config_summary, load_config
 
 from accelerate import Accelerator, PartialState
+
+
+PREPARED_CACHE_VERSION = 1
 
 
 class RichLoggingCallback(TrainerCallback):
@@ -88,6 +94,33 @@ class TranslationDataCollator:
             )
         batch["labels"] = torch.tensor(labels, dtype=torch.long)
         return batch
+
+
+def training_world_size():
+    """Return the active Accelerate process count without assuming CUDA."""
+    return PartialState().num_processes
+
+
+def resolve_gradient_accumulation_steps(config):
+    """Derive accumulation from the configured global batch when requested."""
+    cfg = config["training"]
+    effective_batch = cfg.get("effective_batch_size")
+    if effective_batch is None:
+        return cfg["gradient_accumulation_steps"]
+    denominator = cfg["batch_size"] * training_world_size()
+    if effective_batch % denominator:
+        raise ValueError(
+            "training.effective_batch_size must be exactly divisible by "
+            "training.batch_size * world_size; "
+            f"got {effective_batch} / ({cfg['batch_size']} * {training_world_size()})"
+        )
+    accumulation = effective_batch // denominator
+    if accumulation < 1:
+        raise ValueError(
+            f"training.effective_batch_size={effective_batch} is smaller than the "
+            f"{denominator}-sample distributed micro-batch"
+        )
+    return accumulation
 
 
 def format_translategemma_message(source, target, source_lang, target_lang):
@@ -241,14 +274,126 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
     return tokenized.remove_columns(["has_target", "was_truncated"])
 
 
-def setup_model_and_processor(config):
+def _prepared_cache_path(path, config, split_name, max_examples, packed):
+    """Return a stable cache path that changes with the input and preprocessing recipe."""
+    source = Path(path).expanduser().resolve()
+    stat = source.stat()
+    train_cfg = config["training"]
+    identity = {
+        "cache_version": PREPARED_CACHE_VERSION,
+        "source": str(source),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "split": split_name,
+        "max_examples": max_examples,
+        "base_model_id": config["model"]["base_model_id"],
+        "transformers_version": importlib.metadata.version("transformers"),
+        "trl_version": importlib.metadata.version("trl"),
+        "source_lang": config["data"]["source_lang"],
+        "target_lang": config["data"]["target_lang"],
+        "source_column": config["data"]["source_column"],
+        "target_column": config["data"]["target_column"],
+        "max_length": train_cfg["max_length"],
+        "truncation_side": train_cfg["truncation_side"],
+        "packed": packed,
+        "packing_strategy": train_cfg["packing_strategy"] if packed else None,
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+    safe_split = re.sub(r"[^A-Za-z0-9_.-]+", "-", split_name).strip("-") or "split"
+    return Path(config["data"]["prepared_cache_dir"]) / f"{safe_split}-{digest}"
+
+
+def validate_packing_config(config):
+    """Reject packing modes that can merge attention or split SFT examples."""
+    if config["training"]["packing_strategy"] != "bfd":
+        raise ValueError("SFT packing requires training.packing_strategy='bfd'.")
+    if config["model"]["attn_implementation"] != "flash_attention_3":
+        raise ValueError(
+            "training.packing requires model.attn_implementation=flash_attention_3 "
+            "to preserve attention boundaries between packed examples."
+        )
+
+
+def prepare_sft_dataset(path, processor, config, split_name, max_examples=None, packed=False):
+    """Tokenize and optionally pack once on rank zero, then load on every rank."""
+    if packed:
+        validate_packing_config(config)
+    state = PartialState()
+    cache_path = _prepared_cache_path(path, config, split_name, max_examples, packed)
+    ready_path = cache_path / "_READY"
+    if state.is_main_process and not ready_path.is_file():
+        logger.info("Building rank-zero %s cache at %s", split_name, cache_path)
+        dataset = tokenize_sft_dataset(
+            load_sft_split(path, config, split_name, max_examples), processor, config, split_name
+        )
+        if packed:
+            # TRL's BFD packer records seq_lengths. Its padding-free collator
+            # converts them to resetting position_ids, which FA3 uses as
+            # document boundaries. Existing -100 completion masks are retained.
+            dataset = dataset.remove_columns(
+                [name for name in ("attention_mask", config["training"]["length_column_name"])
+                 if name in dataset.column_names]
+            )
+            dataset = pack_dataset(
+                dataset,
+                seq_length=config["training"]["max_length"],
+                strategy=config["training"]["packing_strategy"],
+            )
+            logger.info("Packed %s into %s blocks.", split_name, len(dataset))
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f".{cache_path.name}-", dir=cache_path.parent) as temp_dir:
+            temp_path = Path(temp_dir) / "dataset"
+            dataset.save_to_disk(temp_path)
+            (temp_path / "_READY").write_text("ok\n", encoding="utf-8")
+            try:
+                temp_path.replace(cache_path)
+            except FileExistsError:
+                # Another independent launch completed the identical immutable
+                # cache first. Its ready marker makes it safe to reuse.
+                if not ready_path.is_file():
+                    raise
+    state.wait_for_everyone()
+    if not ready_path.is_file():
+        raise RuntimeError(f"Prepared dataset cache was not completed: {cache_path}")
+    dataset = load_from_disk(cache_path)
+    logger.info("Loaded %s prepared cache: examples=%s path=%s", split_name, len(dataset), cache_path)
+    return dataset
+
+
+def make_sft_data_collator(processor, config):
+    """Select the boundary-aware packed collator or the ordinary padded collator."""
+    train_cfg = config["training"]
+    if not train_cfg["packing"]:
+        return TranslationDataCollator(processor.tokenizer, train_cfg["pad_to_multiple_of"])
+    validate_packing_config(config)
+    pad_token_id = processor.tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = processor.tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("Packing requires a tokenizer pad_token_id or eos_token_id.")
+    return DataCollatorForLanguageModeling(
+        pad_token_id=pad_token_id,
+        padding_free=True,
+        # BFD blocks are flattened and contain no padding. Adding alignment
+        # padding here would create artificial position-id resets and make
+        # non-padding token accounting ambiguous.
+        pad_to_multiple_of=None,
+    )
+
+
+def setup_processor(config):
+    """Load the processor independently so data can be prepared before GPU weights."""
+    return AutoProcessor.from_pretrained(
+        config["model"]["base_model_id"], use_fast=True, fix_mistral_regex=False
+    )
+
+
+def setup_model_and_processor(config, processor=None):
     model_cfg, train_cfg = config["model"], config["training"]
     # Transformers 4.57.6 can misclassify locally bundled non-Mistral models
     # as needing its Mistral regex patch. TranslateGemma uses a single Split
     # pre-tokenizer, while that patch assumes an indexable Sequence and crashes.
-    processor = AutoProcessor.from_pretrained(
-        model_cfg["base_model_id"], use_fast=True, fix_mistral_regex=False
-    )
+    processor = processor or setup_processor(config)
     # Without an explicit dtype, transformers materialises every unquantised
     # parameter in float32 -- embeddings, norms and a 262k-row lm_head.
     dtype = resolve_dtype(model_cfg["dtype"])
@@ -304,9 +449,10 @@ def setup_model_and_processor(config):
 
 def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_dataset, max_steps=None, group_by_length=False):
     cfg = config["training"]
+    accumulation_steps = resolve_gradient_accumulation_steps(config)
     args = {
         "output_dir": str(output_dir), "per_device_train_batch_size": cfg["batch_size"],
-        "per_device_eval_batch_size": cfg["eval_batch_size"], "gradient_accumulation_steps": cfg["gradient_accumulation_steps"],
+        "per_device_eval_batch_size": cfg["eval_batch_size"], "gradient_accumulation_steps": accumulation_steps,
         "learning_rate": float(learning_rate), "num_train_epochs": epochs, "bf16": cfg["bf16"],
         "logging_steps": cfg["logging_steps"], "save_strategy": cfg["save_strategy"],
         "save_steps": cfg["save_steps"], "eval_steps": cfg["eval_steps"],
@@ -333,10 +479,18 @@ def make_training_arguments(config, output_dir, learning_rate, epochs, has_eval_
     args[evaluation_key] = cfg["evaluation_strategy"] if has_eval_dataset else "no"
     if max_steps is not None:
         args["max_steps"] = max_steps
+    logger.info(
+        "Distributed batch: per_device=%s world_size=%s accumulation=%s effective=%s",
+        cfg["batch_size"], training_world_size(), accumulation_steps,
+        cfg["batch_size"] * training_world_size() * accumulation_steps,
+    )
     return TrainingArguments(**args)
 
 
 def write_run_metadata(config, split_sizes):
+    state = PartialState()
+    if not state.is_main_process:
+        return
     output_dir = Path(config["model"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -348,20 +502,32 @@ def write_run_metadata(config, split_sizes):
         "created_at": datetime.now(timezone.utc).isoformat(), "git_revision": revision,
         "split_sizes": split_sizes, "config": config,
         "package_versions": {name: importlib.metadata.version(name) for name in packages},
-        "cuda": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "cuda": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
     }
     path = output_dir / config["model"]["run_metadata_filename"]
     path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info("Run metadata saved to %s", path)
 
 
-def run_sft(model, processor, config, max_examples=None, max_steps=None):
-    model_cfg, data_cfg = config["model"], config["data"]
-    train_data = tokenize_sft_dataset(load_sft_split(data_cfg["train_sft_dataset_path"], config, "train", max_examples), processor, config, "train")
+def prepare_sft_splits(processor, config, max_examples=None):
+    """Prepare the configured SFT splits before allocating model weights."""
+    data_cfg = config["data"]
+    train_data = prepare_sft_dataset(
+        data_cfg["train_sft_dataset_path"], processor, config, "train", max_examples,
+        packed=config["training"]["packing"],
+    )
     validation_path = data_cfg["validation_sft_dataset_path"]
     validation_data = (
-        tokenize_sft_dataset(load_sft_split(validation_path, config, "validation", max_examples), processor, config, "validation")
+        prepare_sft_dataset(validation_path, processor, config, "validation", max_examples, packed=False)
         if validation_path else None
+    )
+    return train_data, validation_data
+
+
+def run_sft(model, processor, config, max_examples=None, max_steps=None, prepared_splits=None):
+    model_cfg = config["model"]
+    train_data, validation_data = prepared_splits or prepare_sft_splits(
+        processor, config, max_examples
     )
     split_sizes = {"train": len(train_data)}
     if validation_data is not None:
@@ -369,13 +535,16 @@ def run_sft(model, processor, config, max_examples=None, max_steps=None):
     write_run_metadata(config, split_sizes)
     args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, max_steps, group_by_length=config["training"]["group_by_length"])
     trainer = Trainer(model=model, args=args, train_dataset=train_data, eval_dataset=validation_data,
-                      data_collator=TranslationDataCollator(processor.tokenizer, config["training"]["pad_to_multiple_of"]),
+                      data_collator=make_sft_data_collator(processor, config),
                       callbacks=[RichLoggingCallback()])
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
     save_path = Path(model_cfg["output_dir"]) / model_cfg["sft_final_subdir"]
     trainer.save_model(save_path)
-    processor.save_pretrained(save_path)
-    logger.info("Best SFT adapter saved to %s", save_path)
+    state = PartialState()
+    if state.is_main_process:
+        processor.save_pretrained(save_path)
+        logger.info("Best SFT adapter saved to %s", save_path)
+    state.wait_for_everyone()
     return model, str(save_path)
 
 
@@ -397,7 +566,10 @@ def run_dpo(model, processor, config, max_examples=None, max_steps=None):
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
     save_path = Path(model_cfg["output_dir"]) / model_cfg["dpo_final_subdir"]
     trainer.save_model(save_path)
-    processor.save_pretrained(save_path)
+    state = PartialState()
+    if state.is_main_process:
+        processor.save_pretrained(save_path)
+    state.wait_for_everyone()
     return str(save_path)
 
 
@@ -428,6 +600,8 @@ def run_dry_run(config):
     logger.info("Dry run: validating enabled pipeline stages; no model weights or outputs will be created.")
     processor = None
     if config["training"]["run_sft"]:
+        if config["training"]["packing"]:
+            validate_packing_config(config)
         processor = AutoProcessor.from_pretrained(
             config["model"]["base_model_id"], use_fast=True, fix_mistral_regex=False
         )
@@ -461,6 +635,7 @@ def smoke_test_config(config, output_dir):
     training = smoke["training"]
     training.update({
         "epochs": 1, "dpo_epochs": 1, "batch_size": min(training["batch_size"], 2),
+        "effective_batch_size": None, "gradient_accumulation_steps": 1,
         "eval_batch_size": min(training["eval_batch_size"], 2), "logging_steps": 1,
         "evaluation_strategy": "no", "save_strategy": "no", "load_best_model_at_end": False,
         "resume_from_checkpoint": None, "dataloader_num_workers": 0,
@@ -481,10 +656,17 @@ def smoke_test_config(config, output_dir):
 
 def run_pipeline(config, max_examples=None, max_steps=None):
     set_seed(config["training"]["seed"])
-    model, processor = setup_model_and_processor(config)
+    processor = setup_processor(config)
+    prepared_splits = (
+        prepare_sft_splits(processor, config, max_examples)
+        if config["training"]["run_sft"] else None
+    )
+    model, processor = setup_model_and_processor(config, processor=processor)
     adapter_path = None
     if config["training"]["run_sft"]:
-        model, adapter_path = run_sft(model, processor, config, max_examples, max_steps)
+        model, adapter_path = run_sft(
+            model, processor, config, max_examples, max_steps, prepared_splits=prepared_splits
+        )
     if config["training"]["run_dpo"]:
         adapter_path = run_dpo(model, processor, config, max_examples, max_steps)
         
@@ -504,7 +686,8 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     else:
         setup_logging(config)
-    log_config_summary(config)
+    if PartialState().is_main_process:
+        log_config_summary(config)
     try:
         if args.dry_run:
             run_dry_run(config)
