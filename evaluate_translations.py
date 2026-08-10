@@ -27,6 +27,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from degeneration import audit_outputs
 from language_pairs import resolve_language_pair
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
 from prompting import (
@@ -387,6 +388,27 @@ def _run_one(config, adapter_path, prefix, force=False):
     results = test_df.copy()
     results["generated_farsi"] = generate_translations(test_df, config, adapter_path, prefix=prefix, force=force)
     summary = {"label": prefix, "examples": len(results), "adapter_path": adapter_path}
+    if eval_cfg.get("degeneration_audit_enabled", True):
+        # Runs before the scoring models load. MetricX and COMET are corpus
+        # averages and cannot express "this system stopped translating and
+        # filled the token budget", so this is the only check in the pipeline
+        # that can fail a structurally broken run.
+        audit = audit_outputs(results["generated_farsi"], references)
+        summary["degeneration"] = {
+            key: audit[key]
+            for key in ("rows", "clean_rows", "clean_rate", "failure_rate", "failures",
+                        "mean_chars", "mean_chars_trimmed", "mean_trailing_chars",
+                        "max_trailing_chars")
+        }
+        if is_main:
+            logger.info(
+                "Decoding audit for [bold green]%s[/bold green]: clean [bold]%.1f%%[/bold] "
+                "(%d/%d), mean chars %.0f (trailing %.0f)",
+                prefix, 100 * audit["clean_rate"], audit["clean_rows"], audit["rows"],
+                audit["mean_chars"], audit["mean_trailing_chars"],
+            )
+            for failure, values in audit["failures"].items():
+                logger.warning("  %s: %d rows (%.2f%%)", failure, values["rows"], 100 * values["rate"])
     if eval_cfg["metricx_enabled"]:
         results["metricx_score"] = evaluate_metricx(sources, results["generated_farsi"].tolist(), references, config, prefix=prefix, force=force)
         summary["metricx_mean_lower_is_better"] = float(results["metricx_score"].mean())
@@ -427,6 +449,8 @@ def run_evaluation(config, adapter_path=None, force=False):
         table.add_column("Label", style="cyan")
         table.add_column("Examples", style="white")
         table.add_column("Adapter Path", style="dim")
+        if any("degeneration" in summary for summary in summaries):
+            table.add_column("Clean ↑", style="blue")
         if eval_cfg["metricx_enabled"]:
             table.add_column("MetricX ↓", style="magenta")
         if eval_cfg["comet_enabled"]:
@@ -434,6 +458,9 @@ def run_evaluation(config, adapter_path=None, force=False):
 
         for s in summaries:
             row = [s["label"], str(s["examples"]), str(s["adapter_path"] or "Base Model")]
+            if any("degeneration" in summary for summary in summaries):
+                audit = s.get("degeneration")
+                row.append(f"{100 * audit['clean_rate']:.1f}%" if audit else "—")
             if eval_cfg["metricx_enabled"]:
                 row.append(f"{s.get('metricx_mean_lower_is_better', 0.0):.4f}")
             if eval_cfg["comet_enabled"]:
@@ -442,7 +469,34 @@ def run_evaluation(config, adapter_path=None, force=False):
 
         console.print(table)
         logger.info("Evaluation results saved to [bold]%s[/bold]", output_path)
+
+    _enforce_degeneration_gate(summaries, eval_cfg)
     return summaries
+
+
+def _enforce_degeneration_gate(summaries, eval_cfg):
+    """Fail the run when a system's decoding failure rate exceeds the threshold.
+
+    Raising rather than warning is deliberate. The 2026-08-10 adapter posted the
+    best eval_loss of its run while 87% of its output was unusable, and nothing
+    in the pipeline objected; a human noticed by reading the HTML report. Set
+    evaluation.max_degeneration_rate to null to report without failing.
+    """
+    threshold = eval_cfg.get("max_degeneration_rate")
+    if threshold is None:
+        return
+    breached = {
+        summary["label"]: summary["degeneration"]["failure_rate"]
+        for summary in summaries
+        if "degeneration" in summary and summary["degeneration"]["failure_rate"] > threshold
+    }
+    if breached:
+        detail = ", ".join(f"{label}={rate:.1%}" for label, rate in sorted(breached.items()))
+        raise RuntimeError(
+            f"Decoding failure rate above evaluation.max_degeneration_rate={threshold:.1%}: {detail}. "
+            "Inspect <prefix>_detailed_scores.csv, or run scripts/audit_degeneration.py for the "
+            "per-class breakdown."
+        )
 
 
 def main():
