@@ -534,21 +534,75 @@ uv run python scripts/audit_degeneration.py --eval-dir evaluation
 uv run python scripts/audit_sft_corpus.py --dataset data/splits/train.jsonl
 ```
 
-## Next steps
+## Open items
 
-Fixes 1–3 are done and the failure is gone (see Outcome). What remains is
-optional and none of it is blocking:
+Fixes 1–3 are done and the failure is gone (see Outcome). Status of everything
+else:
 
-- **Enable MetricX and COMET.** Both were off for these runs, so there is still
-  no proper quality number. They were pointless while 85% of the output was
-  degenerate; now they would measure something real.
-- **Finish the training run.** It stopped at step 23,640 of 34,860, epoch 2.03
-  of 3, with eval_loss still falling. Resuming is an improvement, not a repair.
-- **Clean the corpus (Fix 5) before the next run.** Largest item is the 73,110
-  self-repeating targets. Note the 4 boilerplate leaks disappeared with proper
-  stopping — they were post-turn filler, not mid-output memorisation — so this
-  is lower priority than it looked.
-- **Fix truncation (Fix 4)** in the same pass, so no future run trains 105k
-  examples without a terminator.
-- **Wire `audit_degeneration.py --fail-over` into the evaluation run** so this
-  class of failure can never again require a human to notice it.
+### Done
+
+- **Fix 4, truncation.** `training.drop_overlength_examples` (default true)
+  drops examples that lose their terminator to `max_length` instead of training
+  on them. The 2026-08-09 run had 105,567 such rows. Dropping is preferred over
+  re-appending `<end_of_turn>`: an example that stops mid-sentence and then ends
+  the turn teaches *truncated translations*, which is a worse lesson than the
+  3.86% of data it costs. `PREPARED_CACHE_VERSION` is bumped to 3, so the next
+  run re-tokenizes.
+- **Fix 6, termination gate.** The classifier moved to `degeneration.py` and now
+  runs inside `evaluate_translations.py`, before the scoring models load. Per
+  system it logs the clean rate, records it in `summary.json`, adds a `Clean ↑`
+  column to the results table, and raises when the failure rate exceeds
+  `evaluation.max_degeneration_rate` (default 0.15; null to report only).
+  `scripts/audit_degeneration.py` imports the same classifier, so the offline
+  report and the in-run gate cannot disagree.
+
+  The threshold is 0.15 rather than something tighter because the base model
+  sits at 0.084 on this test set: some source segments legitimately repeat, and
+  a stricter gate would fail every run. Post-fix, base is 0.084 and the adapter
+  0.054; the broken run was 0.872.
+
+- **Clean mid-run stop.** `GracefulStopCallback` watches
+  `training.stop_file` (default `<model.output_dir>/STOP`). See below.
+
+### Open
+
+- **Enable MetricX and COMET.** Both are still off, so there is no proper
+  quality number. They were pointless while 85% of output was degenerate; now
+  they would measure something real. Highest-value next step.
+- **Finish the training run.** Stopped at step 23,640 of 34,860, epoch 2.03 of
+  3, eval_loss still falling. An improvement, not a repair.
+- **Fix 5, corpus cleanup.** Belongs upstream in the dataset registry, not here
+  — see `2026-08-10_registry_quality_flags_prompt.md`. Lower priority than it
+  looked: the 4 boilerplate leaks vanished with proper stopping, so they were
+  post-turn filler rather than mid-output memorisation. The 73,110
+  self-repeating targets (2.67%) are the real remaining item.
+
+## Stopping a run mid-flight
+
+The 2026-08-09 run died at step 23,640 without reaching Trainer's end-of-training
+path, so `load_best_model_at_end` never fired and no `sft_final` was written.
+The evaluated artefact was an intermediate checkpoint that was not even the best
+one (step 23,000 scored better). Killing the process is how that happens: any
+progress since the last `save_steps` boundary is lost, and the run has no
+completion.
+
+Instead, from the host running training:
+
+```bash
+touch translategemma-farsi-science/STOP
+```
+
+Within `training.stop_file_check_steps` (default 10) optimizer steps, rank zero
+sees the file, deletes it, and sets `should_evaluate`, `should_save` and
+`should_training_stop`. Training then evaluates, checkpoints, and exits through
+the normal path — `load_best_model_at_end` runs and `sft_final` is written, so
+the run ends as if it had reached its last step.
+
+Rank zero owns the decision and broadcasts it to the other ranks. If each rank
+stat'd the file independently, one could observe it a step earlier than another
+and the ranks would desynchronise into a hang. The sentinel is deleted on
+trigger, and any stale sentinel is cleared at startup, so `resume_from_checkpoint`
+does not immediately stop again.
+
+Ctrl-C remains available and is still the right tool for an emergency — it just
+costs you the interval since the last save and gives you no final adapter.

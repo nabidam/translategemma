@@ -13,6 +13,8 @@ data/*
 # Run outputs.
 translategemma-farsi-science/
 evaluation/
+# Evaluation runs are named per adapter/date; all are generated output.
+evaluation*/
 logs/
 
 # Shipping tarballs.
