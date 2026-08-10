@@ -29,6 +29,7 @@ class TranslateGemmaRunner:
         import torch
         from peft import PeftModel
         from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+        from prompting import resolve_stop_token_ids
         from train import load_generation_safe_model_config, make_deterministic_generation_config
 
         self.torch = torch
@@ -51,29 +52,41 @@ class TranslateGemmaRunner:
             model_config = load_generation_safe_model_config(model_id)
         kwargs = {
             "config": model_config,
-            "generation_config": make_deterministic_generation_config(model_config, self.processor),
+            "generation_config": make_deterministic_generation_config(
+                model_config, self.processor, model_id
+            ),
             "dtype": _torch_dtype(torch, candidate.get("dtype", "bfloat16")),
         }
+        # Passed on every generate() call as well, so an adapter's own
+        # generation config cannot drop <end_of_turn> from the stop set.
+        self.stop_token_ids = resolve_stop_token_ids(
+            self.processor.tokenizer, base_model_id=model_id
+        )
         kwargs.update(revision_kwargs)
         if attention := candidate.get("attn_implementation"):
             kwargs["attn_implementation"] = attention
         self.model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
         device = candidate.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(device)
-        if adapter := candidate.get("adapter") or candidate.get("adapter_repo"):
+        adapter = candidate.get("adapter") or candidate.get("adapter_repo")
+        if adapter:
             adapter_kwargs = {"revision": candidate["adapter_revision"]} if candidate.get("adapter_revision") else {}
             self.model = PeftModel.from_pretrained(self.model, adapter, **adapter_kwargs)
+        # An SFT adapter from this repository is conditioned on the training
+        # rendering; an untouched upstream checkpoint is conditioned on the
+        # generation prompt. The two are not the same string.
+        self.use_training_rendering = bool(adapter)
         self.model.eval()
 
     def translate(self, texts: list[str]) -> tuple[list[str], list[float], list[int]]:
-        conversations = [[{"role": "user", "content": [{
+        from prompting import render_inference_prompts, tokenize_prompts_for_generation
+
+        user_messages = [{"role": "user", "content": [{
             "type": "text", "source_lang_code": self.source_lang,
             "target_lang_code": self.target_lang, "text": text,
-        }]}] for text in texts]
-        prompts = [self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        ) for conversation in conversations]
-        inputs = self.processor(text=prompts, padding=True, return_tensors="pt").to(self.model.device)
+        }]} for text in texts]
+        prompts = render_inference_prompts(self.processor, user_messages, self.use_training_rendering)
+        inputs = tokenize_prompts_for_generation(self.processor, prompts, self.model.device)
         pad_id = self.processor.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.processor.tokenizer.eos_token_id
@@ -82,6 +95,7 @@ class TranslateGemmaRunner:
             "do_sample": bool(self.settings.get("do_sample", False)),
             "num_beams": int(self.settings.get("num_beams", 1)),
             "pad_token_id": pad_id,
+            "eos_token_id": self.stop_token_ids,
         }
         if kwargs["do_sample"]:
             kwargs.update(temperature=float(self.settings.get("temperature", 1.0)), top_p=float(self.settings.get("top_p", 1.0)))

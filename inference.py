@@ -2,6 +2,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
 from accelerate import Accelerator
 from peft import PeftModel
+from prompting import (
+    render_training_prompts,
+    resolve_stop_token_ids,
+    tokenize_prompts_for_generation,
+)
 from train import load_generation_safe_model_config, make_deterministic_generation_config
 
 # 1. Load Base Model and Processor
@@ -9,12 +14,17 @@ base_model_id = "google/translategemma-12b-it"
 processor = AutoProcessor.from_pretrained(
     base_model_id, use_fast=True, fix_mistral_regex=False
 )
+# Required by tokenize_prompts_for_generation, and by batched decoding generally.
+processor.tokenizer.padding_side = "left"
 model_config = load_generation_safe_model_config(base_model_id)
+stop_token_ids = resolve_stop_token_ids(processor.tokenizer, base_model_id=base_model_id)
 
 accelerator = Accelerator()
 load_kwargs = {
     "config": model_config,
-    "generation_config": make_deterministic_generation_config(model_config, processor),
+    "generation_config": make_deterministic_generation_config(
+        model_config, processor, base_model_id
+    ),
     "torch_dtype": torch.bfloat16,
 }
 
@@ -27,28 +37,23 @@ model = PeftModel.from_pretrained(base_model, "./final_farsi_adapter")
 # 3. Format the input strictly following the TranslateGemma schema
 english_text = "The model relies on multi-query attention and RoPE embeddings to process the genome sequence."
 
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "source_lang_code": "en",
-                "target_lang_code": "fa",
-                "text": english_text,
-            }
-        ],
-    }
-]
+user_message = {
+    "role": "user",
+    "content": [
+        {
+            "type": "text",
+            "source_lang_code": "en",
+            "target_lang_code": "fa",
+            "text": english_text,
+        }
+    ],
+}
 
-# 4. Apply the template and generate
-inputs = processor.apply_chat_template(
-    messages,
-    tokenize=True,
-    add_generation_prompt=True,  # Tells the model to start the assistant's turn
-    return_dict=True,
-    return_tensors="pt",
-).to(model.device)
+# 4. Render the prompt the adapter was trained to continue, and generate.
+# Not add_generation_prompt=True: that omits the assistant-turn indentation the
+# SFT rendering emits. See prompting.py.
+prompts = render_training_prompts(processor, [user_message])
+inputs = tokenize_prompts_for_generation(processor, prompts, model.device)
 
 with torch.inference_mode():
     pad_token_id = processor.tokenizer.pad_token_id
@@ -62,6 +67,7 @@ with torch.inference_mode():
         top_p=1.0,
         top_k=50,
         pad_token_id=pad_token_id,
+        eos_token_id=stop_token_ids,
     )
 
 # 5. Decode only the newly generated tokens

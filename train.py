@@ -38,6 +38,7 @@ from language_pairs import (
     resolve_language_pair,
 )
 from logging_utils import logger, setup_logging, log_config_summary, load_config
+from prompting import render_training_prompt, resolve_stop_token_ids
 
 from accelerate import Accelerator, PartialState
 
@@ -156,9 +157,19 @@ def load_generation_safe_model_config(base_model_id):
     return config
 
 
-def make_deterministic_generation_config(model_config, processor):
-    """Return explicit, warning-free defaults for translation generation."""
+def make_deterministic_generation_config(model_config, processor, base_model_id=None):
+    """Return explicit, warning-free defaults for translation generation.
+
+    The stop set is resolved through prompting.resolve_stop_token_ids rather
+    than taken from the model config. GenerationConfig.from_model_config reads
+    config.json only, which for google/translategemma-12b-it yields just
+    <eos> (1) and omits the chat turn ender <end_of_turn> (106) that
+    generation_config.json publishes and that SFT trains every target to emit.
+    A decoder missing 106 does not stop a fine-tuned model at all; see
+    docs/2026-08-10_adapter_degeneration_analysis.md.
+    """
     tokenizer = processor.tokenizer
+    base_model_id = base_model_id or getattr(model_config, "_name_or_path", None)
     generation_config = GenerationConfig.from_model_config(model_config)
     generation_config.do_sample = False
     generation_config.temperature = 1.0
@@ -166,8 +177,11 @@ def make_deterministic_generation_config(model_config, processor):
     generation_config.top_k = 50
     if generation_config.bos_token_id is None:
         generation_config.bos_token_id = tokenizer.bos_token_id
-    if generation_config.eos_token_id is None:
-        generation_config.eos_token_id = tokenizer.eos_token_id
+    # Unconditional: eos_token_id is present but incomplete, so an
+    # "if ... is None" guard would never fire.
+    generation_config.eos_token_id = resolve_stop_token_ids(
+        tokenizer, generation_config, base_model_id=base_model_id
+    )
     if generation_config.pad_token_id is None:
         generation_config.pad_token_id = tokenizer.pad_token_id
     if generation_config.pad_token_id is None:
@@ -217,7 +231,6 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
     tokenizer = processor.tokenizer
     tokenizer.truncation_side = train_cfg["truncation_side"]
     max_length = train_cfg["max_length"]
-    boundary_marker = "<|translategemma-target-boundary|>"
 
     def tokenize_example(example):
         source_lang, target_lang = resolve_language_pair(example, data_cfg)
@@ -226,17 +239,10 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
             source_lang, target_lang,
         )
         full_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        # TranslateGemma's generation prompt is not guaranteed to be a literal token
-        # prefix of its completed assistant turn. Render the same *training* template
-        # with a unique assistant marker instead, then use the marker position as the
-        # loss boundary. This preserves the previously working rendering behavior.
-        marker_messages = [messages[0], {"role": "assistant", "content": boundary_marker}]
-        marker_text = processor.apply_chat_template(marker_messages, tokenize=False, add_generation_prompt=False)
-        try:
-            response_start = marker_text.rindex(boundary_marker)
-        except ValueError as error:
-            raise ValueError("TranslateGemma chat template did not preserve the assistant boundary marker.") from error
-        prompt_text = marker_text[:response_start]
+        # Shared with every generation entry point via prompting.py, so the
+        # prefix the model is trained to continue is the prefix it is queried
+        # with. add_generation_prompt=True is NOT that prefix.
+        prompt_text = render_training_prompt(processor, messages[0])
         full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         if full_ids[:len(prompt_ids)] != prompt_ids:

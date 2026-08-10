@@ -29,6 +29,11 @@ from rich.table import Table
 
 from language_pairs import resolve_language_pair
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
+from prompting import (
+    render_inference_prompts,
+    resolve_stop_token_ids,
+    tokenize_prompts_for_generation,
+)
 from train import (
     load_generation_safe_model_config,
     make_deterministic_generation_config,
@@ -164,11 +169,25 @@ def generate_translations(test_df, config, adapter_path=None, prefix="", force=F
     model_config = load_generation_safe_model_config(model_cfg["base_model_id"])
     load_kwargs = {
         "config": model_config,
-        "generation_config": make_deterministic_generation_config(model_config, processor),
+        "generation_config": make_deterministic_generation_config(
+            model_config, processor, model_cfg["base_model_id"]
+        ),
         "dtype": resolve_dtype(model_cfg["dtype"]),
         "attn_implementation": model_cfg["attn_implementation"],
     }
-    
+    # Resolved again here and passed on every generate() call: a cached or
+    # adapter-supplied generation config must not be able to reintroduce a stop
+    # set that omits <end_of_turn>.
+    stop_token_ids = resolve_stop_token_ids(
+        processor.tokenizer, base_model_id=model_cfg["base_model_id"]
+    )
+    if is_main:
+        logger.info(
+            "Stop tokens for generation: %s -> %s",
+            processor.tokenizer.convert_ids_to_tokens(stop_token_ids),
+            stop_token_ids,
+        )
+
     base_model = AutoModelForCausalLM.from_pretrained(model_cfg["base_model_id"], **load_kwargs)
     base_model = base_model.to(state.device)
     model = PeftModel.from_pretrained(base_model, adapter_path) if adapter_path else base_model
@@ -181,21 +200,19 @@ def generate_translations(test_df, config, adapter_path=None, prefix="", force=F
         
         for batch_start in range(0, len(uncached_rank_indices), batch_size):
             batch_indices = uncached_rank_indices[batch_start : batch_start + batch_size]
-            messages_batch = []
+            user_messages = []
             for i in batch_indices:
                 row = test_df.iloc[i]
                 source = row[data_cfg["source_column"]]
                 source_lang, target_lang = resolve_language_pair(row, data_cfg)
-                messages_batch.append([{"role": "user", "content": [{"type": "text", "source_lang_code": source_lang, "target_lang_code": target_lang, "text": source}]}])
+                user_messages.append({"role": "user", "content": [{"type": "text", "source_lang_code": source_lang, "target_lang_code": target_lang, "text": source}]})
 
-            inputs = processor.apply_chat_template(
-                messages_batch,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                padding=True,
-            ).to(model.device)
+            # The adapter is conditioned on the SFT rendering, which
+            # add_generation_prompt=True does not reproduce; the untouched base
+            # model is conditioned on the generation prompt. Each system is
+            # queried the way it was trained.
+            prompts = render_inference_prompts(processor, user_messages, adapter_path is not None)
+            inputs = tokenize_prompts_for_generation(processor, prompts, model.device)
 
             with torch.inference_mode():
                 pad_token_id = processor.tokenizer.pad_token_id
@@ -204,6 +221,7 @@ def generate_translations(test_df, config, adapter_path=None, prefix="", force=F
                     "do_sample": eval_cfg["do_sample"],
                     "num_beams": eval_cfg["num_beams"],
                     "pad_token_id": pad_token_id,
+                    "eos_token_id": stop_token_ids,
                 }
                 if eval_cfg["do_sample"]:
                     generation_kwargs.update(temperature=eval_cfg["temperature"], top_p=eval_cfg["top_p"])
