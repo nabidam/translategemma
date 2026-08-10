@@ -186,6 +186,7 @@ evaluation:
   summary_filename: "summary.json"
   human_review_filename: "human_review_sample.csv"
   human_review_seed: 42
+  eval_batch_size: 8 # GPU batch size for batched evaluation generation
   max_new_tokens: 1024
   do_sample: false
   temperature: 1.0

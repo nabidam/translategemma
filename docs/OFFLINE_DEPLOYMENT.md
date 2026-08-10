@@ -474,6 +474,16 @@ docker compose run --rm trainer python train.py       --config config.yaml
 # Evaluation features Rich progress bars and line-flushed crash-proof resumption
 docker compose run --rm trainer python evaluate_translations.py \
     --config config.yaml --adapter-path translategemma-farsi-science/sft_final
+
+# Multi-GPU data-parallel evaluation. Each rank keeps its own resumable cache
+# shard, so an interrupted run continues where it stopped.
+docker compose run --rm trainer accelerate launch \
+    --config_file accelerate_configs/h200_8gpu.yaml evaluate_translations.py \
+    --config config.yaml --adapter-path translategemma-farsi-science/sft_final
+
+# CPU-only. Renders evaluation/report.html: metric summary, per-domain
+# breakdown, and base-versus-adapter translations side by side for review.
+docker compose run --rm trainer python report_evaluation.py --config config.yaml
 ```
 
 Run the final multi-model benchmark as separate containers. This guarantees

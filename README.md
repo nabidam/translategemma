@@ -91,11 +91,42 @@ python scripts/benchmark_training.py --config config.yaml \
   --training-options-gpu-count 4
 
 # 4. Evaluate an existing adapter (or inspect final outputs again).
-# Features live Rich progress bars and line-flushed crash-proof resumption.
+# Single-GPU with GPU batching (eval_batch_size configured in config.yaml):
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
+
+# Multi-GPU data-parallel evaluation using Accelerate:
+accelerate launch --config_file accelerate_configs/h200_4gpu.yaml \
+  evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
 
 # Optional: Force a clean re-evaluation from scratch (bypassing cached progress).
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter --force
+
+# 5. Turn the evaluation CSVs into one offline HTML review page.
+python report_evaluation.py --config config.yaml
+```
+
+### Reviewing an evaluation run
+
+`report_evaluation.py` renders `evaluation/report.html` from whatever
+`<prefix>_detailed_scores.csv` files the evaluation wrote (`base` and `adapter`
+by default), joined on `data.id_column`. It is a single self-contained file with
+no network dependency, so it can be copied off the offline host and opened
+directly.
+
+The page contains the per-system metric cards, a head-to-head table with the
+MetricX/COMET deltas and the per-sample win rate, a per-domain breakdown, and a
+sample explorer that shows the source, the reference, and every system's
+translation side by side. The explorer supports full-text search, domain
+filtering, sorting by biggest gain or regression, word-level diffing against the
+reference, and renders Farsi right-to-left automatically.
+
+```bash
+# Report a run kept outside the configured evaluation directory.
+python report_evaluation.py --config config.yaml \
+  --eval-dir evaluation-canary --output evaluation-canary/report.html
+
+# Keep the page small for a very large test set.
+python report_evaluation.py --config config.yaml --max-samples 2000
 ```
 
 ## Compare multiple translation models
