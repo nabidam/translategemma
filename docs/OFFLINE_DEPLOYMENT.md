@@ -471,6 +471,7 @@ memory before raising the per-device batch.
 ```bash
 docker compose run --rm trainer python split_dataset.py --config config.yaml
 docker compose run --rm trainer python train.py       --config config.yaml
+# Evaluation features Rich progress bars and line-flushed crash-proof resumption
 docker compose run --rm trainer python evaluate_translations.py \
     --config config.yaml --adapter-path translategemma-farsi-science/sft_final
 ```

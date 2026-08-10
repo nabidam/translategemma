@@ -91,7 +91,11 @@ python scripts/benchmark_training.py --config config.yaml \
   --training-options-gpu-count 4
 
 # 4. Evaluate an existing adapter (or inspect final outputs again).
+# Features live Rich progress bars and line-flushed crash-proof resumption.
 python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter
+
+# Optional: Force a clean re-evaluation from scratch (bypassing cached progress).
+python evaluate_translations.py --config config.yaml --adapter-path path/to/adapter --force
 ```
 
 ## Compare multiple translation models
@@ -245,7 +249,9 @@ The trainer evaluates validation loss and checkpoints every configured interval.
 restores the best validation checkpoint before writing the final adapter. The held-out
 test split is never used during training; after training, the evaluator optionally
 compares the base model and adapter with deterministic decoding, COMET, MetricX, and a
-per-domain human-review CSV sample.
+per-domain human-review CSV sample. Evaluation includes live Rich progress indicators
+and writes line-flushed cache files (`.cache_*_hypotheses.jsonl`) to make generation and
+metric scoring crash-proof and instantly resumable.
 
 ## Checkpointing and resume
 
