@@ -110,6 +110,17 @@ training:
   # truncation cap and the target BFD packed-block length.
   max_length: 2048
   truncation_side: "right"
+  # Truncation removes the tail, and the tail holds <end_of_turn>, so a
+  # truncated example is a completion the model is never taught to finish. The
+  # 2026-08-09 run trained on 105,567 of them (3.86%). Set false to keep them;
+  # they will end mid-sentence with no terminator.
+  drop_overlength_examples: true
+  # Touch this file (default <model.output_dir>/STOP) to end a run cleanly at
+  # the next checked step: it evaluates, saves, then runs Trainer's normal
+  # end-of-training path, so load_best_model_at_end fires and sft_final is
+  # written. Killing the process instead loses everything since the last save.
+  stop_file: null
+  stop_file_check_steps: 10
   # Alignment for unpacked batches (including the validation split). Packed
   # padding-free training blocks do not add alignment padding.
   pad_to_multiple_of: 8
@@ -205,6 +216,15 @@ evaluation:
   comet_batch_size: 8
   comet_gpus: 1
   human_review_samples_per_domain: 15
+  # Classify decoding failures (unstopped output, loops, leaked boilerplate)
+  # before the scoring models load. MetricX and COMET are corpus averages and
+  # cannot express "this system stopped translating and filled the token
+  # budget"; see docs/2026-08-10_adapter_degeneration_analysis.md.
+  degeneration_audit_enabled: true
+  # Fail the run when a system's failure rate exceeds this. The base model sits
+  # near 0.08 on this test set because some source segments legitimately repeat,
+  # so a threshold below that would fail every run. null reports without failing.
+  max_degeneration_rate: 0.15
 
 logging:
   logs_dir: "logs"

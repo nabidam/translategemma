@@ -43,7 +43,8 @@ from prompting import render_training_prompt, resolve_stop_token_ids
 from accelerate import Accelerator, PartialState
 
 
-PREPARED_CACHE_VERSION = 2
+# 3: over-length examples are dropped rather than trained without a stop token.
+PREPARED_CACHE_VERSION = 3
 
 
 class RichLoggingCallback(TrainerCallback):
@@ -64,6 +65,66 @@ class RichLoggingCallback(TrainerCallback):
 
     def on_train_end(self, args, state, control, **kwargs):
         logger.info("Train end: total_steps=%s epoch=%.4f", state.global_step, state.epoch or 0.0)
+
+
+class GracefulStopCallback(TrainerCallback):
+    """Stop training cleanly when a sentinel file appears.
+
+    Killing a run with Ctrl-C or SIGTERM loses everything since the last
+    save_steps boundary and never runs Trainer's end-of-training path, so
+    load_best_model_at_end does not fire and no sft_final adapter is written.
+    That is how the 2026-08-09 run ended: the evaluated artefact was an
+    intermediate checkpoint that was not even the best one.
+
+    Touching the sentinel instead evaluates, saves, and then ends training
+    through the normal path, so the run finishes as if it had reached its last
+    step. Rank zero owns the decision and broadcasts it: if each rank stat'd the
+    file independently, one could observe it a step earlier than another, and
+    the ranks would desynchronise into a hang.
+    """
+
+    def __init__(self, stop_path, check_interval_steps=10):
+        self.stop_path = Path(stop_path)
+        self.check_interval_steps = max(1, int(check_interval_steps))
+        self._stopping = False
+
+    def _decide(self):
+        """Return rank zero's answer on every rank."""
+        state = PartialState()
+        requested = state.is_main_process and self.stop_path.exists()
+        if state.num_processes == 1:
+            return requested
+        flag = torch.tensor([1 if requested else 0], dtype=torch.uint8, device=state.device)
+        torch.distributed.broadcast(flag, src=0)
+        return bool(flag.item())
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._stopping or state.global_step % self.check_interval_steps:
+            return control
+        if not self._decide():
+            return control
+        self._stopping = True
+        if PartialState().is_main_process:
+            logger.warning(
+                "Stop file %s found at step %s. Evaluating and saving, then ending training.",
+                self.stop_path, state.global_step,
+            )
+            # Removed now so a later resume_from_checkpoint does not stop again
+            # on the first checked step.
+            self.stop_path.unlink(missing_ok=True)
+        # Evaluate before saving so the checkpoint carries a metric and remains
+        # eligible for load_best_model_at_end.
+        control.should_evaluate = True
+        control.should_save = True
+        control.should_training_stop = True
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._stopping and PartialState().is_main_process:
+            logger.warning(
+                "Training stopped early by request at step %s of %s (epoch %.4f).",
+                state.global_step, state.max_steps, state.epoch or 0.0,
+            )
 
 
 class TranslationDataCollator:
@@ -278,14 +339,32 @@ def tokenize_sft_dataset(dataset, processor, config, split_name):
 
     num_proc = map_workers(train_cfg["tokenize_num_proc"], len(dataset))
     tokenized = dataset.map(tokenize_example, remove_columns=dataset.column_names, num_proc=num_proc, desc=f"Tokenizing {split_name}")
+    total = len(tokenized)
     truncated = sum(tokenized["was_truncated"])
-    without_target = len(tokenized) - sum(tokenized["has_target"])
+    without_target = total - sum(tokenized["has_target"])
     if without_target:
         logger.warning("%s examples in %s contain no target tokens at max_length=%s and will be excluded.", without_target, split_name, max_length)
         tokenized = tokenized.filter(lambda example: example["has_target"], num_proc=num_proc, desc=f"Filtering {split_name}")
+    # A truncated example loses its tail, and the tail is where <end_of_turn>
+    # lives, so it teaches a completion the model is never shown how to finish.
+    # The 2026-08-09 run trained on 105,567 such rows (3.86%). Dropping is
+    # preferred over re-appending a terminator: an example that stops
+    # mid-sentence and then ends the turn teaches truncated translations, which
+    # is a worse lesson than the 3.86% of data it costs.
+    if truncated and train_cfg.get("drop_overlength_examples", True):
+        logger.warning(
+            "%s examples in %s are longer than max_length=%s and lose their stop token; dropping them.",
+            truncated, split_name, max_length,
+        )
+        tokenized = tokenized.filter(
+            lambda example: not example["was_truncated"], num_proc=num_proc, desc=f"Dropping over-length {split_name}"
+        )
     if not len(tokenized):
         raise ValueError(f"No usable {split_name} examples remain after tokenization.")
-    logger.info("%s tokenized: examples=%s truncated=%s (%.2f%%), max_length=%s", split_name, len(tokenized), truncated, 100 * truncated / (len(tokenized) + without_target), max_length)
+    logger.info(
+        "%s tokenized: kept=%s of %s, truncated=%s (%.2f%%), no_target=%s, max_length=%s",
+        split_name, len(tokenized), total, truncated, 100 * truncated / total, without_target, max_length,
+    )
     return tokenized.remove_columns(["has_target", "was_truncated"])
 
 
@@ -312,6 +391,7 @@ def _prepared_cache_path(path, config, split_name, max_examples, packed, selecti
         "target_column": config["data"]["target_column"],
         "max_length": train_cfg["max_length"],
         "truncation_side": train_cfg["truncation_side"],
+        "drop_overlength_examples": train_cfg.get("drop_overlength_examples", True),
         "packed": packed,
         "packing_strategy": train_cfg["packing_strategy"] if packed else None,
     }
@@ -601,6 +681,18 @@ def prepare_sft_splits(processor, config, max_examples=None):
     return train_data, validation_data
 
 
+def make_graceful_stop_callback(config):
+    """Build the stop-file callback, defaulting the path under the output dir."""
+    train_cfg, model_cfg = config["training"], config["model"]
+    stop_path = train_cfg.get("stop_file") or Path(model_cfg["output_dir"]) / "STOP"
+    callback = GracefulStopCallback(stop_path, train_cfg.get("stop_file_check_steps", 10))
+    if PartialState().is_main_process:
+        # Stale sentinels from a previous run would end this one immediately.
+        Path(stop_path).unlink(missing_ok=True)
+        logger.info("Touch %s to stop training cleanly after the next checkpoint.", stop_path)
+    return callback
+
+
 def run_sft(model, processor, config, max_examples=None, max_steps=None, prepared_splits=None):
     model_cfg = config["model"]
     train_data, validation_data = prepared_splits or prepare_sft_splits(
@@ -613,7 +705,7 @@ def run_sft(model, processor, config, max_examples=None, max_steps=None, prepare
     args = make_training_arguments(config, Path(model_cfg["output_dir"]) / model_cfg["sft_checkpoint_subdir"], config["training"]["learning_rate"], config["training"]["epochs"], validation_data is not None, max_steps, group_by_length=config["training"]["group_by_length"])
     trainer = Trainer(model=model, args=args, train_dataset=train_data, eval_dataset=validation_data,
                       data_collator=make_sft_data_collator(processor, config),
-                      callbacks=[RichLoggingCallback()])
+                      callbacks=[RichLoggingCallback(), make_graceful_stop_callback(config)])
     trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
     save_path = Path(model_cfg["output_dir"]) / model_cfg["sft_final_subdir"]
     trainer.save_model(save_path)
