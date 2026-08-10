@@ -30,7 +30,40 @@ executed because training never ended. And the run was **healthy**: smooth loss,
 stable gradient norms, 45 consecutive eval improvements, one 0.0016 uptick at
 the very end. Nothing here looks like divergence or collapse.
 
-## Headline
+## Outcome
+
+**Resolved by the decoder fix. No retraining.** Re-evaluating the *unchanged*
+`checkpoint-23500` with Fixes 1–3 applied (`evaluation_100826_23500_v2`):
+
+| | base | adapter (before) | adapter (after) |
+|---|---:|---:|---:|
+| Clean rows | 91.6% | 12.8% | **94.6%** |
+| Whitespace flood | 0 | 142 (69.95%) | **0** |
+| Loop | 7 (3.45%) | 35 (17.24%) | **6 (2.96%)** |
+| Boilerplate leak | 0 | 4 | **0** |
+| Length blowup | 4 | 28 | **0** |
+| Mean output chars | 466 | 1010 | **423** |
+| Max trailing whitespace | 1 | 511 | **0** |
+| Similarity to reference | 0.530 | — | **0.860** |
+| len(output)/len(reference) | 1.263 | 7.70 | **1.005** |
+
+The adapter now beats the base model on every axis, and closer to the reference
+on **193 of 203 rows (95.1%)**. Whole-text similarity to the reference went from
+0.530 (base) to 0.860 — the fine-tune was always this good; 85% of its output
+was being buried under unstopped decoding.
+
+All 6 residual loops are **shared with the base model**, and in every one the
+*source segment itself* contains the repeated span (repeat factor 3–11). There
+are zero adapter-only loops. Those are PDF-extraction artefacts in the test set
+being translated faithfully, not a model defect.
+
+The base model's numbers are unchanged (466 vs 465 mean chars, 91.6% vs 92.1%
+clean), confirming that keeping it on `add_generation_prompt=True` preserved the
+baseline rather than moving it.
+
+Everything below is the investigation that produced that fix.
+
+## Headline (pre-fix measurements)
 
 **The fine-tune improved translation and destroyed termination.**
 
@@ -501,13 +534,21 @@ uv run python scripts/audit_degeneration.py --eval-dir evaluation
 uv run python scripts/audit_sft_corpus.py --dataset data/splits/train.jsonl
 ```
 
-## Next step
+## Next steps
 
-Apply Fixes 1–3 and re-run evaluation against the **unchanged**
-`checkpoint-23500`. No retraining, no data work. If the diagnosis is right, the
-adapter's 12.8% clean rate should jump past the base model's 92.1%, and the
-quality gain already measurable in every row's first 120 characters becomes the
-whole translation.
+Fixes 1–3 are done and the failure is gone (see Outcome). What remains is
+optional and none of it is blocking:
 
-Only if that re-evaluation still shows floods or loops do Fixes 4–5 and a
-retrain become necessary.
+- **Enable MetricX and COMET.** Both were off for these runs, so there is still
+  no proper quality number. They were pointless while 85% of the output was
+  degenerate; now they would measure something real.
+- **Finish the training run.** It stopped at step 23,640 of 34,860, epoch 2.03
+  of 3, with eval_loss still falling. Resuming is an improvement, not a repair.
+- **Clean the corpus (Fix 5) before the next run.** Largest item is the 73,110
+  self-repeating targets. Note the 4 boilerplate leaks disappeared with proper
+  stopping — they were post-turn filler, not mid-output memorisation — so this
+  is lower priority than it looked.
+- **Fix truncation (Fix 4)** in the same pass, so no future run trains 105k
+  examples without a terminator.
+- **Wire `audit_degeneration.py --fail-over` into the evaluation run** so this
+  class of failure can never again require a human to notice it.
