@@ -54,11 +54,13 @@ from transformers import AutoProcessor, GenerationConfig  # noqa: E402
 
 from language_pairs import resolve_language_pair  # noqa: E402
 from logging_utils import load_config, logger  # noqa: E402
+from model_loading import (  # noqa: E402
+    load_generation_safe_model_config,
+    make_deterministic_generation_config,
+)
 from train import (  # noqa: E402
     format_translategemma_message,
     limit_dataset,
-    load_generation_safe_model_config,
-    make_deterministic_generation_config,
 )
 
 BOUNDARY_MARKER = "<|translategemma-target-boundary|>"

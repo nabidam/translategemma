@@ -7,7 +7,7 @@ from prompting import (
     resolve_stop_token_ids,
     tokenize_prompts_for_generation,
 )
-from train import load_generation_safe_model_config, make_deterministic_generation_config
+from model_loading import load_generation_safe_model_config, make_deterministic_generation_config
 
 # 1. Load Base Model and Processor
 base_model_id = "google/translategemma-12b-it"

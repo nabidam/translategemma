@@ -39,7 +39,7 @@ from prompting import (
     resolve_stop_token_ids,
     tokenize_prompts_for_generation,
 )
-from train import (
+from model_loading import (
     load_generation_safe_model_config,
     make_deterministic_generation_config,
     resolve_dtype,

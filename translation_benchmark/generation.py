@@ -30,7 +30,10 @@ class TranslateGemmaRunner:
         from peft import PeftModel
         from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
         from prompting import resolve_stop_token_ids
-        from train import load_generation_safe_model_config, make_deterministic_generation_config
+        from model_loading import (
+            load_generation_safe_model_config,
+            make_deterministic_generation_config,
+        )
 
         self.torch = torch
         self.settings = settings
