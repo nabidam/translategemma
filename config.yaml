@@ -219,7 +219,7 @@ evaluation:
       - "empty_output"
       - "source_copy"
   metricx_enabled: true
-  metricx_model_id: "google/metricx-24-hybrid-large-v2p6"
+  metricx_model_id: "google/metricx-24-hybrid-xl-v2p6-bfloat16"
   # MetricX repositories contain no tokenizer files. MetricX-24 was initialised
   # from mT5 and predict.py always tokenizes with google/mt5-xl.
   metricx_tokenizer_id: "google/mt5-xl"

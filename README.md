@@ -105,6 +105,13 @@ python evaluate_translations.py --config config.yaml --adapter-path path/to/adap
 python report_evaluation.py --config config.yaml
 ```
 
+Enabling MetricX and COMET needs a MetricX checkout, a licence acceptance for
+gated XCOMET checkpoints, and staged model files. That setup, the multi-GPU and
+single-GPU execution model, and the cache semantics are in
+[`docs/EVALUATION_RUNBOOK.md`](docs/EVALUATION_RUNBOOK.md). Which metric to trust
+for English → Persian is argued in
+[`docs/EVALUATION_BACKLOG.md`](docs/EVALUATION_BACKLOG.md).
+
 ### Reviewing an evaluation run
 
 `report_evaluation.py` renders `evaluation/report.html` from whatever
