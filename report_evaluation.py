@@ -23,9 +23,28 @@ import pandas as pd
 from logging_utils import load_config, logger, console
 
 HYPOTHESIS_COLUMN = "generated_farsi"
-SCORE_COLUMNS = {
-    "metricx": {"column": "metricx_score", "label": "MetricX", "lower_is_better": True},
-    "comet": {"column": "comet_score", "label": "COMET", "lower_is_better": False},
+# Every per-row metric evaluate_translations.py can write into a detailed CSV,
+# in report order. A metric absent from the CSV is dropped from the report
+# rather than rendered empty, so a run with COMET disabled produces a report
+# with no COMET column at all.
+#
+# Labels and directions are duplicated here instead of imported from
+# translation_benchmark.metrics on purpose: rendering a report must not pull in
+# sacrebleu and the rest of the scoring stack, since it is the one step that is
+# routinely run outside the training container.
+#
+# percent marks a rate rendered as a percentage, whose deltas are therefore
+# percentage points; digits is the fixed-point precision for the others.
+METRIC_SPECS = {
+    "metricx": {"column": "metricx_score", "label": "MetricX", "lower_is_better": True, "percent": False, "digits": 4},
+    "comet": {"column": "comet_score", "label": "COMET", "lower_is_better": False, "percent": False, "digits": 4},
+    "sentence_bleu": {"column": "sentence_bleu", "label": "BLEU", "lower_is_better": False, "percent": False, "digits": 2},
+    "sentence_chrf": {"column": "sentence_chrf", "label": "chrF++", "lower_is_better": False, "percent": False, "digits": 2},
+    "number_preservation": {"column": "number_preservation", "label": "Numbers kept", "lower_is_better": False, "percent": True, "digits": 4},
+    "acronym_preservation": {"column": "acronym_preservation", "label": "Acronyms kept", "lower_is_better": False, "percent": True, "digits": 4},
+    "formula_preservation": {"column": "formula_preservation", "label": "Formulas kept", "lower_is_better": False, "percent": True, "digits": 4},
+    "empty_output": {"column": "empty_output", "label": "Empty output", "lower_is_better": True, "percent": True, "digits": 4},
+    "source_copy": {"column": "source_copy", "label": "Source copied", "lower_is_better": True, "percent": True, "digits": 4},
 }
 
 
@@ -111,7 +130,7 @@ def build_samples(frames, system_names, data_cfg):
                 "text": _clean(row.get(HYPOTHESIS_COLUMN)) or "",
                 **{
                     metric: _optional_float(row.get(spec["column"]))
-                    for metric, spec in SCORE_COLUMNS.items()
+                    for metric, spec in METRIC_SPECS.items()
                     if spec["column"] in frame.columns
                 },
             }
@@ -124,23 +143,37 @@ def _mean(values):
 
 
 def summarize_systems(samples, system_names, summary_entries):
-    """Corpus-level stats per system, merged with evaluate_translations' summary.json."""
+    """Corpus-level stats per system, merged with evaluate_translations' summary.json.
+
+    Means are recomputed from the per-row CSV rather than read from summary.json
+    so a report still describes exactly the samples it embeds (--max-samples) and
+    works when only the CSVs were copied off the GPU host. The decoding audit is
+    the exception: it is corpus-level and has no per-row column, so it is carried
+    through from summary.json when that file is present.
+    """
     stats = {}
     for name in system_names:
         outputs = [sample["outputs"].get(name) for sample in samples]
         present = [output for output in outputs if output is not None]
         texts = [output["text"] for output in present]
         entry = summary_entries.get(name, {})
+        values = {metric: [output.get(metric) for output in present] for metric in METRIC_SPECS}
         stats[name] = {
             "label": name,
             "adapter_path": entry.get("adapter_path"),
             "examples": len(present),
             "empty_outputs": sum(1 for text in texts if not text.strip()),
             "avg_chars": _mean([float(len(text)) for text in texts]),
-            "metrics": {
-                metric: _mean([output.get(metric) for output in present])
-                for metric in SCORE_COLUMNS
+            "metrics": {metric: _mean(column) for metric, column in values.items()},
+            # Preservation metrics are undefined for rows whose source contains
+            # no number/acronym/formula, so their mean is over a subset. Showing
+            # the denominator keeps a 100% over 12 rows from reading like a
+            # corpus-wide result.
+            "scored": {
+                metric: sum(1 for value in column if value is not None)
+                for metric, column in values.items()
             },
+            "degeneration": entry.get("degeneration"),
         }
     return stats
 
@@ -151,14 +184,14 @@ def summarize_domains(samples, system_names):
     for sample in samples:
         bucket = domains.setdefault(
             sample["domain"],
-            {"domain": sample["domain"], "count": 0, "systems": {name: {metric: [] for metric in SCORE_COLUMNS} for name in system_names}},
+            {"domain": sample["domain"], "count": 0, "systems": {name: {metric: [] for metric in METRIC_SPECS} for name in system_names}},
         )
         bucket["count"] += 1
         for name in system_names:
             output = sample["outputs"].get(name)
             if not output:
                 continue
-            for metric in SCORE_COLUMNS:
+            for metric in METRIC_SPECS:
                 if output.get(metric) is not None:
                     bucket["systems"][name][metric].append(output[metric])
     rows = []
@@ -178,7 +211,7 @@ def available_metrics(samples, system_names):
     """Metrics that at least one system actually scored."""
     return [
         metric
-        for metric in SCORE_COLUMNS
+        for metric in METRIC_SPECS
         if any(
             (sample["outputs"].get(name) or {}).get(metric) is not None
             for sample in samples
@@ -217,8 +250,13 @@ def build_payload(config, eval_dir, args):
         "base_model_id": config.get("model", {}).get("base_model_id"),
         "systems": system_names,
         "metric_specs": {
-            metric: {"label": spec["label"], "lower_is_better": spec["lower_is_better"]}
-            for metric, spec in SCORE_COLUMNS.items()
+            metric: {
+                "label": spec["label"],
+                "lower_is_better": spec["lower_is_better"],
+                "percent": spec["percent"],
+                "digits": spec["digits"],
+            }
+            for metric, spec in METRIC_SPECS.items()
             if metric in metrics
         },
         "stats": summarize_systems(samples, system_names, summary_entries),
@@ -330,8 +368,17 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="panel scroll"><table id="compare"></table></div>
   </section>
 
+  <section id="decoding-section">
+    <h2>Decoding failures</h2>
+    <div class="panel scroll"><table id="decoding"></table></div>
+  </section>
+
   <section>
     <h2>By domain</h2>
+    <div class="controls">
+      <label class="sub" for="domain-metric">Metric</label>
+      <select id="domain-metric"></select>
+    </div>
     <div class="panel scroll"><table id="domains"></table></div>
   </section>
 
@@ -363,6 +410,22 @@ const RTL = /[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]/;
 const fmt = (v, digits = 4) => (v === null || v === undefined ? "—" : Number(v).toFixed(digits));
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const dirOf = (s) => (RTL.test(String(s || "")) ? "rtl" : "ltr");
+const pct = (v, digits = 1) => (v === null || v === undefined ? "—" : `${(100 * v).toFixed(digits)}%`);
+
+// Rates render as percentages and their deltas as percentage points; the rest
+// keep the fixed precision the metric is normally quoted at.
+const fmtVal = (metric, v) => {
+  if (v === null || v === undefined) return "—";
+  const spec = DATA.metric_specs[metric];
+  return spec.percent ? pct(v) : Number(v).toFixed(spec.digits);
+};
+const fmtDelta = (metric, d) => {
+  if (d === null || d === undefined) return "—";
+  const spec = DATA.metric_specs[metric];
+  const sign = d > 0 ? "+" : "";
+  return spec.percent ? `${sign}${(100 * d).toFixed(1)} pp` : `${sign}${Number(d).toFixed(spec.digits)}`;
+};
+const deltaClass = (d) => (d === null || d === undefined ? "" : d > 0 ? "good" : d < 0 ? "bad" : "");
 
 // Better of two metric means, honouring each metric's direction.
 function improvement(metric, base, other) {
@@ -383,61 +446,116 @@ document.getElementById("footer").textContent = `Source: ${DATA.eval_dir}`;
 /* Summary cards */
 document.getElementById("cards").innerHTML = DATA.systems.map((name) => {
   const s = DATA.stats[name];
-  const rows = METRICS.map(([metric, spec]) =>
-    `<div class="metric-row"><span>${esc(spec.label)} ${spec.lower_is_better ? "↓" : "↑"}</span><span class="num">${fmt(s.metrics[metric])}</span></div>`
-  ).join("");
+  const rows = METRICS.map(([metric, spec]) => {
+    // A metric scored over fewer rows than the report embeds gets its
+    // denominator shown, so a preservation rate is not read corpus-wide.
+    const scored = s.scored[metric];
+    const note = scored && scored < s.examples ? ` <span class="sub">/${scored}</span>` : "";
+    return `<div class="metric-row"><span>${esc(spec.label)} ${spec.lower_is_better ? "↓" : "↑"}</span>` +
+      `<span class="num">${fmtVal(metric, s.metrics[metric])}${note}</span></div>`;
+  }).join("");
+  // The decoding audit is the only check that can call a run structurally
+  // broken, so it sits above the quality metrics rather than below them.
+  const audit = s.degeneration ? `
+    <div class="metric-row"><span>Clean decoding ↑</span><span class="num ${s.degeneration.clean_rate < 0.95 ? "bad" : "good"}">${pct(s.degeneration.clean_rate)}</span></div>
+    <div class="metric-row"><span>Decoding failures ↓</span><span class="num ${s.degeneration.failure_rate ? "bad" : ""}">${pct(s.degeneration.failure_rate)}</span></div>` : "";
   return `<div class="card">
     <h3>${esc(name)}</h3>
     <div class="path">${esc(s.adapter_path || "base model (no adapter)")}</div>
     <div class="metric-row"><span>Examples</span><span class="num">${s.examples}</span></div>
     <div class="metric-row"><span>Avg. characters</span><span class="num">${fmt(s.avg_chars, 1)}</span></div>
     <div class="metric-row"><span>Empty outputs</span><span class="num ${s.empty_outputs ? "bad" : ""}">${s.empty_outputs}</span></div>
+    ${audit}
     ${rows}
   </div>`;
 }).join("");
 
-/* Head-to-head: every system against the first one */
+/* Head-to-head: every system against the first one.
+   Metrics are rows, not columns: the report now carries up to nine of them, and
+   a column per metric per comparison ran off the side of the page. */
 const baseName = DATA.systems[0];
+const others = DATA.systems.slice(1);
 const compareSection = document.getElementById("compare-section");
+
+// Per-segment win rate: how often a system's score beats the baseline's on the
+// same row, which a corpus mean can hide entirely.
+function winRate(metric, name) {
+  let win = 0, total = 0;
+  for (const sample of DATA.samples) {
+    const d = improvement(metric, (sample.outputs[baseName] || {})[metric], (sample.outputs[name] || {})[metric]);
+    if (d === null) continue;
+    total++; if (d > 0) win++;
+  }
+  return total ? `${win}/${total} (${((100 * win) / total).toFixed(1)}%)` : "—";
+}
+
 if (DATA.systems.length < 2 || METRICS.length === 0) {
   compareSection.style.display = "none";
 } else {
-  const head = `<tr><th>System</th>${METRICS.map(([, s]) => `<th class="num">${esc(s.label)}</th>`).join("")}` +
-    `${METRICS.map(([, s]) => `<th class="num">Δ ${esc(s.label)} vs ${esc(baseName)}</th>`).join("")}` +
-    `${METRICS.map(([, s]) => `<th class="num">Wins (${esc(s.label)})</th>`).join("")}</tr>`;
-  const body = DATA.systems.map((name) => {
-    const cells = METRICS.map(([metric]) => `<td class="num">${fmt(DATA.stats[name].metrics[metric])}</td>`).join("");
-    const deltas = METRICS.map(([metric]) => {
-      const d = name === baseName ? null : improvement(metric, DATA.stats[baseName].metrics[metric], DATA.stats[name].metrics[metric]);
-      const cls = d === null ? "" : d > 0 ? "good" : d < 0 ? "bad" : "";
-      return `<td class="num ${cls}">${d === null ? "—" : (d > 0 ? "+" : "") + fmt(d)}</td>`;
+  const head = `<tr><th>Metric</th><th>Better</th>` +
+    DATA.systems.map((n) => `<th class="num">${esc(n)}</th>`).join("") +
+    others.map((n) => `<th class="num">Δ ${esc(n)}</th>`).join("") +
+    others.map((n) => `<th class="num">Wins ${esc(n)}</th>`).join("") +
+    `<th class="num">Scored</th></tr>`;
+  const body = METRICS.map(([metric, spec]) => {
+    const values = DATA.systems.map((n) => `<td class="num">${fmtVal(metric, DATA.stats[n].metrics[metric])}</td>`).join("");
+    // Δ is the improvement over the baseline in the metric's own favourable
+    // direction, so positive always means better -- including for MetricX and
+    // the empty_output/source_copy rates, where the raw difference is negative.
+    const deltas = others.map((n) => {
+      const d = improvement(metric, DATA.stats[baseName].metrics[metric], DATA.stats[n].metrics[metric]);
+      return `<td class="num ${deltaClass(d)}">${fmtDelta(metric, d)}</td>`;
     }).join("");
-    const wins = METRICS.map(([metric]) => {
-      if (name === baseName) return `<td class="num">—</td>`;
-      let win = 0, total = 0;
-      for (const sample of DATA.samples) {
-        const a = (sample.outputs[baseName] || {})[metric], b = (sample.outputs[name] || {})[metric];
-        const d = improvement(metric, a, b);
-        if (d === null) continue;
-        total++; if (d > 0) win++;
-      }
-      return `<td class="num">${total ? `${win}/${total} (${((100 * win) / total).toFixed(1)}%)` : "—"}</td>`;
-    }).join("");
-    return `<tr><td>${esc(name)}</td>${cells}${deltas}${wins}</tr>`;
+    const wins = others.map((n) => `<td class="num">${winRate(metric, n)}</td>`).join("");
+    const scored = Math.max(...DATA.systems.map((n) => DATA.stats[n].scored[metric] || 0));
+    return `<tr><td>${esc(spec.label)}</td><td class="sub">${spec.lower_is_better ? "lower" : "higher"}</td>` +
+      `${values}${deltas}${wins}<td class="num">${scored}</td></tr>`;
   }).join("");
   document.getElementById("compare").innerHTML = head + body;
 }
 
-/* Domain table */
-document.getElementById("domains").innerHTML =
-  `<tr><th>Domain</th><th class="num">Samples</th>` +
-  DATA.systems.map((n) => METRICS.map(([, s]) => `<th class="num">${esc(n)} · ${esc(s.label)}</th>`).join("")).join("") +
-  `</tr>` +
-  DATA.domains.map((row) =>
-    `<tr><td>${esc(row.domain)}</td><td class="num">${row.count}</td>` +
-    DATA.systems.map((n) => METRICS.map(([metric]) => `<td class="num">${fmt(row.systems[n][metric])}</td>`).join("")).join("") +
-    `</tr>`
-  ).join("");
+/* Decoding failures, straight from summary.json's audit */
+const decodingRows = DATA.systems.flatMap((name) => {
+  const audit = DATA.stats[name].degeneration;
+  if (!audit) return [];
+  return Object.entries(audit.failures || {})
+    .filter(([, v]) => v.rows)
+    .sort((a, b) => b[1].rate - a[1].rate)
+    .map(([failure, v]) => `<tr><td>${esc(name)}</td><td>${esc(failure)}</td><td class="num">${v.rows}</td><td class="num bad">${pct(v.rate, 2)}</td></tr>`);
+});
+const decodingSection = document.getElementById("decoding-section");
+if (!decodingRows.length) {
+  decodingSection.style.display = "none";
+} else {
+  document.getElementById("decoding").innerHTML =
+    `<tr><th>System</th><th>Failure</th><th class="num">Rows</th><th class="num">Rate</th></tr>` + decodingRows.join("");
+}
+
+/* Domain table: one metric at a time, so the columns stay one per system */
+const domainMetricSelect = document.getElementById("domain-metric");
+domainMetricSelect.innerHTML = METRICS.map(([metric, spec]) => `<option value="${metric}">${esc(spec.label)}</option>`).join("");
+
+function renderDomains() {
+  const metric = domainMetricSelect.value || (METRICS[0] || [""])[0];
+  const table = document.getElementById("domains");
+  if (!metric) { table.innerHTML = `<tr><th>Domain</th><th class="num">Samples</th></tr>` +
+    DATA.domains.map((row) => `<tr><td>${esc(row.domain)}</td><td class="num">${row.count}</td></tr>`).join(""); return; }
+  table.innerHTML =
+    `<tr><th>Domain</th><th class="num">Samples</th>` +
+    DATA.systems.map((n) => `<th class="num">${esc(n)}</th>`).join("") +
+    (others.length ? others.map((n) => `<th class="num">Δ ${esc(n)}</th>`).join("") : "") +
+    `</tr>` +
+    DATA.domains.map((row) => {
+      const values = DATA.systems.map((n) => `<td class="num">${fmtVal(metric, row.systems[n][metric])}</td>`).join("");
+      const deltas = others.map((n) => {
+        const d = improvement(metric, row.systems[baseName][metric], row.systems[n][metric]);
+        return `<td class="num ${deltaClass(d)}">${fmtDelta(metric, d)}</td>`;
+      }).join("");
+      return `<tr><td>${esc(row.domain)}</td><td class="num">${row.count}</td>${values}${deltas}</tr>`;
+    }).join("");
+}
+domainMetricSelect.addEventListener("change", renderDomains);
+renderDomains();
 
 /* Word-level diff (LCS) used to highlight a translation against the reference */
 function diffWords(reference, candidate) {
@@ -516,9 +634,8 @@ function cellHtml(sample, name) {
     const value = output[metric];
     if (value === null || value === undefined) return null;
     const delta = name === baseName ? null : improvement(metric, scoreOf(sample, baseName, metric), value);
-    const cls = delta === null ? "" : delta > 0 ? "good" : delta < 0 ? "bad" : "";
-    const suffix = delta === null ? "" : ` <span class="${cls}">(${delta > 0 ? "+" : ""}${fmt(delta, 3)})</span>`;
-    return `${esc(spec.label)} ${fmt(value, 3)}${suffix}`;
+    const suffix = delta === null ? "" : ` <span class="${deltaClass(delta)}">(${fmtDelta(metric, delta)})</span>`;
+    return `${esc(spec.label)} ${fmtVal(metric, value)}${suffix}`;
   }).filter(Boolean).join(" · ");
   const text = output.text.trim();
   const body = !text
