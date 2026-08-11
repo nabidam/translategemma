@@ -428,7 +428,16 @@ def evaluate_metricx(sources, hypotheses, references, config, prefix="", force=F
                     )
                     # MetricX-24 is trained without the trailing EOS token.
                     inputs = {key: value[:, :-1].to(state.device) for key, value in inputs.items()}
-                    yield i, model(**inputs).predictions.item()
+                    # use_cache=False is required, not an optimisation. MetricX
+                    # builds its decoder with is_encoder_decoder=False, so with
+                    # caching on, MT5Stack allocates a plain DynamicCache rather
+                    # than an EncoderDecoderCache; T5Attention then appends the
+                    # cross-attention keys to the same cache as the decoder's
+                    # self-attention key, making key_length one longer than the
+                    # encoder mask and crashing on position_bias + causal_mask.
+                    # The decoder runs a single dummy step here, so there is
+                    # nothing for a cache to accelerate.
+                    yield i, model(**inputs, use_cache=False).predictions.item()
         finally:
             del model, tokenizer
 
