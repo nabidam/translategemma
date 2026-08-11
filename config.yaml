@@ -203,7 +203,22 @@ evaluation:
   temperature: 1.0
   top_p: 1.0
   num_beams: 1
-  metricx_enabled: false
+  # Model-free metrics computed with translation_benchmark/metrics.py, so a
+  # number here is directly comparable with the same number in a benchmark run.
+  # They cost only CPU time and run on the main process before the scoring
+  # models load. Drop entries from `metrics` to shorten the summary table.
+  transparent_metrics_enabled: true
+  transparent_metrics:
+    chrf_word_order: 2 # chrF++
+    metrics:
+      - "sentence_bleu"
+      - "sentence_chrf"
+      - "number_preservation" # Preservation metrics are NaN, and excluded from
+      - "acronym_preservation" # the mean, on rows whose source has no such item.
+      - "formula_preservation"
+      - "empty_output"
+      - "source_copy"
+  metricx_enabled: true
   metricx_model_id: "google/metricx-24-hybrid-large-v2p6"
   # MetricX repositories contain no tokenizer files. MetricX-24 was initialised
   # from mT5 and predict.py always tokenizes with google/mt5-xl.
@@ -211,8 +226,14 @@ evaluation:
   # MetricX-24 was trained at 1536 tokens (MetricX-23 used 1024). Raising this
   # further produces unpredictable scores.
   metricx_max_length: 1536
-  comet_enabled: false
-  comet_model_id: "Unbabel/wmt22-comet-da"
+  comet_enabled: true
+  # XCOMET-XL (3.5B) is reference-based and gated on the Hub: accept the licence
+  # once with the account whose token is on the host. XCOMET-XXL is 10.7B and
+  # needs ~24 GB more VRAM. Use Unbabel/wmt22-cometkiwi-da or XCOMET-XL-QE with
+  # comet_reference_free: true when no reference is available.
+  comet_model_id: "Unbabel/XCOMET-XL"
+  comet_reference_free: false
+  # XCOMET is far larger than wmt22-comet-da; lower this first on an OOM.
   comet_batch_size: 8
   comet_gpus: 1
   human_review_samples_per_domain: 15

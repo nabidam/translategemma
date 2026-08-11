@@ -37,3 +37,4 @@ __pycache__/
 # Local/reference design documents used during implementation review.
 docs/refs/
 docs/MULTI_GPU_TRAINING.md
+docs/EVALUATION_BACKLOG.md

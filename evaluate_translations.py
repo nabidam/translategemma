@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from rich.table import Table
 
 from degeneration import audit_outputs
 from language_pairs import resolve_language_pair
+from translation_benchmark.metrics import METRIC_DIRECTIONS, score_transparent_metrics
 from logging_utils import console, logger, setup_logging, log_config_summary, load_config
 from prompting import (
     render_inference_prompts,
@@ -253,6 +255,51 @@ def generate_translations(test_df, config, adapter_path=None, prefix="", force=F
     return [all_cached.get(i, "") for i in range(total_rows)]
 
 
+# The auditable, model-free metrics shared with translation_benchmark. Listing
+# them here (instead of deriving from METRIC_DIRECTIONS) keeps the config's
+# evaluation.transparent_metrics.metrics list validatable without pulling in
+# the model-based entries, which this script computes through their own stages.
+TRANSPARENT_METRICS = (
+    "sentence_bleu",
+    "sentence_chrf",
+    "number_preservation",
+    "acronym_preservation",
+    "formula_preservation",
+    "empty_output",
+    "source_copy",
+)
+
+
+def evaluate_transparent_metrics(sources, hypotheses, references, config, prefix=""):
+    """Score sacrebleu and preservation metrics with translation_benchmark's implementation.
+
+    These are CPU-only and cheap relative to generation, so they are neither
+    cached nor sharded across ranks: the caller runs them on the main process.
+    Sharing the benchmark's implementation keeps a number reported here
+    comparable with the same number in a cross-model benchmark run.
+    """
+    settings = config["evaluation"].get("transparent_metrics") or {}
+    requested = list(settings.get("metrics") or TRANSPARENT_METRICS)
+    if unknown := sorted(set(requested) - set(TRANSPARENT_METRICS)):
+        raise ValueError(
+            f"Unknown evaluation.transparent_metrics.metrics entries: {unknown}. "
+            f"Available: {sorted(TRANSPARENT_METRICS)}"
+        )
+    logger.info("Scoring transparent metrics for [bold green]%s[/bold green]: %s", prefix, requested)
+    frame = pd.DataFrame({"source": sources, "translation": hypotheses, "reference": references})
+    scored = score_transparent_metrics(frame, settings)
+    columns = {name: scored[name] for name in requested}
+    for name, values in columns.items():
+        # Preservation metrics are NaN for rows whose source contains no
+        # number/acronym/formula, so the mean is over the scored subset only.
+        # scored_rows makes that denominator visible instead of implied.
+        logger.info(
+            "  %s (%s is better): [bold yellow]%.4f[/bold yellow] over %d scored rows",
+            name, METRIC_DIRECTIONS[name], float(values.mean()), int(values.notna().sum()),
+        )
+    return columns
+
+
 def _gather_cached_metricx(output_dir, prefix):
     combined = {}
     cache_files = list(output_dir.glob(f".cache_{prefix}_metricx*.jsonl"))
@@ -352,7 +399,13 @@ def evaluate_comet(sources, hypotheses, references, config, prefix=""):
     from comet import download_model, load_from_checkpoint
     eval_cfg = config["evaluation"]
     model = load_from_checkpoint(download_model(eval_cfg["comet_model_id"]))
-    data = [{"src": source, "mt": hypothesis, "ref": reference} for source, hypothesis, reference in zip(sources, hypotheses, references)]
+    # Quality-estimation checkpoints (CometKiwi, XCOMET-*-QE) reject a "ref"
+    # key; XCOMET and wmt22-comet-da require it. The checkpoint decides, so it
+    # is configured rather than sniffed from the model id.
+    if eval_cfg.get("comet_reference_free", False):
+        data = [{"src": source, "mt": hypothesis} for source, hypothesis in zip(sources, hypotheses)]
+    else:
+        data = [{"src": source, "mt": hypothesis, "ref": reference} for source, hypothesis, reference in zip(sources, hypotheses, references)]
     output = model.predict(data, batch_size=eval_cfg["comet_batch_size"], gpus=eval_cfg["comet_gpus"] if torch.cuda.is_available() else 0)
     del model
     if torch.cuda.is_available():
@@ -367,7 +420,12 @@ def _write_human_review_sample(results, config, output_dir, prefix):
     sample = (results.groupby(domain_column, group_keys=False)
               .apply(lambda group: group.sample(n=min(len(group), eval_cfg["human_review_samples_per_domain"]), random_state=eval_cfg["human_review_seed"]))
               .reset_index(drop=True))
-    columns = [column for column in [data_cfg["id_column"], domain_column, data_cfg["source_column"], data_cfg["target_column"], "generated_farsi", "metricx_score", "comet_score"] if column in sample]
+    candidates = [
+        data_cfg["id_column"], domain_column, data_cfg["source_column"],
+        data_cfg["target_column"], "generated_farsi", "metricx_score", "comet_score",
+        *TRANSPARENT_METRICS,
+    ]
+    columns = [column for column in candidates if column in sample]
     sample[columns].to_csv(output_dir / f"{prefix}_{eval_cfg['human_review_filename']}", index=False)
 
 
@@ -409,6 +467,22 @@ def _run_one(config, adapter_path, prefix, force=False):
             )
             for failure, values in audit["failures"].items():
                 logger.warning("  %s: %d rows (%.2f%%)", failure, values["rows"], 100 * values["rate"])
+    if eval_cfg.get("transparent_metrics_enabled", True) and is_main:
+        # Runs on the main process only: CPU-bound and cheap next to generation,
+        # and only the main process writes the detailed CSV these land in.
+        columns = evaluate_transparent_metrics(
+            sources, results["generated_farsi"].tolist(), references, config, prefix=prefix
+        )
+        summary["transparent"] = {}
+        for name, values in columns.items():
+            # Positional assignment: the scored frame is freshly built, while
+            # results carries the test split's own index.
+            results[name] = values.to_numpy()
+            summary["transparent"][name] = {
+                "mean": float(values.mean()),
+                "direction": METRIC_DIRECTIONS[name],
+                "scored_rows": int(values.notna().sum()),
+            }
     if eval_cfg["metricx_enabled"]:
         results["metricx_score"] = evaluate_metricx(sources, results["generated_farsi"].tolist(), references, config, prefix=prefix, force=force)
         summary["metricx_mean_lower_is_better"] = float(results["metricx_score"].mean())
@@ -443,35 +517,218 @@ def run_evaluation(config, adapter_path=None, force=False):
     if is_main:
         output_path = Path(eval_cfg["output_dir"]) / eval_cfg["summary_filename"]
         output_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        # Print clean Rich comparison table
-        table = Table(title="Evaluation Results Summary", header_style="bold yellow", border_style="green")
-        table.add_column("Label", style="cyan")
-        table.add_column("Examples", style="white")
-        table.add_column("Adapter Path", style="dim")
-        if any("degeneration" in summary for summary in summaries):
-            table.add_column("Clean ↑", style="blue")
-        if eval_cfg["metricx_enabled"]:
-            table.add_column("MetricX ↓", style="magenta")
-        if eval_cfg["comet_enabled"]:
-            table.add_column("COMET ↑", style="green")
-
-        for s in summaries:
-            row = [s["label"], str(s["examples"]), str(s["adapter_path"] or "Base Model")]
-            if any("degeneration" in summary for summary in summaries):
-                audit = s.get("degeneration")
-                row.append(f"{100 * audit['clean_rate']:.1f}%" if audit else "—")
-            if eval_cfg["metricx_enabled"]:
-                row.append(f"{s.get('metricx_mean_lower_is_better', 0.0):.4f}")
-            if eval_cfg["comet_enabled"]:
-                row.append(f"{s.get('comet_system_score_higher_is_better', 0.0):.4f}")
-            table.add_row(*row)
-
-        console.print(table)
+        _render_summary(summaries, eval_cfg, output_path)
         logger.info("Evaluation results saved to [bold]%s[/bold]", output_path)
 
     _enforce_degeneration_gate(summaries, eval_cfg)
     return summaries
+
+
+# Display labels and units for every metric this script can report. Metric keys
+# are the summary keys, not the DataFrame column names, so a metric is added to
+# the report by adding it here and to _collect_metrics.
+METRIC_LABELS = {
+    "clean_rate": "Clean decoding",
+    "metricx": "MetricX",
+    "comet": "COMET",
+    "sentence_bleu": "BLEU",
+    "sentence_chrf": "chrF++",
+    "number_preservation": "Numbers kept",
+    "acronym_preservation": "Acronyms kept",
+    "formula_preservation": "Formulas kept",
+    "empty_output": "Empty output",
+    "source_copy": "Source copied",
+}
+# Rates, rendered as percentages; their deltas are therefore percentage points.
+PERCENT_METRICS = frozenset({
+    "clean_rate", "number_preservation", "acronym_preservation",
+    "formula_preservation", "empty_output", "source_copy",
+})
+# Shown in the narrow per-system table. Everything else lives in the delta
+# table, which grows downward and so never widens past a 80-column console.
+HEADLINE_METRICS = ("clean_rate", "metricx", "comet")
+
+
+def _collect_metrics(summary):
+    """Flatten one system's summary into {name: (value, direction, scored_rows)}.
+
+    scored_rows is the denominator behind the mean and is None where it equals
+    the example count. Preservation metrics skip rows whose source contains no
+    number/acronym/formula, so their mean is over a subset.
+    """
+    metrics = {}
+    if audit := summary.get("degeneration"):
+        metrics["clean_rate"] = (audit["clean_rate"], "higher", None)
+    if "metricx_mean_lower_is_better" in summary:
+        metrics["metricx"] = (summary["metricx_mean_lower_is_better"], METRIC_DIRECTIONS["metricx"], None)
+    if "comet_system_score_higher_is_better" in summary:
+        metrics["comet"] = (summary["comet_system_score_higher_is_better"], METRIC_DIRECTIONS["comet"], None)
+    for name, entry in (summary.get("transparent") or {}).items():
+        metrics[name] = (entry["mean"], entry["direction"], entry["scored_rows"])
+    return metrics
+
+
+def _is_missing(value):
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _format_metric(name, value):
+    if _is_missing(value):
+        return "—"
+    if name in PERCENT_METRICS:
+        return f"{100 * value:.1f}%"
+    if name in {"sentence_bleu", "sentence_chrf"}:
+        return f"{value:.2f}"
+    return f"{value:.4f}"
+
+
+def _format_delta(name, delta):
+    if _is_missing(delta):
+        return "—"
+    if name in PERCENT_METRICS:
+        return f"{100 * delta:+.1f} pp"
+    if name in {"sentence_bleu", "sentence_chrf"}:
+        return f"{delta:+.2f}"
+    return f"{delta:+.4f}"
+
+
+def _short_system(summary):
+    """Name a system by its adapter directory rather than its absolute path.
+
+    The full path is already in summary.json; repeating it here is what pushed
+    the old single table past the console width.
+    """
+    if not summary["adapter_path"]:
+        return "base model"
+    path = Path(summary["adapter_path"])
+    return "/".join(path.parts[-2:]) if len(path.parts) > 1 else path.name
+
+
+def _render_systems_table(summaries):
+    table = Table(title="Systems", title_style="bold yellow", header_style="bold yellow", border_style="green")
+    table.add_column("Label", style="cyan")
+    table.add_column("System", style="dim")
+    table.add_column("Examples", style="white", justify="right")
+    collected = [_collect_metrics(summary) for summary in summaries]
+    shown = [name for name in HEADLINE_METRICS if any(name in metrics for metrics in collected)]
+    for name in shown:
+        arrow = "↑" if METRIC_DIRECTIONS.get(name, "higher") == "higher" else "↓"
+        table.add_column(f"{METRIC_LABELS[name]} {arrow}", style="white", justify="right")
+    for summary, metrics in zip(summaries, collected):
+        row = [summary["label"], _short_system(summary), str(summary["examples"])]
+        row.extend(_format_metric(name, metrics.get(name, (None,))[0]) for name in shown)
+        table.add_row(*row)
+    return table
+
+
+def _render_delta_table(baseline, candidate):
+    """Compare two systems with one row per metric.
+
+    Metrics are rows, not columns, so the table stays readable at any console
+    width no matter how many metrics are enabled -- the failure of the previous
+    single-table layout, which grew a column per metric.
+    """
+    base_metrics, candidate_metrics = _collect_metrics(baseline), _collect_metrics(candidate)
+    names = list(dict.fromkeys([*base_metrics, *candidate_metrics]))
+    if not names:
+        return None
+    table = Table(
+        title=f"{candidate['label']} vs {baseline['label']}",
+        title_style="bold yellow", header_style="bold yellow", border_style="green",
+    )
+    table.add_column("Metric", style="cyan")
+    table.add_column("Better", style="dim")
+    table.add_column(baseline["label"], justify="right")
+    table.add_column(candidate["label"], justify="right")
+    table.add_column("Δ", justify="right")
+    table.add_column("Scored rows", style="dim", justify="right")
+    for name in names:
+        base_value, direction, _ = base_metrics.get(name, (None, METRIC_DIRECTIONS.get(name, "higher"), None))
+        candidate_value, _, scored_rows = candidate_metrics.get(name, (None, direction, None))
+        if _is_missing(base_value) or _is_missing(candidate_value):
+            delta_cell = "[dim]—[/dim]"
+        else:
+            delta = candidate_value - base_value
+            # A metric is improved when it moved in its own favourable
+            # direction, which is not the same as the sign of the delta:
+            # MetricX and the empty_output/source_copy rates are lower-better.
+            improved = delta > 0 if direction == "higher" else delta < 0
+            style = "dim" if delta == 0 else ("green" if improved else "red")
+            delta_cell = f"[{style}]{_format_delta(name, delta)}[/{style}]"
+        table.add_row(
+            METRIC_LABELS.get(name, name),
+            "higher" if direction == "higher" else "lower",
+            _format_metric(name, base_value),
+            _format_metric(name, candidate_value),
+            delta_cell,
+            "—" if scored_rows is None else str(scored_rows),
+        )
+    return table
+
+
+def _render_failures_table(summaries):
+    """Break down decoding failures by class, which was previously log-only."""
+    rows = [
+        (summary["label"], failure, values["rows"], values["rate"])
+        for summary in summaries
+        for failure, values in (summary.get("degeneration", {}).get("failures") or {}).items()
+        if values["rows"]
+    ]
+    if not rows:
+        return None
+    table = Table(title="Decoding failures", title_style="bold yellow", header_style="bold yellow", border_style="red")
+    table.add_column("Label", style="cyan")
+    table.add_column("Failure", style="white")
+    table.add_column("Rows", justify="right")
+    table.add_column("Rate", justify="right")
+    for label, failure, count, rate in sorted(rows, key=lambda row: (row[0], -row[3])):
+        table.add_row(label, failure, str(count), f"[red]{100 * rate:.2f}%[/red]")
+    return table
+
+
+def _render_summary(summaries, eval_cfg, output_path):
+    console.print(_render_systems_table(summaries))
+    # Deltas compare the first system evaluated (the baseline, when
+    # run_baseline is set) against the last one (the adapter under test).
+    if len(summaries) >= 2:
+        if delta_table := _render_delta_table(summaries[0], summaries[-1]):
+            console.print(delta_table)
+    if failures_table := _render_failures_table(summaries):
+        console.print(failures_table)
+
+    threshold = eval_cfg.get("max_degeneration_rate")
+    breached = _degeneration_breaches(summaries, eval_cfg)
+    if threshold is None:
+        verdict = "[dim]Degeneration gate disabled (max_degeneration_rate is null).[/dim]"
+    elif breached:
+        detail = ", ".join(f"{label} {rate:.1%}" for label, rate in sorted(breached.items()))
+        verdict = f"[bold red]FAILED[/bold red] decoding gate at {threshold:.1%}: {detail}"
+    else:
+        verdict = f"[bold green]PASSED[/bold green] decoding gate at {threshold:.1%}"
+    output_dir = Path(eval_cfg["output_dir"])
+    console.print(Panel(
+        f"{verdict}\n\n"
+        f"[bold]Summary[/bold]      {output_path}\n"
+        f"[bold]Per-example[/bold]  {output_dir}/<label>_{eval_cfg['detailed_filename']}\n"
+        f"[bold]Human review[/bold] {output_dir}/<label>_{eval_cfg['human_review_filename']}",
+        title="Evaluation complete", border_style="red" if breached else "green",
+    ))
+
+
+def _degeneration_breaches(summaries, eval_cfg):
+    """Systems whose decoding failure rate exceeds the configured threshold.
+
+    Shared by the printed verdict and the gate so the report and the exit status
+    can never disagree. Returns empty when the gate is disabled.
+    """
+    threshold = eval_cfg.get("max_degeneration_rate")
+    if threshold is None:
+        return {}
+    return {
+        summary["label"]: summary["degeneration"]["failure_rate"]
+        for summary in summaries
+        if "degeneration" in summary and summary["degeneration"]["failure_rate"] > threshold
+    }
 
 
 def _enforce_degeneration_gate(summaries, eval_cfg):
@@ -483,14 +740,7 @@ def _enforce_degeneration_gate(summaries, eval_cfg):
     evaluation.max_degeneration_rate to null to report without failing.
     """
     threshold = eval_cfg.get("max_degeneration_rate")
-    if threshold is None:
-        return
-    breached = {
-        summary["label"]: summary["degeneration"]["failure_rate"]
-        for summary in summaries
-        if "degeneration" in summary and summary["degeneration"]["failure_rate"] > threshold
-    }
-    if breached:
+    if breached := _degeneration_breaches(summaries, eval_cfg):
         detail = ", ".join(f"{label}={rate:.1%}" for label, rate in sorted(breached.items()))
         raise RuntimeError(
             f"Decoding failure rate above evaluation.max_degeneration_rate={threshold:.1%}: {detail}. "
