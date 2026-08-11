@@ -1,0 +1,9 @@
+# The build context is api/ itself. Keep it to source and requirements: a fat
+# context is copied on every build and invalidates the source layer.
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Never ship a developer's local settings; compose supplies the real values.
+.env

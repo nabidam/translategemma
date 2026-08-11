@@ -29,6 +29,12 @@ GENERATION_ENTRY_POINTS = (
     Path("evaluate_translations.py"),
     Path("inference.py"),
     Path("translation_benchmark/generation.py"),
+    # The serving API. It imports its own byte-identical copy of prompting.py
+    # (see tests/test_api_vendored_modules.py) because api/ is deployed without
+    # the repository, but it is held to the same contract: a server that renders
+    # its own prompts would answer differently from the evaluated system without
+    # any visible failure.
+    Path("api/translator.py"),
 )
 
 
