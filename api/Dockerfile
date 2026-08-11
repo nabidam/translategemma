@@ -1,9 +1,10 @@
 # TranslateGemma serving image.
 #
-# The build context is api/ alone -- this directory is self-contained and is
-# deployed without the rest of the repository:
+# This directory is self-contained and is deployed without the rest of the
+# repository: copy api/ to the target machine and build from inside it, with
+# this directory as the context.
 #
-#     docker build -t translategemma-api api/
+#     cd api && docker build -t translategemma-api .
 #
 # Design notes (why it looks like this):
 #   * Base is python:3.12-slim-bookworm with torch installed from the cu128
@@ -17,12 +18,14 @@
 #     mount, so even a *changed* requirements.txt reuses every wheel it already
 #     has -- the ~3 GB torch download happens once per machine, not once per
 #     rebuild. Both require BuildKit (default in Docker 23+).
-#   * api/prompting.py and api/model_loading.py are copies of the project-root
-#     modules of the same name, kept byte-identical by
-#     scripts/sync_api_vendored.py and enforced by
-#     tests/test_api_vendored_modules.py. They carry the prompt rendering and
-#     stop-token contract from docs/2026-08-10_adapter_degeneration_analysis.md,
-#     where a mismatch is silent: the model still returns fluent text.
+#   * prompting.py and model_loading.py here are copies of the modules of the
+#     same name at the root of the source repository (which is NOT shipped with
+#     this directory). They carry the prompt rendering and stop-token contract
+#     from that repository's docs/2026-08-10_adapter_degeneration_analysis.md,
+#     where a mismatch is silent: the model still returns fluent text. The
+#     copies are kept byte-identical there by scripts/sync_api_vendored.py and
+#     enforced by tests/test_api_vendored_modules.py; nothing needs to run on
+#     the deployment host.
 FROM python:3.12-slim-bookworm
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/

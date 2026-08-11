@@ -6,14 +6,28 @@ service, so callers move over with a URL change.
 
 ## Standalone
 
-`api/` runs on its own. It imports nothing from the parent repository, its
-dependencies are its own `requirements.txt`, and its Docker build context is
-this directory. Copy `api/` anywhere and it works.
+**This directory is the deployment unit.** Copy it to the target machine, `cd`
+into it, and build — every command below runs from inside `api/`, and nothing
+here reads a path outside it. It imports nothing from the parent repository and
+pins its own dependencies in `requirements.txt`.
+
+```
+api/                    # ← copy this, and only this, to the server
+├── Dockerfile          # build context is this directory
+├── requirements.txt
+├── main.py             # FastAPI app
+├── config.py           # TG_* settings
+├── schemas.py
+├── translator.py       # model loading + generation
+├── prompting.py        # copy, see below
+├── model_loading.py    # copy, see below
+└── .env.example
+```
 
 That independence has one cost, handled explicitly: `prompting.py` and
-`model_loading.py` here are **copies** of the project-root modules of the same
-name. They encode two facts this repository paid for in a failed adapter (see
-`docs/2026-08-10_adapter_degeneration_analysis.md`):
+`model_loading.py` are **copies** of the modules of the same name at the root of
+the source repository. They encode two facts that repository paid for in a
+failed adapter (`docs/2026-08-10_adapter_degeneration_analysis.md`):
 
 1. The prompt an SFT adapter was trained to continue is **not**
    `apply_chat_template(..., add_generation_prompt=True)`.
@@ -21,10 +35,12 @@ name. They encode two facts this repository paid for in a failed adapter (see
    does not provide.
 
 Get either wrong and the model still returns fluent Farsi — it just never stops.
-No smoke test catches that. So the copies are machine-checked:
+No smoke test catches that. So the copies are machine-checked **in the source
+repository**, before this directory is ever copied anywhere:
 
 ```bash
-uv run python scripts/sync_api_vendored.py          # re-copy after editing the root module
+# From the repository root, not from api/. Not needed on the deployment host.
+uv run python scripts/sync_api_vendored.py          # re-copy after editing a root module
 uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift
 uv run pytest tests/test_api_vendored_modules.py    # same check, in CI
 ```
@@ -117,20 +133,28 @@ A bad adapter path fails at startup rather than on the first request.
 
 ## Docker
 
-Build context is `api/`, not the repository root:
+Run from inside this directory; the build context is this directory:
 
 ```bash
-docker build -t translategemma-api api/
+cd api
+docker build -t translategemma-api .
 ```
 
-Rebuilds are cheap. Dependencies install in a layer that mentions only
+The source is baked into the image, so **a code change needs a rebuild** — but
+only the last layer. Dependencies install in a layer that mentions only
 `requirements.txt`, so editing the source never re-resolves them, and the uv
-cache lives in a BuildKit cache mount — even a changed `requirements.txt` reuses
-every wheel already downloaded, so the ~3 GB torch download happens once per
-machine. BuildKit is required (default in Docker 23+; export
-`DOCKER_BUILDKIT=1` on older hosts).
+cache lives in a BuildKit cache mount, so even a changed `requirements.txt`
+reuses every wheel already downloaded. The ~3 GB torch download happens once per
+machine; a code-only rebuild takes seconds. BuildKit is required (default in
+Docker 23+; export `DOCKER_BUILDKIT=1` on older hosts).
 
-Service block for the compose file this is deployed under:
+Note that a rebuild is not the expensive part of shipping a change: the model
+loads once at startup, so any change costs a container restart and a few minutes
+of reloading weights regardless.
+
+Service block for the compose file this is deployed under. `context` is written
+for a compose file sitting **next to** this directory (`../docker-compose.yml`);
+use `context: .` if the compose file lives inside it.
 
 ```yaml
 services:
@@ -174,12 +198,16 @@ services:
               capabilities: [gpu]
 ```
 
-## Local run
+## Local run (no Docker)
+
+From inside this directory:
 
 ```bash
-cp api/.env.example api/.env   # then edit the model paths
-cd api && uv run --with-requirements requirements.txt fastapi dev main.py
+cp .env.example .env   # then edit the model paths
+uv run --with-requirements requirements.txt fastapi dev main.py
 ```
+
+`.env` is read relative to the working directory, so run the server from here.
 
 ## Concurrency
 

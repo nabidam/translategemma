@@ -360,7 +360,32 @@ start fresh. Resume stages in separate invocations to avoid either ambiguity.
 - Keep DPO disabled until preference pairs have genuine curated rejected translations.
   It is a second-stage experiment, not a substitute for a clean SFT baseline.
 
-## vLLM serving
+## Serving
+
+[`api/`](api/README.md) is a FastAPI service for a trained adapter, with the same
+endpoint shapes as the existing NLLB service plus a batch endpoint. It is a
+self-contained deployment unit: copy the directory to the serving host and build
+from inside it, with no part of this repository present.
+
+```bash
+cd api && docker build -t translategemma-api .
+```
+
+Its generation path mirrors `evaluate_translations.py` exactly, so a served
+translation is the translation the harness scored. That requires copies of
+`prompting.py` and `model_loading.py` inside `api/`, which are kept
+byte-identical from here:
+
+```bash
+uv run python scripts/sync_api_vendored.py          # after editing either root module
+uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift; also a test
+```
+
+`TG_MODEL_MODE` selects what the service loads: the base model, the adapter, or
+both at once (one copy of the weights, adapter toggled per request), so a caller
+can query either system live.
+
+### vLLM serving
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
