@@ -235,9 +235,10 @@ evaluation:
   comet_reference_free: false
   # XCOMET is far larger than wmt22-comet-da; lower this first on an OOM.
   comet_batch_size: 8
-  # GPUs per rank, not in total. COMET is sharded across ranks the same way
-  # MetricX and generation are, each rank scoring its own slice on its own
-  # device, so this stays 1 under any accelerate profile.
+  # Ignored: COMET is sharded across ranks the same way MetricX and generation
+  # are, each rank scoring its own slice on its own device, so the scorer always
+  # asks Lightning for exactly one GPU. Kept only so an existing config still
+  # loads; raising it to the machine's GPU count used to abort scoring.
   comet_gpus: 1
   human_review_samples_per_domain: 15
   # Classify decoding failures (unstopped output, loops, leaked boilerplate)

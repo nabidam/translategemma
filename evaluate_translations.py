@@ -479,6 +479,12 @@ def _download_comet_checkpoint(model_id):
 
     Concurrent download_model calls from every rank race on the same cache
     directory. Called by all ranks so the barrier stays symmetric.
+
+    The checkpoint is not the only asset COMET needs: load_from_checkpoint also
+    builds a tokenizer from the separate encoder repository its hparams.yaml
+    names (facebook/xlm-roberta-xl for XCOMET-XL). Staging that one is
+    documented in docs/OFFLINE_DEPLOYMENT.md §3.4 and §6.4, because its absence
+    surfaces as an unrelated-looking AttributeError inside transformers.
     """
     from comet import download_model
 
@@ -514,8 +520,14 @@ def evaluate_comet(sources, hypotheses, references, config, prefix="", force=Fal
             # devices pins this rank's Trainer to the GPU accelerate already gave
             # it. Without it every rank's Trainer would default to cuda:0 and
             # stack every copy of the model onto one device.
+            #
+            # gpus is 1 by construction, not by configuration: rows are already
+            # sharded across ranks, so each Trainer owns exactly the one device
+            # named in devices. COMET asserts len(devices) == gpus, so any other
+            # value (an evaluation.comet_gpus set to the machine's GPU count,
+            # say) aborts scoring after generation has finished.
             predict_kwargs = (
-                {"gpus": eval_cfg["comet_gpus"], "devices": [state.local_process_index]}
+                {"gpus": 1, "devices": [state.local_process_index]}
                 if torch.cuda.is_available()
                 else {"gpus": 0}
             )

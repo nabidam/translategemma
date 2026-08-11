@@ -209,8 +209,8 @@ disabled candidate must still travel.
 | Enabled NLLB checkpoints | `benchmark_translations.py` | full | size-dependent |
 | `google/metricx-24-hybrid-large-v2p6` | quick evaluation or benchmark MetricX | full | ~4.9 GB |
 | `google/mt5-xl` | MetricX tokenizer (`metricx_tokenizer_id`) | tokenizer only | ~20 MB |
-| `Unbabel/wmt22-comet-da` | quick evaluation or benchmark COMET | full | ~2.3 GB |
-| `xlm-roberta-large` | COMET's encoder — **indirect**, see below | tokenizer only | ~20 MB |
+| Configured COMET checkpoint (`Unbabel/XCOMET-XL` in `config.yaml`; `Unbabel/wmt22-comet-da` for the benchmark default) | quick evaluation or benchmark COMET | full | ~2.3 GB (`wmt22-comet-da`), ~14 GB (`XCOMET-XL`) |
+| That checkpoint's encoder — `facebook/xlm-roberta-xl` for `XCOMET-XL`, `xlm-roberta-large` for `wmt22-comet-da` | COMET's encoder — **indirect**, see below | tokenizer only | ~20 MB |
 | `sentence-transformers/LaBSE` | `build_test_set.py` embeddings | full | ~1.8 GB |
 
 Weights are skipped for the two tokenizer-only repositories: `google/mt5-xl`
@@ -219,7 +219,10 @@ alone would otherwise pull a 15 GB checkpoint that is never loaded.
 **The COMET encoder is the easiest thing to miss.** `load_from_checkpoint()`
 constructs an XLM-R encoder and calls `XLMRobertaTokenizerFast.from_pretrained()`
 plus `XLMRobertaConfig.from_pretrained()` on whatever `hparams.yaml` names in
-`pretrained_model` (`xlm-roberta-large` for `wmt22-comet-da`). The encoder
+`pretrained_model` (`facebook/xlm-roberta-xl` for `XCOMET-XL`,
+`xlm-roberta-large` for `wmt22-comet-da`). **Changing `comet_model_id` changes
+this repository too**, so a models tarball staged for one checkpoint is
+incomplete for another even though the checkpoint itself downloads fine. The encoder
 *weights* are not fetched — COMET passes `load_pretrained_weights=False` — but
 the tokenizer and config are, and an offline run dies without them. The script
 reads that id from the downloaded checkpoint's `hparams.yaml`, so it stays
@@ -612,6 +615,21 @@ and all four fail *silently* — wrong scores, not exceptions — if changed:
 `metricx_max_length` was raised from `1024` (the MetricX-23 value) to `1536`,
 which is what MetricX-24 was trained at.
 
+A fifth aspect fails loudly rather than silently, and only against
+`transformers>=4.53`: the model must be called with **`use_cache=False`**.
+MetricX builds its decoder with `is_encoder_decoder=False`, so `MT5Stack`
+allocates a plain `DynamicCache` instead of an `EncoderDecoderCache`;
+`T5Attention` then appends the cross-attention keys to the same cache that
+already holds the single decoder self-attention key, making the key length one
+longer than the encoder mask:
+
+```
+RuntimeError: The size of tensor a (354) must match the size of tensor b (353)
+at non-singleton dimension 3
+```
+
+The decoder runs one dummy step, so nothing is lost by disabling the cache.
+
 MetricX is vendored into the image as a source checkout at `/opt/metricx` on
 `PYTHONPATH`, not pip-installed: the repository has no `pyproject.toml` or
 `setup.py`, so `pip install git+…` fails. Its `requirements.txt` is also not
@@ -665,6 +683,23 @@ immediately instead of hanging on a connection timeout. If a run dies with
 "Cannot find the requested files in the disk cache", a repository was missed in
 §3.4 — enable the relevant benchmark candidate, or add it with `--repo <id>`,
 and re-stage.
+
+**One path does not raise: tokenizer files.** `transformers` resolves them with
+missing-entry exceptions suppressed, so an unstaged tokenizer repository yields
+`None` rather than an error, and the fast-tokenizer constructor then falls
+through to its tiktoken conversion branch and dies far from the cause:
+
+```
+File "transformers/convert_slow_tokenizer.py", line 1857, in convert_slow_tokenizer
+    elif transformer_tokenizer.vocab_file.endswith("tekken.json"):
+AttributeError: 'NoneType' object has no attribute 'endswith'
+```
+
+Read that as *this tokenizer repository is not in `/models`*, not as a
+transformers bug. The usual culprit is COMET's indirect encoder repository
+after `comet_model_id` was changed (§3.4); the traceback names the encoder
+class (`comet/encoders/xlmr_xl.py` → `facebook/xlm-roberta-xl`), which is the
+only clue to which repository is missing.
 
 ### 6.5 The model mount is writable on purpose
 
