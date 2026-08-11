@@ -3,7 +3,9 @@
 import argparse
 import json
 import math
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -250,9 +252,18 @@ def generate_translations(test_df, config, adapter_path=None, prefix="", force=F
     state.wait_for_everyone()
 
     all_cached = _gather_cached_hypotheses(output_dir, prefix, total_rows)
+    # An absent row means a rank failed, not that the model produced nothing.
+    # Filling it with "" would send it into the degeneration audit as a genuine
+    # empty translation and quietly move the failure rate.
+    if missing := [i for i in range(total_rows) if i not in all_cached]:
+        raise RuntimeError(
+            f"Generation produced {len(missing)} of {total_rows} rows short for '{prefix}' "
+            f"(first missing indices: {missing[:10]}). A rank likely failed; inspect "
+            f"{output_dir}/.cache_{prefix}_*.jsonl and re-run, or pass --force to regenerate."
+        )
     if is_main:
         logger.info("Completed translation generation for [bold green]%s[/bold green].", prefix)
-    return [all_cached.get(i, "") for i in range(total_rows)]
+    return [all_cached[i] for i in range(total_rows)]
 
 
 # The auditable, model-free metrics shared with translation_benchmark. Listing
@@ -300,20 +311,94 @@ def evaluate_transparent_metrics(sources, hypotheses, references, config, prefix
     return columns
 
 
-def _gather_cached_metricx(output_dir, prefix):
+def _gather_cached_scores(output_dir, prefix, stage):
+    """Read every rank's cache for one scoring stage into {index: score}."""
     combined = {}
-    cache_files = list(output_dir.glob(f".cache_{prefix}_metricx*.jsonl"))
-    for cache_path in cache_files:
-        if cache_path.exists():
-            with open(cache_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        try:
-                            entry = json.loads(line)
-                            combined[entry["index"]] = entry["score"]
-                        except Exception:
-                            continue
+    for cache_path in output_dir.glob(f".cache_{prefix}_{stage}*.jsonl"):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        combined[entry["index"]] = entry["score"]
+                    except Exception:
+                        continue
     return combined
+
+
+def _score_sharded(stage, total, config, prefix, force, score_fn, style):
+    """Run a cache-backed, rank-sharded scoring stage.
+
+    Every rank scores its own round-robin slice into its own cache file, so a
+    stage costs wall time proportional to total/num_processes instead of pinning
+    one rank while the others idle at a barrier. This matters most for COMET:
+    an XCOMET-sized model scoring a full test set from rank zero alone can
+    outlast the process group's timeout and have the watchdog abort a run whose
+    generation had already finished.
+
+    score_fn(indices) must be a generator yielding (index, score). It is not
+    called at all when this rank has nothing left to score, so the scoring model
+    is never loaded for an empty slice; it must therefore contain no collective
+    operations.
+    """
+    eval_cfg = config["evaluation"]
+    output_dir = Path(eval_cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    state = PartialState()
+    is_main = state.is_main_process
+    rank_cache_path = output_dir / (
+        f".cache_{prefix}_{stage}_rank{state.process_index}.jsonl"
+        if state.num_processes > 1
+        else f".cache_{prefix}_{stage}.jsonl"
+    )
+
+    if force and is_main:
+        for path in output_dir.glob(f".cache_{prefix}_{stage}*"):
+            path.unlink()
+    state.wait_for_everyone()
+
+    cached = _gather_cached_scores(output_dir, prefix, stage)
+    if len(cached) == total:
+        if is_main:
+            logger.info(
+                "Found all %d cached %s scores for [bold green]%s[/bold green]. Skipping model loading.",
+                total, stage, prefix,
+            )
+        return [cached[i] for i in range(total)]
+
+    pending = [i for i in range(state.process_index, total, state.num_processes) if i not in cached]
+    if is_main:
+        logger.info(
+            "Scoring %s for [bold green]%s[/bold green] on %d process(es) (total: %d, remaining: %d)...",
+            stage, prefix, state.num_processes, total, total - len(cached),
+        )
+
+    progress = make_progress(style, is_main)
+    with open(rank_cache_path, "a", encoding="utf-8") as f_cache, progress:
+        task = progress.add_task(f"{stage} scoring ({prefix})", total=total, completed=len(cached))
+        if pending:
+            for index, score in score_fn(pending):
+                f_cache.write(json.dumps({"index": index, "score": float(score)}, ensure_ascii=False) + "\n")
+                f_cache.flush()
+                if is_main:
+                    progress.update(task, advance=state.num_processes)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    state.wait_for_everyone()
+
+    gathered = _gather_cached_scores(output_dir, prefix, stage)
+    # Never default a missing row to a neutral value. A rank that died leaves
+    # gaps, and for a lower-is-better metric like MetricX a 0.0 fill reads as a
+    # flawless translation, so the corpus mean would improve as a run degraded.
+    if missing := [i for i in range(total) if i not in gathered]:
+        raise RuntimeError(
+            f"{stage} scoring produced {len(missing)} of {total} rows short for '{prefix}' "
+            f"(first missing indices: {missing[:10]}). A rank likely failed; inspect "
+            f"{output_dir}/.cache_{prefix}_{stage}*.jsonl and re-run, or pass --force to rescore."
+        )
+    return [gathered[i] for i in range(total)]
 
 
 def evaluate_metricx(sources, hypotheses, references, config, prefix="", force=False):
@@ -324,94 +409,129 @@ def evaluate_metricx(sources, hypotheses, references, config, prefix="", force=F
         raise ImportError("Install MetricX or set evaluation.metricx_enabled: false.") from error
 
     eval_cfg = config["evaluation"]
-    output_dir = Path(eval_cfg["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     state = PartialState()
-    num_processes = state.num_processes
-    process_index = state.process_index
-    is_main = state.is_main_process
 
-    rank_cache_path = output_dir / (f".cache_{prefix}_metricx_rank{process_index}.jsonl" if num_processes > 1 else f".cache_{prefix}_metricx.jsonl")
+    def score_fn(indices):
+        if state.is_main_process:
+            logger.info("Loading MetricX-24 model ([cyan]%s[/cyan])...", eval_cfg["metricx_model_id"])
+        tokenizer = AutoTokenizer.from_pretrained(eval_cfg["metricx_tokenizer_id"])
+        model = MT5ForRegression.from_pretrained(
+            eval_cfg["metricx_model_id"], torch_dtype="auto"
+        ).to(state.device).eval()
+        try:
+            with torch.inference_mode():
+                for i in indices:
+                    text = f"source: {sources[i]} candidate: {hypotheses[i]} reference: {references[i]}"
+                    inputs = tokenizer(
+                        text, return_tensors="pt", truncation=True,
+                        max_length=eval_cfg["metricx_max_length"], padding=False,
+                    )
+                    # MetricX-24 is trained without the trailing EOS token.
+                    inputs = {key: value[:, :-1].to(state.device) for key, value in inputs.items()}
+                    yield i, model(**inputs).predictions.item()
+        finally:
+            del model, tokenizer
 
-    if force and is_main:
-        for p in output_dir.glob(f".cache_{prefix}_metricx*"):
-            p.unlink()
-
-    state.wait_for_everyone()
-
-    cached_scores = _gather_cached_metricx(output_dir, prefix)
-    total = len(sources)
-
-    if len(cached_scores) == total:
-        scores = [cached_scores[i] for i in range(total)]
-        mean_score = float(pd.Series(scores).mean())
-        if is_main:
-            logger.info(
-                "Found all %d cached MetricX scores for [bold green]%s[/bold green]. Mean score: [bold yellow]%.4f[/bold yellow]",
-                total,
-                prefix,
-                mean_score,
-            )
-        return scores
-
-    rank_indices = [i for i in range(process_index, total, num_processes)]
-    uncached_rank_indices = [i for i in rank_indices if i not in cached_scores]
-
-    device = state.device
-    if is_main:
-        logger.info("Loading MetricX-24 model ([cyan]%s[/cyan])...", eval_cfg["metricx_model_id"])
-
-    tokenizer = AutoTokenizer.from_pretrained(eval_cfg["metricx_tokenizer_id"])
-    model = MT5ForRegression.from_pretrained(eval_cfg["metricx_model_id"], torch_dtype="auto").to(device).eval()
-
-    progress = make_progress("magenta", is_main)
-    with open(rank_cache_path, "a", encoding="utf-8") as f_cache, progress:
-        task = progress.add_task(f"MetricX Scoring ({prefix})", total=total, completed=len(cached_scores))
-        with torch.inference_mode():
-            for i in uncached_rank_indices:
-                source, hypothesis, reference = sources[i], hypotheses[i], references[i]
-                text = f"source: {source} candidate: {hypothesis} reference: {reference}"
-                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=eval_cfg["metricx_max_length"], padding=False)
-                inputs = {key: value[:, :-1].to(device) for key, value in inputs.items()}
-                score = model(**inputs).predictions.item()
-                f_cache.write(json.dumps({"index": i, "score": score}, ensure_ascii=False) + "\n")
-                f_cache.flush()
-                if is_main:
-                    progress.update(task, advance=num_processes)
-
-    del model, tokenizer
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    state.wait_for_everyone()
-
-    all_cached_scores = _gather_cached_metricx(output_dir, prefix)
-    scores = [all_cached_scores.get(i, 0.0) for i in range(total)]
-    mean_score = float(pd.Series(scores).mean())
-    if is_main:
-        logger.info("MetricX evaluation finished for [bold green]%s[/bold green]. Mean score (lower is better): [bold yellow]%.4f[/bold yellow]", prefix, mean_score)
+    scores = _score_sharded("metricx", len(sources), config, prefix, force, score_fn, "magenta")
+    if state.is_main_process:
+        logger.info(
+            "MetricX finished for [bold green]%s[/bold green]. Mean (lower is better): [bold yellow]%.4f[/bold yellow]",
+            prefix, float(pd.Series(scores).mean()),
+        )
     return scores
 
 
-def evaluate_comet(sources, hypotheses, references, config, prefix=""):
-    logger.info("Starting COMET evaluation for [bold green]%s[/bold green]...", prefix)
-    from comet import download_model, load_from_checkpoint
+# Lightning, which COMET drives internally, reads these to auto-detect a
+# distributed launch. Under `accelerate launch` they describe *this* script's
+# process group, which each rank's single-device COMET Trainer must not join.
+DISTRIBUTED_ENV_VARS = (
+    "WORLD_SIZE", "RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+    "NODE_RANK", "MASTER_ADDR", "MASTER_PORT", "TORCHELASTIC_RUN_ID",
+)
+
+
+@contextmanager
+def _distributed_env_hidden():
+    """Hide the launcher's distributed environment for the duration of a block.
+
+    torch.distributed is already bootstrapped by the time this runs, so the
+    existing process group is unaffected; only libraries that re-read the
+    environment (Lightning) see a plain single-process launch.
+    """
+    saved = {name: os.environ.pop(name) for name in DISTRIBUTED_ENV_VARS if name in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+def _download_comet_checkpoint(model_id):
+    """Resolve the checkpoint, downloading once on the main process.
+
+    Concurrent download_model calls from every rank race on the same cache
+    directory. Called by all ranks so the barrier stays symmetric.
+    """
+    from comet import download_model
+
+    state = PartialState()
+    if state.is_main_process:
+        logger.info("Resolving COMET checkpoint ([cyan]%s[/cyan])...", model_id)
+        download_model(model_id)
+    state.wait_for_everyone()
+    return download_model(model_id)
+
+
+def evaluate_comet(sources, hypotheses, references, config, prefix="", force=False):
+    """Score with a COMET checkpoint (higher is better), sharded across ranks."""
     eval_cfg = config["evaluation"]
-    model = load_from_checkpoint(download_model(eval_cfg["comet_model_id"]))
-    # Quality-estimation checkpoints (CometKiwi, XCOMET-*-QE) reject a "ref"
-    # key; XCOMET and wmt22-comet-da require it. The checkpoint decides, so it
-    # is configured rather than sniffed from the model id.
-    if eval_cfg.get("comet_reference_free", False):
-        data = [{"src": source, "mt": hypothesis} for source, hypothesis in zip(sources, hypotheses)]
-    else:
-        data = [{"src": source, "mt": hypothesis, "ref": reference} for source, hypothesis, reference in zip(sources, hypotheses, references)]
-    output = model.predict(data, batch_size=eval_cfg["comet_batch_size"], gpus=eval_cfg["comet_gpus"] if torch.cuda.is_available() else 0)
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    logger.info("COMET evaluation finished for [bold green]%s[/bold green]. System score (higher is better): [bold yellow]%.4f[/bold yellow]", prefix, output.system_score)
-    return output.scores, output.system_score
+    state = PartialState()
+    checkpoint = _download_comet_checkpoint(eval_cfg["comet_model_id"])
+
+    def score_fn(indices):
+        from comet import load_from_checkpoint
+
+        model = load_from_checkpoint(checkpoint)
+        try:
+            # Quality-estimation checkpoints (CometKiwi, XCOMET-*-QE) reject a
+            # "ref" key; XCOMET and wmt22-comet-da require it. The checkpoint
+            # decides, so it is configured rather than sniffed from the model id.
+            reference_free = eval_cfg.get("comet_reference_free", False)
+            data = [
+                {"src": sources[i], "mt": hypotheses[i]}
+                if reference_free
+                else {"src": sources[i], "mt": hypotheses[i], "ref": references[i]}
+                for i in indices
+            ]
+            # devices pins this rank's Trainer to the GPU accelerate already gave
+            # it. Without it every rank's Trainer would default to cuda:0 and
+            # stack every copy of the model onto one device.
+            predict_kwargs = (
+                {"gpus": eval_cfg["comet_gpus"], "devices": [state.local_process_index]}
+                if torch.cuda.is_available()
+                else {"gpus": 0}
+            )
+            with _distributed_env_hidden():
+                output = model.predict(
+                    data,
+                    batch_size=eval_cfg["comet_batch_size"],
+                    progress_bar=False,
+                    **predict_kwargs,
+                )
+            yield from zip(indices, output.scores)
+        finally:
+            del model
+
+    scores = _score_sharded("comet", len(sources), config, prefix, force, score_fn, "green")
+    # Recomputed rather than taken from output.system_score: each rank only sees
+    # its own shard, and for these checkpoints the system score is the mean of
+    # the segment scores.
+    system_score = float(pd.Series(scores).mean())
+    if state.is_main_process:
+        logger.info(
+            "COMET finished for [bold green]%s[/bold green]. System score (higher is better): [bold yellow]%.4f[/bold yellow]",
+            prefix, system_score,
+        )
+    return scores, system_score
 
 
 def _write_human_review_sample(results, config, output_dir, prefix):
@@ -486,8 +606,12 @@ def _run_one(config, adapter_path, prefix, force=False):
     if eval_cfg["metricx_enabled"]:
         results["metricx_score"] = evaluate_metricx(sources, results["generated_farsi"].tolist(), references, config, prefix=prefix, force=force)
         summary["metricx_mean_lower_is_better"] = float(results["metricx_score"].mean())
-    if eval_cfg["comet_enabled"] and is_main:
-        scores, system_score = evaluate_comet(sources, results["generated_farsi"].tolist(), references, config, prefix=prefix)
+    if eval_cfg["comet_enabled"]:
+        # Every rank participates: evaluate_comet shards like MetricX and
+        # contains a barrier, so a main-process-only call would deadlock.
+        scores, system_score = evaluate_comet(
+            sources, results["generated_farsi"].tolist(), references, config, prefix=prefix, force=force
+        )
         results["comet_score"] = scores
         summary["comet_system_score_higher_is_better"] = float(system_score)
     output_dir = Path(eval_cfg["output_dir"])
