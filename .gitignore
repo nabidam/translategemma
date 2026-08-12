@@ -38,3 +38,5 @@ __pycache__/
 docs/refs/
 docs/MULTI_GPU_TRAINING.md
 docs/EVALUATION_BACKLOG.md
+docs/EVALUATION_METRICS_EXPLAINED.md
+

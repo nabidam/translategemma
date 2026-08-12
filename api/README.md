@@ -159,28 +159,48 @@ use `context: .` if the compose file lives inside it.
 ```yaml
 services:
   translategemma-api:
-    image: translategemma-api
+    image: ${IMAGE_NAME:-translategemma-api}
     build:
-      context: ./api
+      context: ${BUILD_CONTEXT:-.}
     ports:
-      - "8000:8000"
+      - "${HOST_PORT:-8000}:${CONTAINER_PORT:-8000}"
     volumes:
       # Staged model tree plus the adapter directory. Read-only is fine: unlike
       # the trainer, this service takes no huggingface_hub download locks when
       # the model id is a local path.
       - ${MODELS_DIR:-./offline_assets/models}:/models:ro
     environment:
-      TG_BASE_MODEL_ID: /models/translategemma-12b-it
-      TG_MODEL_MODE: adapter
-      TG_ADAPTER_PATH: /models/adapters/sft_final
-      TG_SOURCE_LANG: en
-      TG_TARGET_LANG: fa
-      TG_BATCH_SIZE: "8"
-      HF_HOME: /models
-      HUGGINGFACE_HUB_CACHE: /models/hub
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # Model & System Selection
+      TG_BASE_MODEL_ID: ${TG_BASE_MODEL_ID:-/models/translategemma-12b-it}
+      TG_MODEL_MODE: ${TG_MODEL_MODE:-adapter}
+      TG_ADAPTER_PATH: ${TG_ADAPTER_PATH:-/models/adapters/sft_final}
+
+      # Loading Precision & Attention
+      TG_DTYPE: ${TG_DTYPE:-bfloat16}
+      TG_ATTN_IMPLEMENTATION: ${TG_ATTN_IMPLEMENTATION:-sdpa}
+      TG_LOAD_IN_4BIT: ${TG_LOAD_IN_4BIT:-false}
+
+
+      # Translation Defaults
+      TG_SOURCE_LANG: ${TG_SOURCE_LANG:-en}
+      TG_TARGET_LANG: ${TG_TARGET_LANG:-fa}
+      TG_MAX_NEW_TOKENS: ${TG_MAX_NEW_TOKENS:-512}
+      TG_DO_SAMPLE: ${TG_DO_SAMPLE:-false}
+      TG_TEMPERATURE: ${TG_TEMPERATURE:-1.0}
+      TG_TOP_P: ${TG_TOP_P:-1.0}
+      TG_NUM_BEAMS: ${TG_NUM_BEAMS:-1}
+
+      # Batching & Performance Settings
+      TG_BATCH_SIZE: ${TG_BATCH_SIZE:-8}
+      TG_MAX_BATCH_ITEMS: ${TG_MAX_BATCH_ITEMS:-128}
+      TG_SPLIT_SENTENCES: ${TG_SPLIT_SENTENCES:-false}
+
+      # Offline Cache Settings
+      HF_HOME: ${HF_HOME:-/models}
+      HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/models/hub}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
     healthcheck:
       # Generous start_period: loading a 12B checkpoint takes minutes, and the
       # check itself runs a real translation.
@@ -194,7 +214,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
 ```
 

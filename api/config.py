@@ -9,7 +9,10 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from typing import Any
+
+from pydantic import Field, field_validator, model_validator
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -111,8 +114,17 @@ class Settings(BaseSettings):
     # useful for long free text, off-distribution for short ones.
     split_sentences: bool = False
 
+    @field_validator("adapter_path", "default_system", "device", mode="before")
+    @classmethod
+    def _convert_empty_str_to_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
     @model_validator(mode="after")
     def _validate_and_resolve(self):
+        self.base_model_id = _resolve_base_model_path(self.base_model_id)
         if self.model_mode is not ModelMode.BASE:
             if not self.adapter_path:
                 raise ValueError(f"TG_MODEL_MODE={self.model_mode} requires TG_ADAPTER_PATH.")
@@ -143,6 +155,27 @@ class Settings(BaseSettings):
             if system is System.ADAPTER
             else self.base_use_training_rendering
         )
+
+
+def _resolve_base_model_path(base_model_id: str) -> str:
+    """Return an absolute local base model directory, or a hub id unchanged.
+
+    Transformers treats any local path without config.json as a Hub repo id,
+    which in offline mode fails with an opaque LocalEntryNotFoundError.
+    """
+    if _looks_like_hub_id(base_model_id):
+        return base_model_id
+    path = Path(base_model_id).expanduser().resolve()
+    if not path.is_dir():
+        raise ValueError(f"Base model path does not exist: {path} (from {base_model_id!r})")
+    if not (path / "config.json").is_file():
+        available = sorted(
+            child.parent.relative_to(path).as_posix()
+            for child in path.rglob("config.json")
+        )
+        hint = f" Models found below it: {available[:10]}" if available else ""
+        raise ValueError(f"No config.json in {path}.{hint}")
+    return str(path)
 
 
 def _resolve_adapter_path(adapter_path: str) -> str:
