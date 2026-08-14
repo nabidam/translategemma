@@ -262,6 +262,7 @@ and also written to `./benchmarks` on the host as `.md` and `.json`.
 | `--page-source` | `synthetic` | `synthetic`, `file`, or `both` (`file`/`both` need `--page-file`). |
 | `--page-words` | `250` | Words in the synthetic page — the usual page for translation pricing. |
 | `--page-modes` | `whole,sentences` | One long generation, and/or pysbd-split segments. |
+| `--page-batch-size` | `1` | Segments per `generate()` call for `mode=sentences`. Default 1 = one sentence at a time, the latency a single-document caller sees. Engine transport only. |
 | `--systems` | every loaded system | Restrict to `base` / `adapter`. |
 
 Reading the report:

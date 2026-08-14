@@ -774,6 +774,7 @@ PAGE_HEADERS = [
     "system",
     "via",
     "mode",
+    "batch",
     "segments",
     "in tok",
     "out tok",
@@ -793,7 +794,7 @@ def page_row(entry: dict) -> list[str]:
             measurement.system,
             measurement.transport,
             entry["mode"],
-            *(["—"] * 6),
+            *(["—"] * 7),
             measurement.error.split("(")[0].strip(),
         ]
     words_per_minute = page.words / measurement.wall_s * 60 if measurement.wall_s else None
@@ -803,6 +804,7 @@ def page_row(entry: dict) -> list[str]:
         measurement.system,
         measurement.transport,
         entry["mode"],
+        str(entry["batch_size"]) if entry["mode"] == "sentences" else "—",
         str(segments),
         str(measurement.prompt_tokens),
         str(measurement.output_tokens),
@@ -1092,6 +1094,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--page-repeats", type=int, default=1, help="Timed repeats for the page benchmark."
     )
     parser.add_argument(
+        "--page-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Segments per generate() call in mode=sentences. Default 1: one sentence "
+            "at a time, which is the honest per-document latency when a page is the "
+            "whole request. Raise it to see what batching the page buys. Engine "
+            "transport only — over HTTP the server batches by its own TG_BATCH_SIZE."
+        ),
+    )
+    parser.add_argument(
         "--page-max-new-tokens",
         type=int,
         default=None,
@@ -1149,6 +1162,16 @@ def main(argv=None) -> int:
     sweep_max_new_tokens = args.max_new_tokens or settings.max_new_tokens
     notes: list[str] = []
 
+    if (
+        args.mode in ("http", "both")
+        and not args.skip_page
+        and args.page_batch_size != settings.batch_size
+    ):
+        notes.append(
+            f"--page-batch-size={args.page_batch_size} applies to the engine transport only. "
+            f"The HTTP page rows were batched by the server at TG_BATCH_SIZE="
+            f"{settings.batch_size}, and their 'batch' column reports that."
+        )
     if args.mode in ("http", "both") and max(batch_sizes, default=0) > settings.max_batch_items:
         notes.append(
             f"Batch sizes above TG_MAX_BATCH_ITEMS={settings.max_batch_items} were dropped "
@@ -1258,7 +1281,7 @@ def main(argv=None) -> int:
                             system=system,
                             max_new_tokens=max_new_tokens,
                             split_sentences=split,
-                            batch_size=settings.batch_size,
+                            batch_size=args.page_batch_size,
                             repeats=args.page_repeats,
                             warmup=0,  # The sweep already warmed the GPU.
                             prefill_probe=not args.no_prefill_probe,
@@ -1268,9 +1291,17 @@ def main(argv=None) -> int:
                                 "page": page,
                                 "mode": mode,
                                 "transport": runner.transport,
+                                "batch_size": _page_effective_batch_size(
+                                    args, settings, runner.transport
+                                ),
                                 "measurement": measurement,
                                 "predicted_s": _predict_page_seconds(
-                                    page, mode, system, settings, sweeps, runner.transport
+                                    page,
+                                    mode,
+                                    system,
+                                    _page_effective_batch_size(args, settings, runner.transport),
+                                    sweeps,
+                                    runner.transport,
                                 ),
                             }
                         )
@@ -1318,11 +1349,21 @@ def _page_token_budget(page: PageSpec, settings: Settings) -> int:
     return min(4096, max(settings.max_new_tokens, int(source_tokens * 2.0) + 128))
 
 
+def _page_effective_batch_size(args, settings: Settings, transport: str) -> int:
+    """The batch size the page run really used.
+
+    --page-batch-size reaches the engine directly, but over HTTP the batching
+    happens inside the server, which chunks by its own TG_BATCH_SIZE regardless
+    of what this process asked for.
+    """
+    return settings.batch_size if transport == "http" else args.page_batch_size
+
+
 def _predict_page_seconds(
     page: PageSpec,
     mode: str,
     system: System,
-    settings: Settings,
+    batch_size: int,
     sweeps: list[Measurement],
     transport: str,
 ) -> float | None:
@@ -1330,7 +1371,8 @@ def _predict_page_seconds(
 
     Only defined for sentence-split mode, where the page is exactly ceil(n/batch)
     batches of the kind the sweep timed. A large gap against the measured value
-    means the sweep's sentence mix is not representative of this page.
+    means the sweep's sentence mix is not representative of this page. Returns
+    None when the sweep never timed that batch size.
     """
     if mode != "sentences":
         return None
@@ -1340,14 +1382,14 @@ def _predict_page_seconds(
             for m in sweeps
             if m.transport == transport
             and m.system == str(system)
-            and m.batch_size == settings.batch_size
+            and m.batch_size == batch_size
             and not m.error
         ),
         None,
     )
     if row is None or page.sentences == 0:
         return None
-    return math.ceil(page.sentences / settings.batch_size) * row.wall_s
+    return math.ceil(page.sentences / batch_size) * row.wall_s
 
 
 def _write_reports(args, context, sweeps, page_entries, pages, notes) -> None:
@@ -1377,6 +1419,9 @@ def _write_reports(args, context, sweeps, page_entries, pages, notes) -> None:
                 "transport": entry["transport"],
                 "predicted_s": entry["predicted_s"],
                 **asdict(entry["measurement"]),
+                # Last word: over HTTP the server batches by TG_BATCH_SIZE, not
+                # by the batch size this process asked for.
+                "batch_size": entry["batch_size"],
             }
             for entry in page_entries
         ],
