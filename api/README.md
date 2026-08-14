@@ -21,6 +21,8 @@ api/                    # ← copy this, and only this, to the server
 ├── translator.py       # model loading + generation
 ├── prompting.py        # copy, see below
 ├── model_loading.py    # copy, see below
+├── docker-compose.yml  # server + benchmark profile
+├── scripts/            # benchmark_speed.py, run inside the image
 └── .env.example
 ```
 
@@ -217,6 +219,67 @@ services:
               count: ${GPU_COUNT:-1}
               capabilities: [gpu]
 ```
+
+`docker-compose.yml` in this directory ships that service, plus a `benchmark`
+service behind a profile (below) that reuses the same environment block.
+
+## Speed benchmark
+
+`scripts/benchmark_speed.py` measures what this GPU actually delivers: decode
+tokens/second across batch sizes, and how long one page of a document takes.
+
+It measures the **served** path — `TranslationEngine.translate` for the engine
+transport, `POST /translate/batch` for the HTTP one — so the numbers are numbers
+the API can deliver, and the gap between the two transports is the serving
+overhead. Which systems are benchmarked follows `TG_MODEL_MODE`: `base`
+benchmarks the base model, `adapter` the adapted one, `both` runs both and
+therefore also prices the `disable_adapter()` toggle.
+
+```bash
+# Engine transport: loads its own copy of the weights, so stop the server first
+# on a single-GPU host.
+docker compose run --rm benchmark
+
+# HTTP transport: needs the server up, loads nothing itself.
+docker compose up -d translategemma-api
+docker compose run --rm benchmark --mode http --api-url http://translategemma-api:8000
+
+# A real page instead of the synthetic one. PDFs are extracted with PyMuPDF in
+# reading order and reflowed, then segmented with pysbd — the server's splitter.
+docker compose run --rm benchmark --page-source both --page-file scripts/test.pdf --page-number 1
+
+docker compose run --rm benchmark --help
+```
+
+Everything after the service name is passed to the script. Reports are printed
+and also written to `./benchmarks` on the host as `.md` and `.json`.
+
+| Option | Default | Purpose |
+| ------ | ------- | ------- |
+| `--mode` | `engine` | `engine`, `http`, or `both` (needs VRAM for two copies). |
+| `--batch-sizes` | `1,2,4,8,16` | Batch sizes to sweep. |
+| `--repeats` / `--warmup` | `3` / `1` | Timed runs per point; discarded runs before them. |
+| `--page-source` | `synthetic` | `synthetic`, `file`, or `both` (`file`/`both` need `--page-file`). |
+| `--page-words` | `250` | Words in the synthetic page — the usual page for translation pricing. |
+| `--page-modes` | `whole,sentences` | One long generation, and/or pysbd-split segments. |
+| `--systems` | every loaded system | Restrict to `base` / `adapter`. |
+
+Reading the report:
+
+* **`decode tok/s`** is output tokens per second of decode time, counted per row
+  up to the first stop token. Padding columns are excluded — counting them is
+  how a batched benchmark ends up claiming throughput the caller never receives.
+* **`ms/step`** is the per-decode-step cost of the batch: hardware speed,
+  independent of how much padding the batch carried. `decode tok/s` well below
+  `batch x steps / decode s` means the batch was dominated by its slowest row.
+* **`prefill s`** comes from a separate `max_new_tokens=1` run; `decode s` is
+  the remainder.
+* A **truncation warning** means rows hit `max_new_tokens` without emitting a
+  stop token. Those rows measure the cap, not the model — raise
+  `--max-new-tokens` and rerun before quoting anything.
+* **`predicted s`** on the page table extrapolates from the sweep. A large gap
+  against the measured time means the sweep's sentence mix does not represent
+  that page.
 
 ## Local run (no Docker)
 

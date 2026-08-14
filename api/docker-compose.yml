@@ -1,3 +1,47 @@
+# The server and the speed benchmark run from one image and one configuration
+# block, so a benchmark measures the deployment rather than something adjacent
+# to it. The benchmark sits behind a profile and is never started by
+# `docker compose up`.
+x-tg-environment: &tg-environment
+  # Model & System Selection
+  TG_BASE_MODEL_ID: ${TG_BASE_MODEL_ID:-/models/translategemma-12b-it}
+  TG_MODEL_MODE: ${TG_MODEL_MODE:-adapter}
+  TG_ADAPTER_PATH: ${TG_ADAPTER_PATH:-/models/adapters/sft_final}
+
+  # Loading Precision & Attention
+  TG_DTYPE: ${TG_DTYPE:-bfloat16}
+  TG_ATTN_IMPLEMENTATION: ${TG_ATTN_IMPLEMENTATION:-sdpa}
+  TG_LOAD_IN_4BIT: ${TG_LOAD_IN_4BIT:-false}
+
+  # Translation Defaults
+  TG_SOURCE_LANG: ${TG_SOURCE_LANG:-en}
+  TG_TARGET_LANG: ${TG_TARGET_LANG:-fa}
+  TG_MAX_NEW_TOKENS: ${TG_MAX_NEW_TOKENS:-512}
+  TG_DO_SAMPLE: ${TG_DO_SAMPLE:-false}
+  TG_TEMPERATURE: ${TG_TEMPERATURE:-1.0}
+  TG_TOP_P: ${TG_TOP_P:-1.0}
+  TG_NUM_BEAMS: ${TG_NUM_BEAMS:-1}
+
+  # Batching & Performance Settings
+  TG_BATCH_SIZE: ${TG_BATCH_SIZE:-8}
+  TG_MAX_BATCH_ITEMS: ${TG_MAX_BATCH_ITEMS:-128}
+  TG_SPLIT_SENTENCES: ${TG_SPLIT_SENTENCES:-false}
+
+  # Offline Cache Settings
+  HF_HOME: ${HF_HOME:-/models}
+  HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/models/hub}
+  HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+  TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
+  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+x-gpu-reservation: &gpu-reservation
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: ${GPU_COUNT:-1}
+          capabilities: [gpu]
+
 services:
   translategemma-api:
     image: ${IMAGE_NAME:-translategemma-api}
@@ -10,38 +54,7 @@ services:
       # the trainer, this service takes no huggingface_hub download locks when
       # the model id is a local path.
       - ${MODELS_DIR:-./offline_assets/models}:/models:ro
-    environment:
-      # Model & System Selection
-      TG_BASE_MODEL_ID: ${TG_BASE_MODEL_ID:-/models/translategemma-12b-it}
-      TG_MODEL_MODE: ${TG_MODEL_MODE:-adapter}
-      TG_ADAPTER_PATH: ${TG_ADAPTER_PATH:-/models/adapters/sft_final}
-
-      # Loading Precision & Attention
-      TG_DTYPE: ${TG_DTYPE:-bfloat16}
-      TG_ATTN_IMPLEMENTATION: ${TG_ATTN_IMPLEMENTATION:-sdpa}
-      TG_LOAD_IN_4BIT: ${TG_LOAD_IN_4BIT:-false}
-
-
-      # Translation Defaults
-      TG_SOURCE_LANG: ${TG_SOURCE_LANG:-en}
-      TG_TARGET_LANG: ${TG_TARGET_LANG:-fa}
-      TG_MAX_NEW_TOKENS: ${TG_MAX_NEW_TOKENS:-512}
-      TG_DO_SAMPLE: ${TG_DO_SAMPLE:-false}
-      TG_TEMPERATURE: ${TG_TEMPERATURE:-1.0}
-      TG_TOP_P: ${TG_TOP_P:-1.0}
-      TG_NUM_BEAMS: ${TG_NUM_BEAMS:-1}
-
-      # Batching & Performance Settings
-      TG_BATCH_SIZE: ${TG_BATCH_SIZE:-8}
-      TG_MAX_BATCH_ITEMS: ${TG_MAX_BATCH_ITEMS:-128}
-      TG_SPLIT_SENTENCES: ${TG_SPLIT_SENTENCES:-false}
-
-      # Offline Cache Settings
-      HF_HOME: ${HF_HOME:-/models}
-      HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/models/hub}
-      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
-      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
-      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+    environment: *tg-environment
     healthcheck:
       # Generous start_period: loading a 12B checkpoint takes minutes, and the
       # check itself runs a real translation.
@@ -50,10 +63,32 @@ services:
       timeout: 30s
       retries: 3
       start_period: 600s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: ${GPU_COUNT:-1}
-              capabilities: [gpu]
+    deploy: *gpu-reservation
+
+  # Speed benchmark. Same image, same settings, no ports, never started by
+  # `docker compose up` (it is behind a profile and has no depends_on).
+  #
+  #   docker compose run --rm benchmark                       # engine, server down
+  #   docker compose run --rm benchmark --mode http \
+  #       --api-url http://translategemma-api:8000            # server up
+  #
+  # Arguments after the service name go straight to the script (--help lists
+  # them). Reports land in ./benchmarks on the host.
+  #
+  # The engine transport loads its own copy of the weights, so run it with the
+  # server stopped on a single-GPU host; the http transport needs the server up
+  # and loads nothing itself.
+  benchmark:
+    profiles: ["benchmark"]
+    image: ${IMAGE_NAME:-translategemma-api}
+    build:
+      context: ${BUILD_CONTEXT:-.}
+    entrypoint: ["python", "scripts/benchmark_speed.py"]
+    volumes:
+      - ${MODELS_DIR:-./offline_assets/models}:/models:ro
+      - ${BENCHMARK_OUTPUT_DIR:-./benchmarks}:/app/benchmarks
+    environment:
+      <<: *tg-environment
+      TG_BENCHMARK_API_URL: ${TG_BENCHMARK_API_URL:-http://translategemma-api:8000}
+      TG_BENCHMARK_OUTPUT_DIR: /app/benchmarks
+    deploy: *gpu-reservation

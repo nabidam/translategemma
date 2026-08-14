@@ -28,8 +28,16 @@ numpy==1.26.4
 # Blackwell (sm_120) kernels.
 bitsandbytes==0.50.0
 
-# Optional sentence splitting (TG_SPLIT_SENTENCES=true).
+# Sentence splitting: optional for the server (TG_SPLIT_SENTENCES=true),
+# required by scripts/benchmark_speed.py, which segments a benchmarked page the
+# same way the server would so the two report the same segment count.
 pysbd==0.3.4
+
+# Used only by scripts/benchmark_speed.py, to pull a page of text out of a PDF.
+# Installed rather than left optional because the deployment hosts run offline,
+# where `pip install` at benchmark time is not an option. Never imported by the
+# server. Range-pinned: it is not in the project lockfile.
+pymupdf>=1.24,<2
 
 # The web stack is range-pinned rather than exact-pinned: unlike the packages
 # above there is no lockfile entry to copy, and these ranges are the

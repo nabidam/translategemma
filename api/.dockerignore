@@ -7,3 +7,6 @@ __pycache__/
 
 # Never ship a developer's local settings; compose supplies the real values.
 .env
+
+# Benchmark reports are outputs of a run on some host, not build inputs.
+benchmarks/

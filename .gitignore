@@ -40,3 +40,5 @@ docs/MULTI_GPU_TRAINING.md
 docs/EVALUATION_BACKLOG.md
 docs/EVALUATION_METRICS_EXPLAINED.md
 
+# Speed-benchmark reports, produced per host by api/scripts/benchmark_speed.py.
+api/benchmarks/
