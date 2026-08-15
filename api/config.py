@@ -5,14 +5,13 @@ image serves a base checkpoint, a base + LoRA adapter, or both side by side
 without a rebuild. See api/.env.example.
 """
 
+import json
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-
 from typing import Any
 
 from pydantic import Field, field_validator, model_validator
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -114,11 +113,35 @@ class Settings(BaseSettings):
     # useful for long free text, off-distribution for short ones.
     split_sentences: bool = False
 
+    # --- CORS -------------------------------------------------------------
+    # Origins permitted by CORSMiddleware. Comma-separated string or JSON list
+    # in environment variable (e.g. TG_CORS_ORIGINS="http://localhost:3000,http://localhost:8000").
+    # Defaults to allowing all origins.
+    cors_origins: list[str] = ["*"]
+    cors_allow_credentials: bool = True
+    cors_allow_methods: list[str] = ["*"]
+    cors_allow_headers: list[str] = ["*"]
+
     @field_validator("adapter_path", "default_system", "device", mode="before")
     @classmethod
     def _convert_empty_str_to_none(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("cors_origins", "cors_allow_methods", "cors_allow_headers", mode="before")
+    @classmethod
+    def _parse_cors_list(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return []
+            if value.startswith("[") and value.endswith("]"):
+                try:
+                    return json.loads(value)
+                except Exception:
+                    pass
+            return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
 

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from anyio import to_thread
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 
 from config import Settings, System, get_settings
 from schemas import (
@@ -60,6 +61,15 @@ app = FastAPI(
     ),
     version="0.1.0",
     lifespan=lifespan,
+)
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.cors_origins,
+    allow_credentials=_settings.cors_allow_credentials,
+    allow_methods=_settings.cors_allow_methods,
+    allow_headers=_settings.cors_allow_headers,
 )
 
 
