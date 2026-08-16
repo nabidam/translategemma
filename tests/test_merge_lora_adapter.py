@@ -160,95 +160,375 @@ def test_validate_adapter_compatibility_missing_base_identity(tmp_path):
         assert matched is False
 
 
-def test_validate_adapter_architecture():
+IN_FEATURES = 8
+OUT_FEATURES = 16
+LORA_RANK = 4
+
+
+def _build_tiny_base_model():
+    """Real modules, because the validation now inspects types and weight dimensions."""
+    import torch
+
+    class TinyAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(IN_FEATURES, OUT_FEATURES, bias=False)
+            self.v_proj = torch.nn.Linear(IN_FEATURES, OUT_FEATURES, bias=False)
+            self.norm = torch.nn.LayerNorm(OUT_FEATURES)
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = TinyAttention()
+            self.config = MagicMock()
+            self.config.model_type = "gemma3"
+
+    return TinyModel()
+
+
+def _write_adapter_tensors(adapter_dir: Path, tensors) -> None:
+    import torch
+
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(tensors, adapter_dir / "adapter_model.bin")
+
+
+def _lora_state(module_path: str, a_shape, b_shape):
+    import torch
+
+    return {
+        f"base_model.model.{module_path}.lora_A.weight": torch.zeros(a_shape),
+        f"base_model.model.{module_path}.lora_B.weight": torch.zeros(b_shape),
+    }
+
+
+def test_validate_adapter_architecture_accepts_matching_shapes(tmp_path):
     from scripts.merge_lora_adapter import validate_adapter_architecture
 
-    # Mock base model
-    mock_base = MagicMock()
-    mock_base.named_modules.return_value = [
-        ("model.layers.0.self_attn.q_proj", MagicMock()),
-        ("model.layers.0.self_attn.v_proj", MagicMock()),
-        ("model.layers.0.self_attn.k_proj", MagicMock()),
-        ("model.layers.0.self_attn.o_proj", MagicMock()),
-    ]
-    mock_base.config.model_type = "gemma2"
+    base = _build_tiny_base_model()
+    adapter_dir = tmp_path / "adapter_ok"
+    _write_adapter_tensors(
+        adapter_dir,
+        {
+            **_lora_state("self_attn.q_proj", (LORA_RANK, IN_FEATURES), (OUT_FEATURES, LORA_RANK)),
+            **_lora_state("self_attn.v_proj", (LORA_RANK, IN_FEATURES), (OUT_FEATURES, LORA_RANK)),
+        },
+    )
 
-    # 1. Matching target modules
-    peft_cfg_valid = MagicMock()
-    peft_cfg_valid.target_modules = ["q_proj", "v_proj"]
-    res = validate_adapter_architecture(mock_base, peft_cfg_valid)
-    assert res["validated"] is True
-    assert res["target_modules_matched"] == ["q_proj", "v_proj"]
+    peft_cfg = MagicMock()
+    peft_cfg.target_modules = ["q_proj", "v_proj"]
+    peft_cfg.r = LORA_RANK
 
-    # 2. Missing target modules without override -> raises
-    peft_cfg_bad = MagicMock()
-    peft_cfg_bad.target_modules = ["q_proj", "nonexistent_proj"]
-    with pytest.raises(ValueError, match="Adapter target modules.*not found"):
-        validate_adapter_architecture(mock_base, peft_cfg_bad, allow_mismatch=False)
+    result = validate_adapter_architecture(base, peft_cfg, adapter_path=adapter_dir)
 
-    # 3. Missing target modules with override -> passes with reason
-    res_override = validate_adapter_architecture(
-        mock_base,
-        peft_cfg_bad,
+    assert result["validated"] is True
+    assert result["target_modules_matched"] == ["q_proj", "v_proj"]
+    assert result["lora_tensors_checked"] == 4
+    assert result["modules_shape_validated"] == 2
+
+
+def test_validate_adapter_architecture_rejects_dimension_mismatch(tmp_path):
+    """A same-named projection of the wrong width must fail before merge_and_unload."""
+    from scripts.merge_lora_adapter import validate_adapter_architecture
+
+    base = _build_tiny_base_model()
+    adapter_dir = tmp_path / "adapter_wrong_width"
+    _write_adapter_tensors(
+        adapter_dir,
+        _lora_state("self_attn.q_proj", (LORA_RANK, IN_FEATURES * 2), (OUT_FEATURES, LORA_RANK)),
+    )
+
+    peft_cfg = MagicMock()
+    peft_cfg.target_modules = ["q_proj"]
+    peft_cfg.r = LORA_RANK
+
+    with pytest.raises(ValueError, match="dimension mismatches"):
+        validate_adapter_architecture(base, peft_cfg, adapter_path=adapter_dir, allow_mismatch=False)
+
+
+def test_validate_adapter_architecture_rejects_non_linear_target(tmp_path):
+    from scripts.merge_lora_adapter import validate_adapter_architecture
+
+    base = _build_tiny_base_model()
+    adapter_dir = tmp_path / "adapter_non_linear"
+    _write_adapter_tensors(
+        adapter_dir,
+        _lora_state("self_attn.norm", (LORA_RANK, OUT_FEATURES), (OUT_FEATURES, LORA_RANK)),
+    )
+
+    peft_cfg = MagicMock()
+    peft_cfg.target_modules = ["norm"]
+    peft_cfg.r = LORA_RANK
+
+    with pytest.raises(ValueError, match="incompatible module types"):
+        validate_adapter_architecture(base, peft_cfg, adapter_path=adapter_dir, allow_mismatch=False)
+
+
+def test_validate_adapter_architecture_missing_target_requires_override(tmp_path):
+    from scripts.merge_lora_adapter import validate_adapter_architecture
+
+    base = _build_tiny_base_model()
+    adapter_dir = tmp_path / "adapter_missing_target"
+    _write_adapter_tensors(
+        adapter_dir,
+        _lora_state("self_attn.q_proj", (LORA_RANK, IN_FEATURES), (OUT_FEATURES, LORA_RANK)),
+    )
+
+    peft_cfg = MagicMock()
+    peft_cfg.target_modules = ["q_proj", "nonexistent_proj"]
+    peft_cfg.r = LORA_RANK
+
+    with pytest.raises(ValueError, match="target modules not found"):
+        validate_adapter_architecture(base, peft_cfg, adapter_path=adapter_dir, allow_mismatch=False)
+
+    result = validate_adapter_architecture(
+        base,
+        peft_cfg,
+        adapter_path=adapter_dir,
         allow_mismatch=True,
         override_reason="Experimental architecture test",
     )
-    assert res_override["validated"] is False
-    assert res_override["target_modules_missing"] == ["nonexistent_proj"]
+    assert result["validated"] is False
+    assert result["target_modules_missing"] == ["nonexistent_proj"]
 
 
-def test_promote_and_rollback_release_pointers(tmp_path):
+def test_merge_script_has_no_release_activation_path():
+    """Activation belongs to promote_model_release.py, which enforces the full gate set."""
+    args = parse_args([
+        "--base-model", "google/translategemma-12b-it",
+        "--adapter", "checkpoints/sft-adapter",
+        "--output-dir", "exports/test-export",
+    ])
+    assert not hasattr(args, "current_symlink")
+    assert not hasattr(args, "previous_symlink")
+
+
+def test_immutable_revision_must_resolve(tmp_path):
+    """An unresolvable 40-char SHA must abort rather than be echoed back as provenance."""
+    from scripts.merge_lora_adapter import resolve_model_provenance
+
+    sha = "a" * 40
+    with patch("huggingface_hub.model_info", side_effect=OSError("offline")), patch(
+        "scripts.merge_lora_adapter.resolve_cached_snapshot_commit", return_value=None
+    ):
+        with pytest.raises(ValueError, match="could not be resolved"):
+            resolve_model_provenance("google/translategemma-12b-it", sha)
+
+
+def test_immutable_revision_resolved_from_local_snapshot():
+    from scripts.merge_lora_adapter import resolve_model_provenance
+
+    sha = "b" * 40
+    with patch("huggingface_hub.model_info", side_effect=OSError("offline")), patch(
+        "scripts.merge_lora_adapter.resolve_cached_snapshot_commit", return_value=sha
+    ):
+        provenance = resolve_model_provenance("google/translategemma-12b-it", sha)
+
+    assert provenance["resolved_revision"] == sha
+    assert provenance["revision_type"] == "commit_sha"
+    assert provenance["resolution_source"] == "local_hf_cache_snapshot"
+
+
+def _make_release(root: Path, release_id: str, shard_bytes: bytes) -> Path:
+    release_dir = root / "releases" / release_id
+    release_dir.mkdir(parents=True)
+    (release_dir / "config.json").write_text("{}")
+    (release_dir / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106]}))
+    (release_dir / "tokenizer.json").write_text(
+        json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]})
+    )
+    (release_dir / "tokenizer_config.json").write_text("{}")
+    (release_dir / "special_tokens_map.json").write_text("{}")
+    (release_dir / "model.safetensors").write_bytes(shard_bytes)
+    (release_dir / "merge_manifest.json").write_text(json.dumps({
+        "release_id": release_id, "created_at": "now", "base_model": "base", "adapter": "ad",
+        "stop_token_ids": [1, 106], "file_inventory": []
+    }))
+    (release_dir / "merge_manifest.sha256").write_text(
+        f"{compute_file_sha256(release_dir / 'merge_manifest.json')}  merge_manifest.json\n"
+    )
+    (release_dir / "SHA256SUMS").write_text("")
+    return release_dir
+
+
+def _write_attestation(root: Path, release_dir: Path, name: str) -> Path:
+    """Attestation with every required gate passing, bound to this release's manifest."""
+    from datetime import datetime, timezone
+
+    evidence_dir = root / "evidence"
+    evidence_dir.mkdir(exist_ok=True)
+    evidence_file = evidence_dir / f"{name}-report.json"
+    evidence_file.write_text(json.dumps({"report": name}))
+    evidence_hash = compute_file_sha256(evidence_file)
+    now = datetime.now(timezone.utc).isoformat()
+
+    attestation = {
+        "manifest_sha256": compute_file_sha256(release_dir / "merge_manifest.json"),
+        "release_id": release_dir.name,
+        "gates": {
+            gate: {
+                "passed": True,
+                "verified_at": now,
+                "evidence": str(evidence_file),
+                "evidence_sha256": evidence_hash,
+            }
+            for gate in ("merged_quality", "degeneration", "vllm_smoke", "deployment_preflight")
+        },
+    }
+    attestation_path = root / f"{name}-attestation.json"
+    attestation_path.write_text(json.dumps(attestation, indent=2))
+    return attestation_path
+
+
+def _write_anchor(root: Path, release_dir: Path, name: str) -> Path:
+    """External anchor, deliberately stored outside the release directory."""
+    anchor_dir = root / "anchors"
+    anchor_dir.mkdir(exist_ok=True)
+    anchor_path = anchor_dir / f"{name}.sha256"
+    anchor_path.write_text(
+        f"{compute_file_sha256(release_dir / 'merge_manifest.json')}  merge_manifest.json\n"
+    )
+    return anchor_path
+
+
+def test_promotion_requires_external_anchor_and_attestation(tmp_path):
+    from scripts.promote_model_release import promote_release
+
+    rel = _make_release(tmp_path, "rel1", b"shard1")
+    attestation = _write_attestation(tmp_path, rel, "rel1")
+    curr, prev = tmp_path / "current", tmp_path / "previous"
+
+    # Co-located checksum only: no external anchor, so promotion must refuse.
+    assert promote_release(
+        rel, curr, prev, attestation_file=str(attestation), skip_checksums=True
+    ) is False
+    assert not curr.exists()
+
+    # External anchor but no attestation: behavioral gates are unproven.
+    anchor = _write_anchor(tmp_path, rel, "rel1")
+    assert promote_release(
+        rel, curr, prev, attestation_file=None, trusted_anchor_file=str(anchor), skip_checksums=True
+    ) is False
+    assert not curr.exists()
+
+
+def test_promotion_rejects_attestation_bound_to_another_release(tmp_path):
+    from scripts.promote_model_release import promote_release
+
+    rel1 = _make_release(tmp_path, "rel1", b"shard1")
+    rel2 = _make_release(tmp_path, "rel2", b"shard2")
+    foreign_attestation = _write_attestation(tmp_path, rel1, "rel1")
+    anchor2 = _write_anchor(tmp_path, rel2, "rel2")
+    curr, prev = tmp_path / "current", tmp_path / "previous"
+
+    assert promote_release(
+        rel2,
+        curr,
+        prev,
+        attestation_file=str(foreign_attestation),
+        trusted_anchor_file=str(anchor2),
+        skip_checksums=True,
+    ) is False
+    assert not curr.exists()
+
+
+def test_promotion_rejects_stale_gate_evidence(tmp_path):
+    from scripts.promote_model_release import promote_release
+
+    rel = _make_release(tmp_path, "rel1", b"shard1")
+    attestation_path = _write_attestation(tmp_path, rel, "rel1")
+    attestation = json.loads(attestation_path.read_text())
+    attestation["gates"]["vllm_smoke"]["verified_at"] = "2020-01-01T00:00:00+00:00"
+    attestation_path.write_text(json.dumps(attestation))
+    anchor = _write_anchor(tmp_path, rel, "rel1")
+    curr, prev = tmp_path / "current", tmp_path / "previous"
+
+    assert promote_release(
+        rel,
+        curr,
+        prev,
+        attestation_file=str(attestation_path),
+        trusted_anchor_file=str(anchor),
+        skip_checksums=True,
+    ) is False
+
+
+def test_promote_rollback_and_roll_forward_walk_release_history(tmp_path):
     from scripts.promote_model_release import promote_release, rollback_release
 
-    # Create dummy verified release 1
-    rel1 = tmp_path / "releases" / "rel1"
-    rel1.mkdir(parents=True)
-    (rel1 / "config.json").write_text("{}")
-    (rel1 / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106]}))
-    (rel1 / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]}))
-    (rel1 / "tokenizer_config.json").write_text("{}")
-    (rel1 / "special_tokens_map.json").write_text("{}")
-    (rel1 / "model.safetensors").write_bytes(b"shard1")
-    (rel1 / "merge_manifest.json").write_text(json.dumps({
-        "release_id": "rel1", "created_at": "now", "base_model": "base", "adapter": "ad",
-        "stop_token_ids": [1, 106], "file_inventory": []
+    rel1 = _make_release(tmp_path, "rel1", b"shard1")
+    rel2 = _make_release(tmp_path, "rel2", b"shard2")
+    curr, prev = tmp_path / "current", tmp_path / "previous"
+
+    assert promote_release(
+        rel1,
+        curr,
+        prev,
+        attestation_file=str(_write_attestation(tmp_path, rel1, "rel1")),
+        trusted_anchor_file=str(_write_anchor(tmp_path, rel1, "rel1")),
+        skip_checksums=True,
+    ) is True
+    assert curr.resolve() == rel1.resolve()
+
+    assert promote_release(
+        rel2,
+        curr,
+        prev,
+        attestation_file=str(_write_attestation(tmp_path, rel2, "rel2")),
+        trusted_anchor_file=str(_write_anchor(tmp_path, rel2, "rel2")),
+        skip_checksums=True,
+    ) is True
+    assert curr.resolve() == rel2.resolve()
+    assert prev.resolve() == rel1.resolve()
+
+    # Rollback to rel1, and the release we left becomes the rollback target.
+    assert rollback_release(curr, prev, skip_checksums=True) is True
+    assert curr.resolve() == rel1.resolve()
+    assert prev.resolve() == rel2.resolve()
+
+    # Rolling again returns to rel2 instead of pinning one stale pointer forever.
+    assert rollback_release(curr, prev, skip_checksums=True) is True
+    assert curr.resolve() == rel2.resolve()
+    assert prev.resolve() == rel1.resolve()
+
+    index = json.loads((tmp_path / "release_index.json").read_text())
+    assert [entry["action"] for entry in index["history"]] == ["promote", "promote", "rollback", "rollback"]
+
+
+def test_rollback_rejects_tampered_previous_release(tmp_path):
+    """Rollback re-verifies against the hash trusted at promotion time."""
+    from scripts.promote_model_release import promote_release, rollback_release
+
+    rel1 = _make_release(tmp_path, "rel1", b"shard1")
+    rel2 = _make_release(tmp_path, "rel2", b"shard2")
+    curr, prev = tmp_path / "current", tmp_path / "previous"
+
+    promote_release(
+        rel1,
+        curr,
+        prev,
+        attestation_file=str(_write_attestation(tmp_path, rel1, "rel1")),
+        trusted_anchor_file=str(_write_anchor(tmp_path, rel1, "rel1")),
+        skip_checksums=True,
+    )
+    promote_release(
+        rel2,
+        curr,
+        prev,
+        attestation_file=str(_write_attestation(tmp_path, rel2, "rel2")),
+        trusted_anchor_file=str(_write_anchor(tmp_path, rel2, "rel2")),
+        skip_checksums=True,
+    )
+
+    # Attacker rewrites the old release plus its co-located checksum during an incident.
+    manifest = rel1 / "merge_manifest.json"
+    manifest.write_text(json.dumps({
+        "release_id": "rel1", "created_at": "now", "base_model": "evil", "adapter": "ad",
+        "stop_token_ids": [1], "file_inventory": []
     }))
-    (rel1 / "merge_manifest.sha256").write_text(f"{compute_file_sha256(rel1 / 'merge_manifest.json')}  merge_manifest.json\n")
-    (rel1 / "SHA256SUMS").write_text("")
+    (rel1 / "merge_manifest.sha256").write_text(f"{compute_file_sha256(manifest)}  merge_manifest.json\n")
 
-    # Create dummy verified release 2
-    rel2 = tmp_path / "releases" / "rel2"
-    rel2.mkdir(parents=True)
-    (rel2 / "config.json").write_text("{}")
-    (rel2 / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106]}))
-    (rel2 / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]}))
-    (rel2 / "tokenizer_config.json").write_text("{}")
-    (rel2 / "special_tokens_map.json").write_text("{}")
-    (rel2 / "model.safetensors").write_bytes(b"shard2")
-    (rel2 / "merge_manifest.json").write_text(json.dumps({
-        "release_id": "rel2", "created_at": "now", "base_model": "base", "adapter": "ad",
-        "stop_token_ids": [1, 106], "file_inventory": []
-    }))
-    (rel2 / "merge_manifest.sha256").write_text(f"{compute_file_sha256(rel2 / 'merge_manifest.json')}  merge_manifest.json\n")
-    (rel2 / "SHA256SUMS").write_text("")
-
-    curr_symlink = tmp_path / "current"
-    prev_symlink = tmp_path / "previous"
-
-    # Promote rel1
-    ok1 = promote_release(rel1, curr_symlink, prev_symlink, skip_checksums=True)
-    assert ok1 is True
-    assert curr_symlink.resolve() == rel1.resolve()
-
-    # Promote rel2 -> curr points to rel2, prev points to rel1
-    ok2 = promote_release(rel2, curr_symlink, prev_symlink, skip_checksums=True)
-    assert ok2 is True
-    assert curr_symlink.resolve() == rel2.resolve()
-    assert prev_symlink.resolve() == rel1.resolve()
-
-    # Rollback -> curr reverts to rel1
-    ok_roll = rollback_release(curr_symlink, prev_symlink, skip_checksums=True)
-    assert ok_roll is True
-    assert curr_symlink.resolve() == rel1.resolve()
+    assert rollback_release(curr, prev, skip_checksums=True) is False
+    assert curr.resolve() == rel2.resolve()
 
 

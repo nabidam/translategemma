@@ -121,7 +121,12 @@ class ReadyResponse(BaseModel):
     model_name: str
     estimator_mode: str
     processor_mode: str = "canonical"
+    # Authenticity (external anchor) and integrity (co-located checksum) are reported
+    # separately; only authenticity plus payload verification gates production.
     manifest_verified: bool = False
+    manifest_integrity_verified: bool = False
+    payload_verified: bool = False
+    payload_verified_at: Optional[str] = None
     authenticity_status: str = "unverified"
     detail: Optional[str] = None
 
@@ -142,7 +147,8 @@ class ModelInfoResponse(BaseModel):
     max_new_tokens: int
     max_total_context_tokens: int
     vllm_model_name: str
-    vllm_base_url: str
+    # Internal backend address is withheld unless TG_EXPOSE_FULL_MANIFEST is set.
+    vllm_base_url: Optional[str] = None
     estimator_mode: str
     processor_mode: str = "canonical"
     prompt_contract_version: str = "2026-08-10"
@@ -150,6 +156,9 @@ class ModelInfoResponse(BaseModel):
 
     # Manifest and Authenticity provenance
     manifest_verified: bool = False
+    manifest_integrity_verified: bool = False
+    payload_verified: bool = False
+    payload_verified_at: Optional[str] = None
     manifest_sha256: Optional[str] = None
     authenticity_status: str = "unverified"  # "trusted_external_anchor" | "colocated_checksum_only" | "unverified"
     resolved_base_commit: Optional[str] = None

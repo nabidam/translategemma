@@ -3,7 +3,7 @@
 Two properties of the TranslateGemma chat template caused the 2026-08-10 adapter
 to translate correctly and then never stop (see
 docs/2026-08-10_adapter_degeneration_analysis.md). Both are easy to reintroduce
-independependently in each generation entry point, so both are resolved here once.
+independently in each generation entry point, so both are resolved here once.
 
 1. ``add_generation_prompt=True`` is NOT the prefix the assistant turn is
    trained to continue. The training rendering opens the assistant turn with a
@@ -39,7 +39,7 @@ def as_token_id_set(value):
     return {int(item) for item in value if item is not None}
 
 
-def resolve_stop_token_ids(tokenizer, *generation_configs, base_model_id=None):
+def resolve_stop_token_ids(tokenizer, *generation_configs, base_model_id=None, base_revision=None):
     """Return every id that should end generation, as a sorted list.
 
     Unions the tokenizer's eos, each supplied generation config's eos, the
@@ -47,6 +47,11 @@ def resolve_stop_token_ids(tokenizer, *generation_configs, base_model_id=None):
     chat turn ender. Union rather than "first non-empty" is deliberate: a stop
     set can only be too small, never too large, because a token that the model
     never emits costs nothing.
+
+    ``base_revision`` must be threaded through wherever the caller pinned the
+    base model to a revision. Reading generation_config.json from the default
+    revision while the weights came from another one silently mixes two
+    releases' stop contracts, which is the failure this module exists to stop.
     """
     stop_ids = as_token_id_set(getattr(tokenizer, "eos_token_id", None))
     for generation_config in generation_configs:
@@ -58,7 +63,7 @@ def resolve_stop_token_ids(tokenizer, *generation_configs, base_model_id=None):
         from transformers import GenerationConfig
 
         try:
-            published = GenerationConfig.from_pretrained(base_model_id)
+            published = GenerationConfig.from_pretrained(base_model_id, revision=base_revision)
         except (OSError, ValueError):
             # No generation_config.json published, or the hub is unreachable in
             # an offline deployment. The explicit turn ender below still applies.

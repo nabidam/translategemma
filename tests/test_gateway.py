@@ -258,11 +258,15 @@ def test_gateway_api_endpoints():
     assert "processor_mode" in data_ready
     assert "estimator_mode" in data_ready
 
-    # 4. /model-info exposes processor_mode
+    # 4. /model-info exposes processor_mode but withholds internal provenance by default
     resp_info = client.get("/model-info")
     assert resp_info.status_code == 200
     data_info = resp_info.json()
     assert "processor_mode" in data_info
+    assert data_info["manifest_metadata"] is None
+    assert data_info["source_adapter_path"] is None
+    assert data_info["vllm_base_url"] is None
+    assert data_info["architecture_fingerprint"] is None
 
     # 5. Single translate preserves trailing whitespace without stripping
     resp = client.post("/translate", json={"text": "Hello world", "source_lang": "en", "target_lang": "fa"})

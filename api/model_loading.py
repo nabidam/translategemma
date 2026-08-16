@@ -36,7 +36,7 @@ def load_generation_safe_model_config(base_model_id, revision=None):
     return config
 
 
-def make_deterministic_generation_config(model_config, processor, base_model_id=None):
+def make_deterministic_generation_config(model_config, processor, base_model_id=None, base_revision=None):
     """Return explicit, warning-free defaults for translation generation.
 
     The stop set is resolved through prompting.resolve_stop_token_ids rather
@@ -59,7 +59,7 @@ def make_deterministic_generation_config(model_config, processor, base_model_id=
     # Unconditional: eos_token_id is present but incomplete, so an
     # "if ... is None" guard would never fire.
     generation_config.eos_token_id = resolve_stop_token_ids(
-        tokenizer, generation_config, base_model_id=base_model_id
+        tokenizer, generation_config, base_model_id=base_model_id, base_revision=base_revision
     )
     if generation_config.pad_token_id is None:
         generation_config.pad_token_id = tokenizer.pad_token_id

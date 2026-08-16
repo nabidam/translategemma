@@ -1,4 +1,10 @@
-FROM python:3.11-slim
+# The base image must be pinned by digest, not by the mutable python:3.11-slim tag.
+# No default is provided on purpose: an unpinned build fails instead of silently
+# producing an image nobody can reproduce. Record the digest in serving/COMPATIBILITY.md.
+#
+#   docker build --build-arg PYTHON_BASE_IMAGE=python:3.11-slim@sha256:<digest> ...
+ARG PYTHON_BASE_IMAGE
+FROM ${PYTHON_BASE_IMAGE}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -8,8 +14,11 @@ WORKDIR /app
 
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
-COPY requirements.txt requirements-lock.txt /app/
-RUN pip install --no-cache-dir -r /app/requirements-lock.txt \
+# requirements-hashes.txt carries per-artifact SHA256 hashes, so a compromised or
+# republished index file cannot be installed even at an identical version.
+# Generate it on a networked host: scripts/generate_gateway_hash_lock.sh
+COPY requirements.txt requirements-lock.txt requirements-hashes.txt /app/
+RUN pip install --no-cache-dir --require-hashes -r /app/requirements-hashes.txt \
     && pip freeze > /app/resolved-requirements.txt
 
 COPY . /app/

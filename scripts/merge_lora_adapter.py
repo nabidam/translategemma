@@ -9,6 +9,10 @@ offline-loadable model directory containing:
   4. merge_manifest.json with provenance metadata and SHA256 checksums.
   5. SHA256SUMS for artifact integrity verification on the serving host.
 
+This script never activates a release. Serving pointers are switched exclusively by
+scripts/promote_model_release.py, which enforces external trust anchors, release
+attestation evidence, and atomic pointer replacement.
+
 Usage:
   uv run python scripts/merge_lora_adapter.py \
       --base-model google/translategemma-12b-it \
@@ -128,6 +132,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Allow merge even if adapter target modules or architecture differ from base model.",
     )
     parser.add_argument(
+        "--override-reason",
+        type=str,
+        default=None,
+        help="Mandatory written justification when --allow-base-mismatch or --allow-architecture-mismatch is used.",
+    )
+    parser.add_argument(
         "--trusted-anchor-dir",
         type=str,
         default=None,
@@ -138,18 +148,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="External path to write detached manifest SHA256 hash/signature for trusted verification.",
-    )
-    parser.add_argument(
-        "--current-symlink",
-        type=str,
-        default=None,
-        help="Optional path to 'current' release symlink to atomically update after all verification gates pass.",
-    )
-    parser.add_argument(
-        "--previous-symlink",
-        type=str,
-        default=None,
-        help="Optional path to 'previous' release symlink to update for rollback.",
     )
     return parser.parse_args(argv)
 
@@ -253,6 +251,50 @@ def validate_adapter_compatibility(
     return peft_config, base_matched, arch_fingerprint
 
 
+def is_immutable_commit_sha(revision: Optional[str]) -> bool:
+    """True when the revision string is a full 40-character git commit SHA."""
+    if not revision or len(revision) != 40:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in revision)
+
+
+def resolve_cached_snapshot_commit(model_ident: str, requested_revision: Optional[str]) -> Optional[str]:
+    """Resolve a repository revision to a commit SHA using only the local Hugging Face cache.
+
+    Offline serving/export hosts cannot reach the Hub, so the commit that the
+    loader will actually read is the one recorded in the local snapshot refs.
+    Reading it here (rather than echoing the requested string) keeps manifest
+    provenance bound to bytes on disk.
+    """
+    try:
+        from huggingface_hub import scan_cache_dir
+    except Exception as e:  # huggingface_hub missing or unusable
+        logger.debug("Local HF cache scan unavailable for %s (%s)", model_ident, e)
+        return None
+
+    try:
+        cache_info = scan_cache_dir()
+    except Exception as e:
+        logger.debug("Could not scan local HF cache for %s (%s)", model_ident, e)
+        return None
+
+    for repo in cache_info.repos:
+        if repo.repo_id != model_ident:
+            continue
+        for revision_info in repo.revisions:
+            refs = set(getattr(revision_info, "refs", set()) or set())
+            commit = getattr(revision_info, "commit_hash", None)
+            if not commit:
+                continue
+            if requested_revision is None and ("main" in refs or len(repo.revisions) == 1):
+                return commit
+            if requested_revision and (
+                requested_revision in refs or commit.lower() == requested_revision.lower()
+            ):
+                return commit
+    return None
+
+
 def resolve_model_provenance(
     model_ident: str,
     requested_revision: Optional[str] = None,
@@ -272,37 +314,103 @@ def resolve_model_provenance(
 
     # Remote repository: attempt to resolve commit SHA via huggingface_hub or config
     resolved_commit = None
+    resolution_source = None
+    resolution_error: Optional[str] = None
     try:
         from huggingface_hub import model_info as hf_model_info
         info = hf_model_info(model_ident, revision=requested_revision)
         resolved_commit = getattr(info, "sha", None)
+        if resolved_commit:
+            resolution_source = "hf_hub_api"
     except Exception as e:
-        logger.debug("Could not query Hugging Face Hub metadata for %s (%s)", model_ident, e)
+        resolution_error = f"{type(e).__name__}: {e}"
+        logger.warning("Could not query Hugging Face Hub metadata for %s (%s)", model_ident, resolution_error)
 
-    # If an immutable 40-char commit hash was requested, verify match
-    if requested_revision and len(requested_revision) == 40 and all(c in "0123456789abcdefABCDEF" for c in requested_revision):
-        if resolved_commit and resolved_commit.lower() != requested_revision.lower():
+    if resolved_commit is None:
+        # Offline hosts resolve through the local snapshot the loader will actually read.
+        resolved_commit = resolve_cached_snapshot_commit(model_ident, requested_revision)
+        if resolved_commit:
+            resolution_source = "local_hf_cache_snapshot"
+
+    if is_immutable_commit_sha(requested_revision):
+        if not resolved_commit:
             raise ValueError(
-                f"Requested commit SHA {requested_revision} does not match remote resolved commit {resolved_commit} for {model_ident}."
+                f"Immutable commit SHA {requested_revision} was requested for {model_ident}, but it could not be "
+                f"resolved against the Hub ({resolution_error or 'no metadata'}) or against a local Hugging Face "
+                "cache snapshot. Refusing to claim an unverified revision: run the export on a host that can "
+                "resolve the commit, or pre-download the exact snapshot into HF_HOME."
             )
+        if resolved_commit.lower() != requested_revision.lower():
+            raise ValueError(
+                f"Requested commit SHA {requested_revision} does not match resolved commit {resolved_commit} for {model_ident}."
+            )
+    elif requested_revision and not resolved_commit:
+        raise ValueError(
+            f"Revision {requested_revision!r} of {model_ident} could not be resolved to an immutable commit SHA "
+            f"({resolution_error or 'no metadata'}). A mutable tag or branch cannot be recorded as provenance."
+        )
 
     return {
         "identifier": model_ident,
         "provenance_mode": "hf_hub",
         "requested_revision": requested_revision,
-        "resolved_revision": resolved_commit or requested_revision,
+        "resolved_revision": resolved_commit,
+        "resolution_source": resolution_source,
+        "resolution_error": resolution_error,
         "fingerprint": None,
-        "revision_type": "commit_sha" if (resolved_commit or (requested_revision and len(requested_revision) == 40)) else "tag_or_branch",
+        "revision_type": "commit_sha" if resolved_commit else "unresolved",
     }
+
+
+def read_adapter_tensor_shapes(adapter_path: Path) -> Dict[str, Tuple[int, ...]]:
+    """Read LoRA tensor names and shapes from the adapter checkpoint without materializing weights."""
+    shapes: Dict[str, Tuple[int, ...]] = {}
+    safetensor_files = sorted(adapter_path.glob("adapter_model*.safetensors"))
+    if safetensor_files:
+        from safetensors import safe_open
+
+        for shard in safetensor_files:
+            with safe_open(str(shard), framework="pt") as f:
+                for key in f.keys():
+                    shapes[key] = tuple(f.get_slice(key).get_shape())
+        return shapes
+
+    bin_files = sorted(adapter_path.glob("adapter_model*.bin"))
+    for shard in bin_files:
+        state = torch.load(str(shard), map_location="cpu", weights_only=True)
+        for key, tensor in state.items():
+            shapes[key] = tuple(tensor.shape)
+    return shapes
+
+
+def _strip_peft_key_prefix(tensor_key: str) -> Optional[Tuple[str, str]]:
+    """Map a PEFT tensor key to (base module path, 'lora_A'|'lora_B'), or None if not a LoRA weight."""
+    for side in ("lora_A", "lora_B"):
+        marker = f".{side}."
+        if marker not in tensor_key:
+            continue
+        module_path = tensor_key.split(marker)[0]
+        # PEFT wraps the base model, so keys carry a "base_model.model." prefix.
+        while module_path.startswith("base_model.model."):
+            module_path = module_path[len("base_model.model.") :]
+        return module_path, side
+    return None
 
 
 def validate_adapter_architecture(
     base_model: torch.nn.Module,
     peft_config: PeftConfig,
+    adapter_path: Path,
     allow_mismatch: bool = False,
     override_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Validate that adapter target modules exist in the base model architecture."""
+    """Validate adapter targets against base module types and LoRA tensor dimensions.
+
+    Name-existence alone is not evidence of compatibility: a same-named module of
+    a different class or width merges into wrong weights (or fails deep inside
+    merge_and_unload with an opaque error). Every LoRA tensor is therefore matched
+    to a concrete projection module and dimension-checked against it.
+    """
     target_modules = getattr(peft_config, "target_modules", None)
     if isinstance(target_modules, (list, set, tuple)):
         target_list = sorted(list(target_modules))
@@ -312,41 +420,110 @@ def validate_adapter_architecture(
         target_list = []
 
     base_named_modules = dict(base_model.named_modules())
+    base_model_type = getattr(base_model.config, "model_type", type(base_model).__name__)
+
     matched_targets = []
     missing_targets = []
-
     for target in target_list:
-        found = False
-        for mod_name in base_named_modules:
-            if mod_name == target or mod_name.endswith(f".{target}") or target in mod_name.split("."):
-                found = True
-                break
-        if found:
+        if any(
+            mod_name == target or mod_name.endswith(f".{target}") or target in mod_name.split(".")
+            for mod_name in base_named_modules
+        ):
             matched_targets.append(target)
         else:
             missing_targets.append(target)
 
-    base_model_type = getattr(base_model.config, "model_type", getattr(base_model, "__class__", {}).__name__)
+    # Dimension and module-type validation against the adapter's own tensors.
+    adapter_shapes = read_adapter_tensor_shapes(adapter_path)
+    lora_rank = getattr(peft_config, "r", None)
+    shape_errors: List[str] = []
+    type_errors: List[str] = []
+    validated_modules: List[str] = []
 
+    for tensor_key, shape in sorted(adapter_shapes.items()):
+        parsed = _strip_peft_key_prefix(tensor_key)
+        if parsed is None:
+            continue
+        module_path, side = parsed
+        module = base_named_modules.get(module_path)
+        if module is None:
+            shape_errors.append(f"{tensor_key}: base module {module_path!r} not present in loaded base model.")
+            continue
+
+        in_features = getattr(module, "in_features", None)
+        out_features = getattr(module, "out_features", None)
+        if in_features is None or out_features is None:
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.dim() != 2:
+                type_errors.append(
+                    f"{module_path}: {type(module).__name__} is not a linear/projection module "
+                    "and cannot receive a LoRA update."
+                )
+                continue
+            out_features, in_features = int(weight.shape[0]), int(weight.shape[1])
+
+        if len(shape) != 2:
+            shape_errors.append(f"{tensor_key}: expected a 2D LoRA tensor, got shape {shape}.")
+            continue
+
+        if side == "lora_A":
+            expected = (lora_rank, in_features) if lora_rank else (shape[0], in_features)
+        else:
+            expected = (out_features, lora_rank) if lora_rank else (out_features, shape[1])
+
+        if tuple(shape) != tuple(expected):
+            shape_errors.append(
+                f"{tensor_key}: shape {tuple(shape)} does not match base module {module_path} "
+                f"(in_features={in_features}, out_features={out_features}, r={lora_rank}); expected {tuple(expected)}."
+            )
+            continue
+
+        validated_modules.append(module_path)
+
+    expected_base_type = getattr(peft_config, "base_model_class", None) or getattr(
+        peft_config, "task_type", None
+    )
+    problems = []
     if missing_targets:
-        msg = (
-            f"Adapter target modules {missing_targets} were not found in loaded base model ({base_model_type})."
-        )
+        problems.append(f"target modules not found in base model: {missing_targets}")
+    if type_errors:
+        problems.append("incompatible module types: " + "; ".join(type_errors))
+    if shape_errors:
+        problems.append("LoRA/base dimension mismatches: " + "; ".join(shape_errors))
+    if not adapter_shapes:
+        problems.append("no LoRA tensors could be read from the adapter checkpoint")
+
+    if problems:
+        msg = f"Adapter/base architecture validation failed on {base_model_type}: " + " | ".join(problems)
         if not allow_mismatch:
             raise ValueError(f"{msg} Pass --allow-architecture-mismatch and --override-reason to force merge.")
         if not override_reason or not override_reason.strip():
             raise ValueError(f"{msg} --allow-architecture-mismatch requires an explicit --override-reason.")
         logger.warning("%s Proceeding under explicit override: %s", msg, override_reason)
 
+    unique_validated = sorted(set(validated_modules))
     validation_result = {
-        "validated": len(missing_targets) == 0,
+        "validated": not problems,
         "base_model_type": base_model_type,
+        "adapter_expected_type": str(expected_base_type) if expected_base_type else None,
+        "lora_rank": lora_rank,
         "target_modules_requested": target_list,
         "target_modules_matched": matched_targets,
         "target_modules_missing": missing_targets,
-        "override_reason": override_reason if missing_targets else None,
+        "lora_tensors_checked": len(adapter_shapes),
+        "modules_shape_validated": len(unique_validated),
+        "modules_shape_validated_sample": unique_validated[:16],
+        "module_type_errors": type_errors,
+        "shape_errors": shape_errors,
+        "override_reason": override_reason if problems else None,
     }
-    logger.info("Architecture validation passed: matched target modules %s on %s", matched_targets, base_model_type)
+    logger.info(
+        "Architecture validation on %s: %d LoRA tensors checked, %d modules shape-validated, targets %s",
+        base_model_type,
+        len(adapter_shapes),
+        len(unique_validated),
+        matched_targets,
+    )
     return validation_result
 
 
@@ -354,6 +531,7 @@ def build_deterministic_generation_config(
     model_config: Any,
     processor: Any,
     base_model_id: str,
+    base_revision: Optional[str] = None,
 ) -> GenerationConfig:
     """Construct an explicit, warning-free generation configuration with verified stop IDs."""
     tokenizer = processor.tokenizer
@@ -368,7 +546,7 @@ def build_deterministic_generation_config(
 
     # Union all required stop tokens: EOS (1) and chat turn end (106)
     resolved_stop_ids = resolve_stop_token_ids(
-        tokenizer, gen_config, base_model_id=base_model_id
+        tokenizer, gen_config, base_model_id=base_model_id, base_revision=base_revision
     )
     gen_config.eos_token_id = resolved_stop_ids
 
@@ -395,8 +573,6 @@ def merge_and_export(
     override_reason: Optional[str] = None,
     trusted_anchor_dir: Optional[str] = None,
     manifest_signature_file: Optional[str] = None,
-    current_symlink: Optional[str] = None,
-    previous_symlink: Optional[str] = None,
     command_args: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Execute the merge, validation, detached integrity anchoring, and verified export."""
@@ -441,7 +617,9 @@ def merge_and_export(
     tokenizer = processor.tokenizer
 
     # Verify stop tokens at extraction time
-    stop_token_ids = resolve_stop_token_ids(tokenizer, base_model_id=base_model_id)
+    stop_token_ids = resolve_stop_token_ids(
+        tokenizer, base_model_id=base_model_id, base_revision=base_revision
+    )
     stop_tokens = [tokenizer.convert_ids_to_tokens(tid) for tid in stop_token_ids]
     logger.info("Resolved stop token IDs: %s (tokens: %s)", stop_token_ids, stop_tokens)
 
@@ -478,6 +656,7 @@ def merge_and_export(
     arch_validation = validate_adapter_architecture(
         base_model=base_model,
         peft_config=peft_config,
+        adapter_path=adapter_path,
         allow_mismatch=allow_architecture_mismatch,
         override_reason=override_reason,
     )
@@ -503,6 +682,7 @@ def merge_and_export(
         model_config=merged_model.config,
         processor=processor,
         base_model_id=base_model_id,
+        base_revision=base_revision,
     )
 
     # 10. Write to atomic temporary directory
@@ -624,24 +804,16 @@ def merge_and_export(
                 backup_dir.rename(out_path)
             raise
 
-        # Update symlinks if requested
-        if current_symlink:
-            curr_p = Path(current_symlink)
-            prev_target = None
-            if curr_p.is_symlink() or curr_p.exists():
-                try:
-                    prev_target = curr_p.resolve()
-                except Exception:
-                    pass
-                curr_p.unlink(missing_ok=True)
-            curr_p.symlink_to(out_path, target_is_directory=True)
-            logger.info("Updated 'current' symlink %s -> %s", curr_p, out_path)
-
-            if previous_symlink and prev_target and prev_target.exists():
-                prev_p = Path(previous_symlink)
-                prev_p.unlink(missing_ok=True)
-                prev_p.symlink_to(prev_target, target_is_directory=True)
-                logger.info("Updated 'previous' symlink %s -> %s for rollback", prev_p, prev_target)
+        # Activation is deliberately NOT performed here. Serving pointers are switched
+        # only by scripts/promote_model_release.py, which enforces the external trust
+        # anchor, release attestation, and atomic pointer replacement.
+        logger.info(
+            "Release is immutable and NOT active. Activate with:\n"
+            "  python scripts/promote_model_release.py promote --release-dir %s "
+            "--expected-manifest-sha256 %s --attestation-file <release-attestation.json>",
+            out_path,
+            manifest_sha256,
+        )
 
     except Exception:
         logger.exception("Merge export failed. Cleaning up temporary directory %s...", tmp_dir)
@@ -672,8 +844,6 @@ def main() -> int:
             override_reason=args.override_reason,
             trusted_anchor_dir=args.trusted_anchor_dir,
             manifest_signature_file=args.manifest_signature_file,
-            current_symlink=args.current_symlink,
-            previous_symlink=args.previous_symlink,
             command_args=command_args,
         )
         return 0

@@ -21,6 +21,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import Settings, get_settings
 from limits import ConcurrencyManager, RequestValidator, TokenEstimator
+from manifest_verification import (
+    AUTHENTICITY_TRUSTED,
+    REQUIRED_STOP_TOKEN_IDS,
+    ManifestVerificationResult,
+    verify_model_release,
+)
 from metrics import MetricsCollector, get_metrics
 from prompting import (
     CHAT_TURN_END_TOKEN,
@@ -46,16 +52,15 @@ logging.basicConfig(
 logger = logging.getLogger("gateway.main")
 
 
-import hashlib
-from pathlib import Path
-
-class _BodyTooLargeException(Exception):
-    def __init__(self, detail: str):
-        self.detail = detail
-
-
 class BodySizeLimitMiddleware:
-    """Rejects oversized requests before/during body reading without re-invoking broken receive callable."""
+    """Rejects oversized requests before the application ever sees them.
+
+    The body is pre-buffered up to the limit and then replayed through a receive
+    wrapper. Buffering first is what makes the 413 safe: the decision is made before
+    `self.app()` runs, so there is never a case where downstream has already sent
+    `http.response.start` and a second response would be emitted on top of it. A
+    `response_started` guard still backstops that invariant.
+    """
 
     def __init__(self, app, max_body_bytes: int):
         self.app = app
@@ -71,20 +76,6 @@ class BodySizeLimitMiddleware:
         if cl_header is not None:
             try:
                 length = int(cl_header.decode("latin1"))
-                if length < 0:
-                    await self._send_json_response(
-                        send,
-                        status.HTTP_400_BAD_REQUEST,
-                        {"detail": "Invalid negative Content-Length header."},
-                    )
-                    return
-                if length > self.max_body_bytes:
-                    await self._send_json_response(
-                        send,
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        {"detail": f"Request body ({length} bytes) exceeds limit ({self.max_body_bytes} bytes)."},
-                    )
-                    return
             except ValueError:
                 await self._send_json_response(
                     send,
@@ -92,29 +83,91 @@ class BodySizeLimitMiddleware:
                     {"detail": "Invalid non-integer Content-Length header."},
                 )
                 return
+            if length < 0:
+                await self._send_json_response(
+                    send,
+                    status.HTTP_400_BAD_REQUEST,
+                    {"detail": "Invalid negative Content-Length header."},
+                )
+                return
+            if length > self.max_body_bytes:
+                await self._drain(receive)
+                await self._send_json_response(
+                    send,
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    {"detail": f"Request body ({length} bytes) exceeds limit ({self.max_body_bytes} bytes)."},
+                )
+                return
 
+        # Pre-buffer the body, stopping as soon as the limit is exceeded.
+        buffered: List[bytes] = []
         total_received = 0
-
-        async def limited_receive():
-            nonlocal total_received
+        disconnected = False
+        while True:
             message = await receive()
-            if message["type"] == "http.request":
-                body = message.get("body", b"")
-                total_received += len(body)
-                if total_received > self.max_body_bytes:
-                    raise _BodyTooLargeException(
-                        f"Request body exceeded limit of {self.max_body_bytes} bytes during stream transfer."
-                    )
-            return message
+            if message["type"] == "http.disconnect":
+                disconnected = True
+                break
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            total_received += len(chunk)
+            if total_received > self.max_body_bytes:
+                await self._drain(receive)
+                await self._send_json_response(
+                    send,
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    {"detail": f"Request body exceeded limit of {self.max_body_bytes} bytes during stream transfer."},
+                )
+                return
+            buffered.append(chunk)
+            if not message.get("more_body", False):
+                break
 
-        try:
-            await self.app(scope, limited_receive, send)
-        except _BodyTooLargeException as exc:
-            await self._send_json_response(
-                send,
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                {"detail": exc.detail},
-            )
+        if disconnected:
+            return
+
+        body = b"".join(buffered)
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            # Body is exhausted; block on the real transport for disconnects.
+            return await receive()
+
+        response_started = False
+
+        async def guarded_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        await self.app(scope, replay_receive, guarded_send)
+
+    async def _drain(self, receive) -> None:
+        """Consume the remainder of an oversized request so the connection stays usable.
+
+        Bounded on purpose: a client that keeps streaming forever must not be able to
+        hold a worker task open, so draining stops after one further body-limit worth
+        of bytes and lets the server tear the connection down.
+        """
+        drained = 0
+        while drained <= self.max_body_bytes:
+            try:
+                message = await receive()
+            except Exception:
+                return
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            drained += len(message.get("body", b""))
+            if not message.get("more_body", False):
+                return
 
     async def _send_json_response(self, send, status_code: int, content: dict):
         body_bytes = json.dumps(content).encode("utf-8")
@@ -131,142 +184,6 @@ class BodySizeLimitMiddleware:
             "body": body_bytes,
             "more_body": False,
         })
-
-
-class ManifestState:
-    """Manages loaded merge manifest provenance, checksum verification, and authenticity."""
-
-    def __init__(
-        self,
-        is_loaded: bool = False,
-        is_verified: bool = False,
-        authenticity_status: str = "unverified",
-        manifest_sha256: Optional[str] = None,
-        data: Optional[dict] = None,
-        error: Optional[str] = None,
-    ):
-        self.is_loaded = is_loaded
-        self.is_verified = is_verified
-        self.authenticity_status = authenticity_status
-        self.manifest_sha256 = manifest_sha256
-        self.data = data or {}
-        self.error = error
-
-    @classmethod
-    def load_and_verify(cls, settings: Settings) -> ManifestState:
-        model_dir_str = settings.model_dir
-        if not model_dir_str:
-            return cls(error="No model_dir configured.")
-
-        model_dir = Path(model_dir_str)
-        manifest_file = model_dir / "merge_manifest.json"
-        if not manifest_file.is_file():
-            return cls(error=f"merge_manifest.json not found in {model_dir}")
-
-        try:
-            content_bytes = manifest_file.read_bytes()
-            manifest_sha256 = hashlib.sha256(content_bytes).hexdigest()
-            data = json.loads(content_bytes.decode("utf-8"))
-        except Exception as e:
-            return cls(error=f"Failed to read/parse merge_manifest.json: {e}")
-
-        authenticity = "unverified"
-        is_verified = False
-
-        if settings.trusted_manifest_sha256:
-            expected_hash = settings.trusted_manifest_sha256.strip().lower()
-            if manifest_sha256.lower() == expected_hash:
-                authenticity = "trusted_external_anchor"
-                is_verified = True
-                logger.info("Manifest verified against operator trusted SHA256 anchor (%s).", expected_hash)
-            else:
-                msg = f"Manifest SHA256 mismatch with TG_TRUSTED_MANIFEST_SHA256: computed {manifest_sha256}, expected {expected_hash}"
-                logger.error(msg)
-                return cls(
-                    is_loaded=True,
-                    is_verified=False,
-                    authenticity_status="unverified",
-                    manifest_sha256=manifest_sha256,
-                    data=data,
-                    error=msg,
-                )
-        elif settings.trusted_anchor_file:
-            anchor_p = Path(settings.trusted_anchor_file)
-            if not anchor_p.is_file():
-                msg = f"Configured TG_TRUSTED_ANCHOR_FILE not found: {anchor_p}"
-                logger.error(msg)
-                return cls(
-                    is_loaded=True,
-                    is_verified=False,
-                    authenticity_status="unverified",
-                    manifest_sha256=manifest_sha256,
-                    data=data,
-                    error=msg,
-                )
-            try:
-                anchor_text = anchor_p.read_text(encoding="utf-8").strip()
-                expected_hash = anchor_text.split()[0].strip().lower()
-                if manifest_sha256.lower() == expected_hash:
-                    authenticity = "trusted_external_anchor"
-                    is_verified = True
-                    logger.info("Manifest verified against external trusted anchor file %s (%s).", anchor_p, expected_hash)
-                else:
-                    msg = f"Manifest SHA256 mismatch with trusted anchor file: computed {manifest_sha256}, expected {expected_hash}"
-                    logger.error(msg)
-                    return cls(
-                        is_loaded=True,
-                        is_verified=False,
-                        authenticity_status="unverified",
-                        manifest_sha256=manifest_sha256,
-                        data=data,
-                        error=msg,
-                    )
-            except Exception as e:
-                msg = f"Failed to read trusted anchor file {anchor_p}: {e}"
-                logger.error(msg)
-                return cls(
-                    is_loaded=True,
-                    is_verified=False,
-                    authenticity_status="unverified",
-                    manifest_sha256=manifest_sha256,
-                    data=data,
-                    error=msg,
-                )
-        else:
-            local_anchor = model_dir / "merge_manifest.sha256"
-            if local_anchor.is_file():
-                try:
-                    local_text = local_anchor.read_text(encoding="utf-8").strip()
-                    expected_local_hash = local_text.split()[0].strip().lower()
-                    if manifest_sha256.lower() == expected_local_hash:
-                        authenticity = "colocated_checksum_only"
-                        is_verified = True
-                        logger.info("Manifest matches co-located merge_manifest.sha256 integrity anchor.")
-                    else:
-                        msg = f"Co-located merge_manifest.sha256 mismatch: computed {manifest_sha256}, expected {expected_local_hash}"
-                        logger.error(msg)
-                        return cls(
-                            is_loaded=True,
-                            is_verified=False,
-                            authenticity_status="unverified",
-                            manifest_sha256=manifest_sha256,
-                            data=data,
-                            error=msg,
-                        )
-                except Exception as e:
-                    logger.warning("Could not read local merge_manifest.sha256: %s", e)
-            else:
-                logger.warning("No integrity anchor found for merge_manifest.json.")
-
-        return cls(
-            is_loaded=True,
-            is_verified=is_verified,
-            authenticity_status=authenticity,
-            manifest_sha256=manifest_sha256,
-            data=data,
-            error=None,
-        )
-
 
 
 class CanonicalPromptRenderer:
@@ -327,19 +244,37 @@ async def lifespan(app: FastAPI):
             f"must equal TG_VLLM_MAX_MODEL_LEN ({settings.vllm_max_model_len}) for single authoritative context alignment."
         )
 
-    # Load and verify merge manifest
-    manifest_state = ManifestState.load_and_verify(settings)
-    if settings.require_verified_manifest:
-        if not manifest_state.is_verified:
-            raise RuntimeError(
-                f"TG_REQUIRE_VERIFIED_MANIFEST=true, but manifest verification failed: {manifest_state.error}"
-            )
-        if manifest_state.authenticity_status == "unverified":
-            raise RuntimeError(
-                "TG_REQUIRE_VERIFIED_MANIFEST=true, but manifest authenticity cannot be verified."
-            )
+    # Authenticate the manifest and verify the mounted payload it describes.
+    manifest_state = verify_model_release(
+        settings.model_dir,
+        trusted_manifest_sha256=settings.trusted_manifest_sha256,
+        trusted_anchor_file=settings.trusted_anchor_file,
+        verify_payload=settings.verify_model_payload,
+    )
 
-    # Derive runtime settings from verified manifest if available
+    if settings.require_verified_manifest:
+        # Authenticity means an external anchor, full stop. A co-located checksum
+        # travels with the artifact an attacker would have rewritten, so accepting it
+        # here would make the whole required-verification mode decorative.
+        if manifest_state.authenticity_status != AUTHENTICITY_TRUSTED:
+            raise RuntimeError(
+                "TG_REQUIRE_VERIFIED_MANIFEST=true requires authenticity_status "
+                f"'{AUTHENTICITY_TRUSTED}', but this release resolved to "
+                f"'{manifest_state.authenticity_status}'. Configure TG_TRUSTED_MANIFEST_SHA256 or "
+                f"TG_TRUSTED_ANCHOR_FILE from a mount outside the model release. "
+                f"Detail: {manifest_state.error}"
+            )
+        if not manifest_state.payload_verified:
+            raise RuntimeError(
+                "TG_REQUIRE_VERIFIED_MANIFEST=true, but the mounted model payload does not match the "
+                f"authenticated manifest: {manifest_state.error}"
+            )
+    elif settings.require_verified_payload and not manifest_state.payload_verified:
+        raise RuntimeError(
+            f"TG_REQUIRE_VERIFIED_PAYLOAD=true, but payload verification failed: {manifest_state.error}"
+        )
+
+    # Provenance identity is descriptive and may come from any loaded manifest.
     if manifest_state.is_loaded and manifest_state.data:
         m = manifest_state.data
         if m.get("release_id"):
@@ -348,10 +283,37 @@ async def lifespan(app: FastAPI):
             settings.base_model_id = str(m["base_model"])
         if m.get("adapter"):
             settings.source_adapter_path = str(m["adapter"])
-        if m.get("stop_token_ids"):
-            settings.stop_token_ids = list(m["stop_token_ids"])
-        if m.get("stop_tokens"):
-            settings.stop_tokens = list(m["stop_tokens"])
+
+    # Stop tokens are security-critical: losing <end_of_turn> reintroduces runaway
+    # decoding, and a spurious stop truncates translations. They therefore come from
+    # the mounted generation config/tokenizer that the engine itself loads, and a
+    # manifest may only confirm them — never define them.
+    runtime_stop_ids = manifest_state.runtime_stop_token_ids
+    if runtime_stop_ids:
+        missing_required = REQUIRED_STOP_TOKEN_IDS - set(runtime_stop_ids)
+        if missing_required:
+            raise RuntimeError(
+                f"Mounted generation config is missing required stop token IDs {sorted(missing_required)}. "
+                "Refusing to serve: the decoder would not stop at the trained turn boundary."
+            )
+        settings.stop_token_ids = list(runtime_stop_ids)
+        if manifest_state.runtime_stop_tokens:
+            settings.stop_tokens = list(manifest_state.runtime_stop_tokens)
+
+        manifest_stop_ids = manifest_state.data.get("stop_token_ids") if manifest_state.data else None
+        if manifest_stop_ids and sorted(manifest_stop_ids) != sorted(runtime_stop_ids):
+            message = (
+                f"Manifest stop_token_ids {sorted(manifest_stop_ids)} disagree with the mounted "
+                f"generation config {sorted(runtime_stop_ids)}."
+            )
+            if settings.require_verified_manifest:
+                raise RuntimeError(message + " Refusing to serve a release whose provenance and payload disagree.")
+            logger.warning("%s Serving the mounted contract.", message)
+    elif settings.require_verified_manifest or settings.require_exact_tokenizer:
+        raise RuntimeError(
+            "Could not resolve stop token IDs from the mounted model directory: "
+            f"{manifest_state.error or 'generation_config.json unavailable'}"
+        )
 
     # Load processor/tokenizer for exact rendering & admission token counting
     processor_or_tok = None
@@ -553,9 +515,12 @@ async def ready_check(
     is_healthy = await vllm_client.check_health()
     estimator = request.app.state.estimator
     renderer = request.app.state.renderer
-    manifest_state: ManifestState = getattr(request.app.state, "manifest_state", ManifestState())
+    manifest_state: ManifestVerificationResult = getattr(
+        request.app.state, "manifest_state", ManifestVerificationResult()
+    )
 
-    if settings.require_verified_manifest and not manifest_state.is_verified:
+    trust_ok = manifest_state.authenticity_status == AUTHENTICITY_TRUSTED and manifest_state.payload_verified
+    if settings.require_verified_manifest and not trust_ok:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
@@ -564,9 +529,26 @@ async def ready_check(
                 "model_name": settings.vllm_model_name,
                 "estimator_mode": estimator.mode,
                 "processor_mode": renderer.mode,
-                "manifest_verified": False,
+                "manifest_verified": manifest_state.authenticity_verified,
+                "payload_verified": manifest_state.payload_verified,
                 "authenticity_status": manifest_state.authenticity_status,
-                "detail": f"Manifest verification failed: {manifest_state.error}",
+                "detail": f"Release trust verification failed: {manifest_state.error}",
+            },
+        )
+
+    if settings.require_verified_payload and not manifest_state.payload_verified:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "translator": "FAIL",
+                "ready": False,
+                "model_name": settings.vllm_model_name,
+                "estimator_mode": estimator.mode,
+                "processor_mode": renderer.mode,
+                "manifest_verified": manifest_state.authenticity_verified,
+                "payload_verified": False,
+                "authenticity_status": manifest_state.authenticity_status,
+                "detail": f"Mounted payload verification failed: {manifest_state.error}",
             },
         )
 
@@ -577,7 +559,10 @@ async def ready_check(
             model_name=settings.vllm_model_name,
             estimator_mode=estimator.mode,
             processor_mode=renderer.mode,
-            manifest_verified=manifest_state.is_verified,
+            manifest_verified=manifest_state.authenticity_verified,
+            manifest_integrity_verified=manifest_state.integrity_verified,
+            payload_verified=manifest_state.payload_verified,
+            payload_verified_at=manifest_state.payload_verified_at,
             authenticity_status=manifest_state.authenticity_status,
         )
     return JSONResponse(
@@ -588,7 +573,8 @@ async def ready_check(
             "model_name": settings.vllm_model_name,
             "estimator_mode": estimator.mode,
             "processor_mode": renderer.mode,
-            "manifest_verified": manifest_state.is_verified,
+            "manifest_verified": manifest_state.authenticity_verified,
+            "payload_verified": manifest_state.payload_verified,
             "authenticity_status": manifest_state.authenticity_status,
             "detail": "Backend vLLM server is unreachable or exact model is not loaded.",
         },
@@ -601,16 +587,25 @@ async def model_info(
     request: Request,
     settings: Settings = Depends(get_settings),
 ):
-    """Reports provenance, exact context limits, runtime configuration, and verified manifest."""
+    """Reports curated public provenance, exact context limits, and release trust state.
+
+    Detailed provenance (command arguments, local adapter paths, package versions,
+    file inventory) is operator data: it maps the internal filesystem and build host,
+    so it is withheld unless TG_EXPOSE_FULL_MANIFEST is explicitly enabled on a
+    private network.
+    """
     estimator = request.app.state.estimator
     renderer = request.app.state.renderer
-    manifest_state: ManifestState = getattr(request.app.state, "manifest_state", ManifestState())
+    manifest_state: ManifestVerificationResult = getattr(
+        request.app.state, "manifest_state", ManifestVerificationResult()
+    )
     m_data = manifest_state.data or {}
+    expose_full = settings.expose_full_manifest
 
     return ModelInfoResponse(
         model_release_id=settings.model_release_id,
         base_model_id=settings.base_model_id,
-        source_adapter_path=settings.source_adapter_path,
+        source_adapter_path=settings.source_adapter_path if expose_full else None,
         is_merged_checkpoint=True,
         default_system=settings.default_system,
         loaded_systems=[settings.default_system],
@@ -621,20 +616,23 @@ async def model_info(
         max_new_tokens=settings.max_new_tokens,
         max_total_context_tokens=settings.max_total_context_tokens,
         vllm_model_name=settings.vllm_model_name,
-        vllm_base_url=settings.vllm_base_url,
+        vllm_base_url=settings.vllm_base_url if expose_full else None,
         estimator_mode=estimator.mode,
         processor_mode=renderer.mode,
         prompt_contract_version=m_data.get("prompt_contract_version", "2026-08-10"),
         routing_policy_version="v1",
-        manifest_verified=manifest_state.is_verified,
+        manifest_verified=manifest_state.authenticity_verified,
+        manifest_integrity_verified=manifest_state.integrity_verified,
+        payload_verified=manifest_state.payload_verified,
+        payload_verified_at=manifest_state.payload_verified_at,
         manifest_sha256=manifest_state.manifest_sha256,
         authenticity_status=manifest_state.authenticity_status,
         resolved_base_commit=m_data.get("resolved_base_commit") or (m_data.get("base_model_info", {}).get("resolved_revision")),
         resolved_adapter_commit=m_data.get("resolved_adapter_commit") or (m_data.get("adapter_info", {}).get("resolved_revision")),
-        base_fingerprint=m_data.get("base_fingerprint"),
-        adapter_fingerprint=m_data.get("adapter_fingerprint"),
-        architecture_fingerprint=m_data.get("architecture_fingerprint"),
-        manifest_metadata=m_data if manifest_state.is_loaded else None,
+        base_fingerprint=m_data.get("base_fingerprint") if expose_full else None,
+        adapter_fingerprint=m_data.get("adapter_fingerprint") if expose_full else None,
+        architecture_fingerprint=m_data.get("architecture_fingerprint") if expose_full else None,
+        manifest_metadata=m_data if (expose_full and manifest_state.is_loaded) else None,
     )
 
 

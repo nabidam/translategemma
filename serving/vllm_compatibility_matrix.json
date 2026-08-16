@@ -1,6 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "evidence_policy": {
+    "note": "An entry may be marked APPROVED_FOR_PRODUCTION only after the checks below were executed ON THE SERVING HOST and their raw output archived beside this file. scripts/verify_deployment_compatibility.py re-hashes every referenced artifact and rejects entries whose evidence is missing or altered.",
+    "required_evidence_fields": [
+      "verified_by",
+      "verified_date",
+      "host_report",
+      "host_report_sha256",
+      "image_inspect_report",
+      "image_inspect_report_sha256",
+      "smoke_report",
+      "smoke_report_sha256",
+      "model_manifest_sha256"
+    ],
+    "collection_commands": [
+      "docker image inspect ${VLLM_IMAGE} > serving/evidence/image_inspect.json",
+      "nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader",
+      "python scripts/verify_model_export.py --model-dir /opt/models/translategemma/current --expected-manifest-sha256 <anchor>",
+      "curl -s localhost:8080/model-info and a stop-token smoke translation captured into serving/evidence/smoke_report.json"
+    ]
+  },
   "approved_serving_configurations": [
     {
       "image_repository": "vllm/vllm-openai",
@@ -19,15 +39,23 @@
       "runtime_flags": {
         "dtype": "bfloat16",
         "max_model_len": 4096,
+        "tensor_parallel_size": 1,
         "enforce_eager": true,
         "disable_log_requests": true
       },
       "verification_evidence": {
-        "status": "APPROVED_FOR_PRODUCTION",
-        "verified_date": "2026-08-16",
-        "verified_stop_token_ids": [1, 106],
-        "verified_stop_tokens": ["<eos>", "<end_of_turn>"],
-        "token_parity_verified": true
+        "status": "UNVERIFIED",
+        "detail": "No serving-host verification has been executed for this entry. Stop-token and token-parity behavior are claims until the evidence artifacts below exist and hash-match.",
+        "verified_by": null,
+        "verified_date": null,
+        "host_report": null,
+        "host_report_sha256": null,
+        "image_inspect_report": null,
+        "image_inspect_report_sha256": null,
+        "smoke_report": null,
+        "smoke_report_sha256": null,
+        "model_manifest_sha256": null,
+        "gateway_image_digest": null
       }
     }
   ]

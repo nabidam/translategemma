@@ -57,6 +57,9 @@ services:
     build:
       context: ../gateway
       dockerfile: Dockerfile
+      args:
+        # Digest-pinned base image is mandatory; the build fails when it is unset.
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?set PYTHON_BASE_IMAGE to python:3.11-slim@sha256:<digest> (see serving/COMPATIBILITY.md)}
     container_name: translategemma-gateway
     restart: unless-stopped
     depends_on:
@@ -65,6 +68,9 @@ services:
     volumes:
       # Mount model artifact read-only for exact tokenizer and processor loading
       - ${MODEL_DIR:-/opt/models/translategemma/current}:/models/model:ro
+      # Trust anchors live OUTSIDE the model release on their own read-only mount, so
+      # an attacker who can rewrite the release cannot rewrite the hash that authorizes it.
+      - ${TRUSTED_ANCHOR_DIR:-/opt/models/translategemma/anchors}:/trust:ro
     environment:
       - TG_VLLM_BASE_URL=http://vllm:8000/v1
       - TG_VLLM_MODEL_NAME=${SERVED_MODEL_NAME:-translategemma}
@@ -73,6 +79,17 @@ services:
       - TG_MODEL_DIR=/models/model
       - TG_TOKENIZER_PATH=/models/model
       - TG_REQUIRE_EXACT_TOKENIZER=${REQUIRE_EXACT_TOKENIZER:-true}
+      # Fail-closed release trust. Both default to true: startup and readiness fail unless the
+      # manifest matches an external anchor AND the mounted payload matches that manifest.
+      - TG_REQUIRE_VERIFIED_MANIFEST=${REQUIRE_VERIFIED_MANIFEST:-true}
+      - TG_REQUIRE_VERIFIED_PAYLOAD=${REQUIRE_VERIFIED_PAYLOAD:-true}
+      - TG_VERIFY_MODEL_PAYLOAD=true
+      # Supply exactly one: an anchor file on the read-only /trust mount, or an operator digest
+      # injected from protected deployment configuration.
+      - TG_TRUSTED_ANCHOR_FILE=${TRUSTED_ANCHOR_FILE:-/trust/current.sha256}
+      - TG_TRUSTED_MANIFEST_SHA256=${TRUSTED_MANIFEST_SHA256:-}
+      # Detailed provenance (command args, host paths) stays private by default.
+      - TG_EXPOSE_FULL_MANIFEST=${EXPOSE_FULL_MANIFEST:-false}
       - TG_MODEL_RELEASE_ID=${MODEL_RELEASE_ID:-tg-12b-merged}
       - TG_MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-64}
       - TG_MAX_BULK_CONCURRENT_REQUESTS=${MAX_BULK_CONCURRENT_REQUESTS:-16}

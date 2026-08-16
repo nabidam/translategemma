@@ -16,9 +16,18 @@ class Settings(BaseSettings):
     model_dir: Optional[str] = "/models/model"
     tokenizer_path: Optional[str] = "/models/model"
     require_exact_tokenizer: bool = False
+    # Fail-closed production trust chain. require_verified_manifest demands an EXTERNAL
+    # anchor (TG_TRUSTED_MANIFEST_SHA256 or TG_TRUSTED_ANCHOR_FILE); a co-located
+    # merge_manifest.sha256 proves integrity only and can never satisfy it.
     require_verified_manifest: bool = False
     trusted_manifest_sha256: Optional[str] = None
     trusted_anchor_file: Optional[str] = None
+    # Hash mounted config/tokenizer/weight shards against the authenticated manifest.
+    verify_model_payload: bool = True
+    require_verified_payload: bool = False
+    # Detailed provenance (command arguments, local paths, package versions) is
+    # operator data, not public API surface.
+    expose_full_manifest: bool = False
 
     # Model identity & provenance
     model_release_id: str = "translategemma-12b-it-merged"
