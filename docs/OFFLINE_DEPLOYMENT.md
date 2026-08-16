@@ -561,6 +561,71 @@ docker compose run --rm -d --name tg-train trainer \
 docker logs -f tg-train
 ```
 
+### 5.5 Merge the adapter into the base model (for vLLM)
+
+`scripts/merge_lora_adapter.py` folds a trained LoRA adapter into the base
+weights and writes an ordinary Hugging Face model directory. vLLM can also serve
+the adapter unmerged with `--enable-lora`, so this is a choice, not a
+requirement; merging removes the per-request LoRA path and the `--max-lora-rank`
+plumbing, at the cost of one full-size checkpoint on disk per adapter.
+
+It runs in the training image, needs no GPU, and takes two positional arguments —
+the adapter directory and the output directory:
+
+```bash
+docker compose run --rm trainer python scripts/merge_lora_adapter.py \
+    translategemma-farsi-science/sft_final \
+    merged/translategemma-farsi-sft
+```
+
+Write the output inside the project tree (or another bind mount) so it survives
+the container. Budget the full base-model size for it: ~24 GB for
+`translategemma-12b-it` in bf16, on top of the staged copy under `/models`.
+
+The base model id comes from the adapter's `adapter_config.json`; pass
+`--base-model` to override it. Everything else has a working default:
+
+| Flag | Default | When to change it |
+| --- | --- | --- |
+| `--device` | `cpu` | `cuda:0` when host RAM is tighter than VRAM; `auto` only when no single GPU can hold the model. |
+| `--dtype` | `bfloat16` | Rarely. Must be a full-precision dtype — see below. |
+| `--attn-implementation` | `eager` | Rarely. Irrelevant to the merge; the default avoids needing a FlashAttention build on the merging host. |
+| `--max-shard-size` | `5GB` | To match a serving host's preferred shard size. |
+| `--overwrite` | off | To rewrite a non-empty output directory. |
+
+**Run it as a single process, never under `accelerate launch`.** Merging is an
+elementwise weight update, so extra ranks would each repeat the whole merge and
+race to write the same directory. More GPUs do not make it faster; `--device
+auto` exists only to spread an oversized model across cards, which a 12B model
+on an H100/H200 does not need.
+
+**The merge is always done in full precision, never against 4-bit weights**, so
+a run trained with `model.use_4bit: true` still merges into a bf16 base here.
+Merging into a quantised base would dequantise, add, and re-quantise, losing part
+of the adapter delta. Quantise the merged checkpoint afterwards if the serving
+host needs it.
+
+Besides the weights, the output directory receives two things vLLM depends on:
+
+- the **processor** — tokenizer, chat template and preprocessor config — because
+  vLLM loads the tokenizer from the model directory and does not know the base
+  repository it came from;
+- a **`generation_config.json`** built by
+  `model_loading.make_deterministic_generation_config`, whose stop set includes
+  `<end_of_turn>` (106). `config.json` alone publishes only `<eos>` (1), and a
+  decoder missing 106 does not stop a fine-tuned model at all
+  (`docs/2026-08-10_adapter_degeneration_analysis.md`).
+
+It also copies the adapter's `adapter_config.json` and `run_metadata.json` under
+an `adapter_` prefix and writes `merge_metadata.json` recording the source
+adapter, base model, dtype and LoRA hyperparameters — keep those with the
+checkpoint, since a merged model is otherwise indistinguishable from the base.
+
+Sanity-check the result before shipping it. The merged directory is loadable by
+the same evaluation path as the base model, so a quick benchmark candidate with
+no `adapter` set is the cheapest end-to-end proof that the deltas actually
+landed.
+
 ---
 
 ## 6. Known issues to expect
@@ -926,6 +991,41 @@ route above, never through `uv sync --extra speed`.
 
 The vLLM command in `README.md` is not part of this image — `vllm` is not in
 `pyproject.toml`. Serving offline needs its own image, staged the same way.
+
+Two model layouts work there. The unmerged one is what `README.md` shows: the
+staged base repository plus `--enable-lora --lora-modules <alias>=<adapter dir>`,
+which keeps adapters swappable and costs one LoRA application per request. The
+merged one comes from §5.5 and is a self-contained directory that needs no LoRA
+flags:
+
+```bash
+vllm serve /models/merged/translategemma-farsi-sft \
+    --served-model-name farsi-science \
+    --max-model-len 2048 \
+    --limit-mm-per-prompt '{"image": 0}'
+```
+
+The merged directory needs no conversion step, but three things about this model
+are worth setting deliberately:
+
+- **Leave the generation config alone.** vLLM reads `generation_config.json` from
+  the model directory by default, which is how `<end_of_turn>` (106) reaches the
+  stop set. Passing `--generation-config vllm` discards it and the model will not
+  stop generating. If a client bypasses the defaults, have it send
+  `stop_token_ids: [1, 106]` explicitly.
+- **It is still a multimodal Gemma 3 checkpoint.** LoRA excluded `vision_tower`
+  (§`README.md`), and merging leaves the image encoder in place, so the merged
+  model carries it too. This pipeline sends text only, so
+  `--limit-mm-per-prompt '{"image": 0}'` avoids reserving memory for image
+  inputs that never arrive.
+- **Prompts must keep the trained format.** The `<<<source>>>…<<<target>>>…
+  <<<text>>>…` string and the chat template are what the adapter was trained on;
+  the template travels with the merged directory, so use the chat completions
+  endpoint rather than hand-assembling prompts.
+
+`--max-model-len` is worth pinning to the trained sequence length
+(`training.max_length`, 2048). The base config advertises a much longer context,
+and vLLM sizes its KV cache from that.
 
 ### 6.9 Transformers version boundary
 
