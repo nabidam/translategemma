@@ -1,32 +1,24 @@
-# Serving dependencies for the TranslateGemma API.
+# Serving dependencies for the TranslateGemma API gateway.
 #
-# Standalone on purpose: api/ is deployed without the rest of the repository, and
-# this installs only what inference needs -- not the training/evaluation stack
-# (trl, datasets, unbabel-comet, liger-kernel, MetricX).
+# Standalone on purpose: api/ is deployed without the rest of the repository.
+# The weights are served by vLLM in its own container, so nothing here pulls
+# torch, peft or bitsandbytes -- this process renders prompts and forwards
+# them over HTTP, and the image is a few hundred MB rather than several GB.
 #
-# The model-side versions are the ones in the project's uv.lock, so the served
-# model behaves like the one the evaluation harness scored. Update them together.
-
-# Same CUDA wheel line as the trainer image. Requires
-# UV_INDEX_STRATEGY=unsafe-best-match (set in the Dockerfile), or pip, so that
-# `torch` resolves against this index rather than stopping at PyPI.
---extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.8.0
+# transformers/tokenizers are still exact-pinned to the project's uv.lock
+# versions: they produce the prompt token ids vLLM generates from, so a
+# tokenizer that drifts from the evaluated one changes the served translation.
 
 transformers==4.57.6
 tokenizers==0.22.2
-peft==0.20.0
 huggingface-hub==0.36.2
-safetensors==0.8.0
 sentencepiece==0.2.2
+# Imported by the multimodal processor class TranslateGemma's tokenizer ships
+# inside, even though no image ever reaches it.
 pillow==12.3.0
 # transformers 4.57 is not compatible with the NumPy 2 ABI across all of its
 # optional paths; the project lock stays on the 1.26 line.
 numpy==1.26.4
-
-# Optional 4-bit serving (TG_LOAD_IN_4BIT=true). Versions below 0.48 lack
-# Blackwell (sm_120) kernels.
-bitsandbytes==0.50.0
 
 # Sentence splitting: optional for the server (TG_SPLIT_SENTENCES=true),
 # required by scripts/benchmark_speed.py, which segments a benchmarked page the
@@ -48,3 +40,6 @@ fastapi[standard]>=0.115,<1.0
 uvicorn>=0.34,<1.0
 pydantic>=2.9,<3.0
 pydantic-settings>=2.5,<3.0
+# The upstream client. Comes with fastapi[standard], but this module imports it
+# directly, so it is declared directly.
+httpx>=0.27,<1.0

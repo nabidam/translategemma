@@ -362,37 +362,36 @@ start fresh. Resume stages in separate invocations to avoid either ambiguity.
 
 ## Serving
 
-[`api/`](api/README.md) is a FastAPI service for a trained adapter, with the same
-endpoint shapes as the existing NLLB service plus a batch endpoint. It is a
-self-contained deployment unit: copy the directory to the serving host and build
-from inside it, with no part of this repository present.
+[`api/`](api/README.md) is a FastAPI **gateway**: vLLM holds the weights, and
+the gateway owns the prompt rendering, the stop set, sentence splitting and the
+endpoint shapes (the same ones as the existing NLLB service, plus a batch
+endpoint). It is a self-contained deployment unit: copy the directory to the
+serving host and build from inside it, with no part of this repository present.
 
 ```bash
 cd api && docker build -t translategemma-api .
+docker compose up -d          # vLLM, then the gateway once vLLM is healthy
 ```
 
-Its generation path mirrors `evaluate_translations.py` exactly, so a served
-translation is the translation the harness scored. That requires copies of
-`prompting.py` and `model_loading.py` inside `api/`, which are kept
-byte-identical from here:
+vLLM serves the **merged** checkpoint that `scripts/merge_lora_adapter.py`
+writes, so no `--enable-lora` and no adapter loading at serve time:
 
 ```bash
-uv run python scripts/sync_api_vendored.py          # after editing either root module
+uv run python scripts/merge_lora_adapter.py \
+  --adapter-path outputs/sft_final \
+  --output-dir offline_assets/models/translategemma-12b-merged
+```
+
+The gateway reproduces the generation contract of `evaluate_translations.py`
+exactly — it renders prompts locally and sends **token ids** to vLLM's
+`/v1/completions`, with the resolved stop set on every request — so a served
+translation is the translation the harness scored. That requires a copy of
+`prompting.py` inside `api/`, kept byte-identical from here:
+
+```bash
+uv run python scripts/sync_api_vendored.py          # after editing the root module
 uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift; also a test
 ```
 
-`TG_MODEL_MODE` selects what the service loads: the base model, the adapter, or
-both at once (one copy of the weights, adapter toggled per request), so a caller
-can query either system live.
-
-### vLLM serving
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model google/translategemma-12b-it \
-  --enable-lora \
-  --lora-modules farsi-science=path/to/final_adapter \
-  --max-lora-rank 64 \
-  --host 0.0.0.0 \
-  --port 8000
-```
+`TG_MODEL_MODE` names which system the upstream answers as, so `/model-info` and
+the per-request `system` field keep attributing a translation to a checkpoint.

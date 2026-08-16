@@ -5,12 +5,12 @@ Endpoint shapes mirror the NLLB service (POST body with a `text` field, a
 change, plus a batch endpoint, a per-request system selector, and a /model-info
 that reports exactly which checkpoint answered.
 
-Concurrency: one model on one GPU. Requests serialize behind a lock and each
-generate() runs in a worker thread, so the event loop keeps serving
-/health-check and /model-info while a long translation is in flight.
+Generation happens in a vLLM server (see translator.py); this process renders
+prompts and forwards them. Requests are therefore concurrent end to end — no
+GPU lock — and vLLM's continuous batching merges whatever is in flight,
+including the segments of a single sentence-split request.
 """
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -33,31 +33,26 @@ from translator import TranslationEngine
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("translategemma.api")
 
-# Serializes GPU access. TranslationEngine runs one generate() at a time, and in
-# "both" mode it toggles the adapter in place, which two concurrent requests
-# would race on.
-_gpu_lock = asyncio.Lock()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     engine = TranslationEngine(settings)
-    # Loading a 12B checkpoint takes minutes; doing it in a thread keeps the
-    # startup event loop responsive and matches how generation is dispatched.
+    # Tokenizer only, but still blocking file I/O: keep it off the event loop.
     await to_thread.run_sync(engine.load)
     app.state.engine = engine
     try:
         yield
     finally:
+        await engine.aclose()
         engine.unload()
 
 
 app = FastAPI(
     title="TranslateGemma API",
     description=(
-        "Translation service backed by TranslateGemma, serving the base model, a "
-        "LoRA-adapted model, or both."
+        "Translation gateway for TranslateGemma: renders prompts and forwards "
+        "generation to a vLLM server."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -77,7 +72,7 @@ def get_engine() -> TranslationEngine:
     engine = getattr(app.state, "engine", None)
     if engine is None or not engine.is_loaded:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model is not loaded."
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway is not ready."
         )
     return engine
 
@@ -114,16 +109,14 @@ def _resolve(options, settings: Settings) -> ResolvedOptions:
 
 
 async def _translate(engine, texts: list[str], resolved: ResolvedOptions) -> list[str]:
-    async with _gpu_lock:
-        return await to_thread.run_sync(
-            engine.translate,
-            texts,
-            resolved.system,
-            resolved.source_lang,
-            resolved.target_lang,
-            resolved.max_new_tokens,
-            resolved.split_sentences,
-        )
+    return await engine.translate(
+        texts,
+        resolved.system,
+        resolved.source_lang,
+        resolved.target_lang,
+        resolved.max_new_tokens,
+        resolved.split_sentences,
+    )
 
 
 @app.get("/health-check", response_model=HealthResponse)

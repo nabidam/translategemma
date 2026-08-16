@@ -54,7 +54,7 @@ class Prompt(TranslationOptions):
 
 
 class BatchPrompt(TranslationOptions):
-    """Several texts translated in one request, batched into shared generate() calls."""
+    """Several texts translated in one request, dispatched concurrently to vLLM."""
 
     texts: list[str] = Field(min_length=1)
 

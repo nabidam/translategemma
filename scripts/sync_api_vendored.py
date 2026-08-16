@@ -2,8 +2,8 @@
 """Copy the shared generation contract into api/, which must run standalone.
 
 api/ is deployed on its own, without the rest of the repository on disk, so it
-cannot import prompting.py and model_loading.py from the project root. It
-carries byte-identical copies instead.
+cannot import prompting.py from the project root. It carries a byte-identical
+copy instead.
 
 Duplication is normally the wrong answer, and it is only tolerable here because
 the copies are machine-checked: tests/test_api_vendored_modules.py fails the
@@ -21,9 +21,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 API_DIR = PROJECT_ROOT / "api"
 
-# Modules api/ needs and must never re-implement. Both encode the fixes from
-# docs/2026-08-10_adapter_degeneration_analysis.md, whose failure mode is silent.
-VENDORED_MODULES = ("prompting.py", "model_loading.py")
+# Modules api/ needs and must never re-implement. prompting.py encodes the
+# fixes from docs/2026-08-10_adapter_degeneration_analysis.md, whose failure
+# mode is silent. model_loading.py used to be vendored too; api/ serves through
+# vLLM now and loads no weights, so it neither ships nor imports torch.
+VENDORED_MODULES = ("prompting.py",)
 
 
 def main():

@@ -1,0 +1,222 @@
+# Deployment stack: MySQL + Spring backend + phpMyAdmin + two vLLM servers and
+# the two API gateways in front of them.
+#
+# Images are built elsewhere; this file only wires them together.
+#
+# GPU: both vLLM servers share one device, so their memory fractions must add up
+# to less than 1.0 with room to spare. See the note on DOTS_GPU_MEMORY_UTILIZATION.
+
+x-gpu-device: &gpu-device
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          # Pinned rather than `count: all`: two vLLM servers on one host must
+          # agree on which device they are dividing, and `count` makes that
+          # implicit.
+          device_ids: ["${GPU_DEVICE_ID:-0}"]
+          capabilities: [gpu]
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-fundamental}
+    ports:
+      # Bound to loopback: the backend and phpMyAdmin reach MySQL over the
+      # compose network, so nothing needs it published to the LAN. Drop the
+      # 127.0.0.1 prefix only if a host-external client really needs it.
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - ./mysql/config/initdb:/docker-entrypoint-initdb.d
+      - mysqldb:/var/lib/mysql
+    healthcheck:
+      # Gates the backend's start-up. Without it the backend races the very
+      # first boot of MySQL, which runs initdb before it accepts connections.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+  # sudo docker compose exec mysql bash
+  # mysql -u root -p  -> create database fundamental;
+  # mysql -u root -p fundamental < fundamental.sql
+
+  backend:
+    image: translator-server:latest
+    container_name: backend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend/config/application.properties:/app/config/application.properties
+    environment:
+      - SPRING_CONFIG_LOCATION=file:/app/config/application.properties
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: root
+      PMA_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    ports:
+      - "7070:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------- #
+  # TranslateGemma: vLLM holds the weights, the API is a CPU-only gateway.
+  # --------------------------------------------------------------------- #
+
+  translategemma-vllm:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: translategemma-vllm
+    restart: unless-stopped
+    ports:
+      # For humans and benchmarks. The gateway reaches it over the compose
+      # network on port 8000, not through this.
+      - "7073:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - HF_HUB_OFFLINE=1
+    volumes:
+      # The merged checkpoint (base + LoRA folded in) that
+      # scripts/merge_lora_adapter.py writes. Mounted at its own path rather
+      # than inside the HF cache mount, so the two mounts cannot collide.
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to the merged checkpoint directory}:/merged:ro
+      - /mnt/d/wsl/.cache/huggingface:/root/.cache/huggingface
+    # The merged directory carries its own generation_config.json, whose stop
+    # set includes <end_of_turn> (106). vLLM reads it because
+    # --generation-config defaults to auto; do NOT pass
+    # `--generation-config vllm`, which discards the file.
+    #
+    # No --max-model-len: the context length comes from the checkpoint's
+    # config.json. Add `--max-model-len 8192` only if vLLM refuses to start
+    # because the KV cache for the full context does not fit its memory share.
+    command: >
+      serve /merged
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name ${SERVED_TG_MODEL_NAME:-translategemma}
+      --tensor-parallel-size 1
+      --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.45}
+      --dtype ${TG_DTYPE:-bfloat16}
+      --chat-template-content-format string
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Loading a 12B checkpoint and capturing CUDA graphs takes minutes.
+      start_period: 900s
+    deploy: *gpu-device
+    ipc: host
+
+  translategemma-api:
+    image: translategemma-api:latest
+    container_name: translategemma-api
+    restart: unless-stopped
+    env_file:
+      - ./translategemma/.env
+    ports:
+      - "8888:8000"
+    volumes:
+      # Read-only, and read for the tokenizer and chat template only: this
+      # container loads no weights. It must be the SAME checkpoint vLLM serves,
+      # or prompts are rendered with one tokenizer and generated by another.
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to the merged checkpoint directory}:/merged:ro
+      - /mnt/d/wsl/.cache/huggingface:/models:ro
+    environment:
+      # These override anything in ./translategemma/.env — compose gives
+      # `environment:` precedence over `env_file:` — so the wiring lives here
+      # and the .env file carries only the translation defaults.
+      TG_VLLM_BASE_URL: http://translategemma-vllm:8000/v1
+      TG_VLLM_MODEL: ${SERVED_TG_MODEL_NAME:-translategemma}
+      TG_BASE_MODEL_ID: /merged
+      TG_MODEL_MODE: adapter
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    healthcheck:
+      # Runs a real translation through vLLM, so it proves the whole path.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      # Seconds, not minutes: the gateway loads a tokenizer, not a checkpoint.
+      # The wait for the weights is depends_on's job.
+      start_period: 120s
+    depends_on:
+      translategemma-vllm:
+        condition: service_healthy
+    # No GPU reservation and no PYTORCH_CUDA_ALLOC_CONF: there is no torch in
+    # this image.
+
+  # --------------------------------------------------------------------- #
+  # dots.ocr
+  # --------------------------------------------------------------------- #
+
+  dots-ocr-vllm:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: dots-ocr-vllm
+    restart: unless-stopped
+    ports:
+      - "7071:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - /mnt/d/wsl/.cache/huggingface:/root/.cache/huggingface
+      - /mnt/d/wsl/projects/dotsmocr/weights/DotsMOCR:/workspace/weights
+    entrypoint: ["vllm", "serve"]
+    command: >
+      /workspace/weights
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name ${SERVED_DOT_MODEL_NAME:-model}
+      --tensor-parallel-size 1
+      --gpu-memory-utilization ${DOTS_GPU_MEMORY_UTILIZATION:-0.40}
+      --chat-template-content-format string
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+    deploy: *gpu-device
+    ipc: host
+
+  dots-ocr-api:
+    image: dots-ocr-api:latest
+    container_name: dots-ocr-api
+    restart: unless-stopped
+    ports:
+      - "7072:8088"
+    env_file:
+      - ./dots-ocr-api/.env
+    volumes:
+      - ./dots-ocr-api/app:/app/app:ro
+      - ./dots-ocr-api/dots_ocr:/app/dots_ocr:ro
+      - ./dots-ocr-api/config.yaml:/app/config.yaml:ro
+      - ./dots-ocr-api/logs:/app/logs
+    # Kept for whatever in ./dots-ocr-api/.env still points at the host. The
+    # service name http://dots-ocr-vllm:8000/v1 is the better address: it does
+    # not depend on the published port and survives a port change.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      dots-ocr-vllm:
+        condition: service_healthy
+
+volumes:
+  mysqldb:

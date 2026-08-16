@@ -8,30 +8,27 @@ Answers two questions on the machine that actually serves the model:
    whole-page request and as a sentence-split request, plus a words-per-minute
    figure that a non-engineer can act on.
 
-Both are measured through the *serving* code path, not a reimplementation of it.
-The engine transport calls ``TranslationEngine.translate`` — the same rendering,
-the same stop set, the same generation kwargs the API answers requests with — so
-a number here is a number the API can deliver. The HTTP transport calls
-``POST /translate/batch`` on a running server; the difference between the two is
-the serving overhead (JSON, the GPU lock, the worker-thread hop).
+Everything is measured through the *serving* path: ``POST /translate/batch`` on
+a running API, which renders prompts and forwards them to vLLM. That is the
+whole deployment — gateway overhead, JSON, vLLM's scheduler and its continuous
+batching — so a number here is a number a caller can actually receive. There is
+no in-process transport any more: the API loads no weights, so a benchmark of
+"the model without the server" would have to reimplement the serving path
+rather than measure it.
 
-What is loaded comes from the environment, exactly as the server takes it: the
-benchmark reads ``Settings`` and measures each system in ``loaded_systems``. With
-``TG_MODEL_MODE=base`` it benchmarks the base model only; with ``both`` it
-benchmarks both, which also prices PEFT's ``disable_adapter()`` toggle.
+What is served comes from the environment, exactly as the API takes it: the
+benchmark reads ``Settings`` and measures each system in ``loaded_systems``, and
+cross-checks ``/model-info`` so a report cannot silently describe a different
+checkpoint from the one that answered.
 
-Token accounting is exact rather than estimated. ``generate()`` returns rows
-padded to the longest sequence in the batch, so a naive
-``rows x new_columns`` count inflates throughput by however much the batch was
-padded. This script wraps ``model.generate`` for the duration of a run and
-counts, per row, the tokens before the first stop id — the tokens the caller
-actually receives. Rows that never hit a stop id are flagged as truncated,
-because a run that hit ``max_new_tokens`` measures the cap, not the model.
+Token counts are approximate, and labelled as such wherever they are reported:
+the response carries text, not token ids, so output tokens are recovered by
+re-encoding it with the same tokenizer. Latency and words-per-minute — the
+numbers this benchmark exists for — are exact.
 
 Usage (inside the API image, from /app):
 
-    python scripts/benchmark_speed.py                          # engine sweep + page
-    python scripts/benchmark_speed.py --mode http --api-url http://localhost:8000
+    python scripts/benchmark_speed.py --api-url http://localhost:8000
     python scripts/benchmark_speed.py --page-source file --page-file scripts/test.pdf
 
 See --help for the full option list, and README.md for the compose invocation.
@@ -197,180 +194,6 @@ class PageSpec:
 
 
 # --------------------------------------------------------------------------- #
-# Engine transport
-# --------------------------------------------------------------------------- #
-
-
-class GenerationRecorder:
-    """Counts the tokens a run really produced, by wrapping model.generate.
-
-    Installed only for the duration of the benchmark and delegating to the
-    original method, so the measured code path is byte-for-byte the served one.
-
-    The count that matters is per row, up to the first stop id: generate()
-    returns every row padded to the length of the slowest row in the batch, and
-    counting those pad columns as output is how a batched benchmark ends up
-    claiming several times the throughput the caller receives.
-    """
-
-    def __init__(self, engine):
-        self._engine = engine
-        self._original = None
-        self.stats = CallStats()
-        self.errors: list[str] = []
-
-    def reset(self) -> None:
-        self.stats = CallStats()
-
-    def __enter__(self) -> "GenerationRecorder":
-        self._original = self._engine.model.generate
-        self._engine.model.generate = self._wrapped
-        return self
-
-    def __exit__(self, *exc_info) -> bool:
-        # Delete rather than assign back: the wrapper was an instance attribute
-        # shadowing the class method, and restoring the bound method would leave
-        # the model holding a reference to itself.
-        try:
-            del self._engine.model.generate
-        except AttributeError:
-            pass
-        self._original = None
-        return False
-
-    def _wrapped(self, *args, **kwargs):
-        outputs = self._original(*args, **kwargs)
-        try:
-            self.stats.add(self._count(kwargs, outputs))
-        except Exception as error:  # Never let accounting break a benchmark run.
-            self.errors.append(f"token accounting failed: {error!r}")
-        return outputs
-
-    def _count(self, kwargs, outputs) -> CallStats:
-        import torch
-
-        input_ids = kwargs["input_ids"]
-        attention_mask = kwargs.get("attention_mask")
-        rows, prompt_len = input_ids.shape[0], input_ids.shape[-1]
-        real_prompt_tokens = (
-            int(attention_mask.sum().item()) if attention_mask is not None else rows * prompt_len
-        )
-
-        new_tokens = outputs[:, prompt_len:]
-        steps = int(new_tokens.shape[-1])
-        stop_ids = torch.as_tensor(
-            self._engine.stop_token_ids, device=new_tokens.device, dtype=new_tokens.dtype
-        )
-        is_stop = torch.isin(new_tokens, stop_ids)
-        stopped = is_stop.any(dim=1)
-        # argmax over a boolean row returns the first True; rows that never stop
-        # are charged the full step count, since every one of those tokens was
-        # generated and returned.
-        first_stop = torch.where(
-            stopped,
-            is_stop.int().argmax(dim=1),
-            torch.full_like(stopped, steps, dtype=torch.long),
-        )
-        return CallStats(
-            calls=1,
-            prompt_tokens=real_prompt_tokens,
-            padded_prompt_tokens=rows * prompt_len,
-            steps=steps,
-            output_tokens=int(first_stop.sum().item()),
-            truncated_rows=int((~stopped).sum().item()),
-        )
-
-
-class EngineRunner:
-    """Runs translations in-process against a locally loaded model."""
-
-    transport = "engine"
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.engine = None
-        self.recorder = None
-
-    def start(self) -> None:
-        from translator import TranslationEngine
-
-        self.engine = TranslationEngine(self.settings)
-        self.engine.load()
-        self.recorder = GenerationRecorder(self.engine)
-
-    def stop(self) -> None:
-        if self.engine is not None:
-            self.engine.unload()
-            self.engine = None
-
-    @property
-    def tokenizer(self):
-        return self.engine.processor.tokenizer
-
-    def run(
-        self,
-        texts: list[str],
-        system: System,
-        max_new_tokens: int,
-        split_sentences: bool,
-        batch_size: int,
-    ) -> Sample:
-        import torch
-
-        settings = self.settings
-        previous_batch_size = settings.batch_size
-        settings.batch_size = batch_size
-        try:
-            with self.recorder as recorder:
-                recorder.reset()
-                if torch.cuda.is_available():
-                    torch.cuda.reset_peak_memory_stats()
-                _synchronize()
-                started = time.perf_counter()
-                outputs = self.engine.translate(
-                    texts,
-                    system,
-                    settings.source_lang,
-                    settings.target_lang,
-                    max_new_tokens,
-                    split_sentences,
-                )
-                _synchronize()
-                wall_s = time.perf_counter() - started
-                stats = recorder.stats
-        finally:
-            settings.batch_size = previous_batch_size
-
-        peak_vram_gb = None
-        if torch.cuda.is_available():
-            peak_vram_gb = torch.cuda.max_memory_allocated() / (1024**3)
-        return Sample(wall_s=wall_s, stats=stats, peak_vram_gb=peak_vram_gb, outputs=outputs)
-
-    def describe(self) -> dict:
-        import torch
-
-        settings = self.settings
-        device_info = {}
-        if torch.cuda.is_available():
-            index = self.engine.device.index or 0 if self.engine else 0
-            properties = torch.cuda.get_device_properties(index)
-            device_info = {
-                "gpu_name": properties.name,
-                "gpu_total_memory_gb": round(properties.total_memory / (1024**3), 2),
-                "gpu_capability": f"sm_{properties.major}{properties.minor}",
-                "gpu_count": torch.cuda.device_count(),
-                "cuda_version": torch.version.cuda,
-            }
-        return {
-            "device": str(self.engine.device) if self.engine else None,
-            "torch_version": torch.__version__,
-            "stop_token_ids": list(self.engine.stop_token_ids) if self.engine else [],
-            **device_info,
-            **_settings_summary(settings),
-        }
-
-
-# --------------------------------------------------------------------------- #
 # HTTP transport
 # --------------------------------------------------------------------------- #
 
@@ -467,33 +290,9 @@ class HttpRunner:
 # --------------------------------------------------------------------------- #
 
 
-def _synchronize() -> None:
-    """Wait for the GPU before reading the clock.
-
-    CUDA kernel launches are asynchronous. Timing without this measures how fast
-    Python queued the work, which on a warm cache is roughly instant.
-    """
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-    except Exception:
-        pass
-
-
 def _is_oom(error: BaseException) -> bool:
+    """True for an upstream out-of-memory, which arrives here as a 5xx body."""
     return "out of memory" in str(error).lower() or type(error).__name__ == "OutOfMemoryError"
-
-
-def _empty_cuda_cache() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
 
 
 def measure(
@@ -549,7 +348,6 @@ def measure(
         measurement.error = f"{type(error).__name__}: {error}"
         if _is_oom(error):
             measurement.error = f"OOM at batch {batch_size} ({type(error).__name__})"
-        _empty_cuda_cache()
         if verbose:
             print(f"FAILED — {measurement.error}")
         return measurement
@@ -567,7 +365,7 @@ def measure(
 def split_into_sentences(text: str, language: str) -> list[str]:
     """Segment text the way the server segments it.
 
-    ``TranslationEngine`` splits with pysbd, so counting sentences any other way
+    ``SentenceSplitter`` splits with pysbd, so counting sentences any other way
     would report a segment count the server never produces — and the page table
     divides the measured time by exactly that count. Falls back to a regex only
     if pysbd is missing or has no model for the language, matching
@@ -829,42 +627,27 @@ def _page_summary_row(page: PageSpec) -> list[str]:
 def build_summary(sweeps: list[Measurement], page_entries: list[dict]) -> list[str]:
     """The three or four sentences someone will actually quote."""
     lines: list[str] = []
-    engine_sweeps = [m for m in sweeps if m.transport == "engine" and not m.error]
     http_sweeps = [m for m in sweeps if m.transport == "http" and not m.error]
 
-    for system in sorted({m.system for m in engine_sweeps}):
-        rows = [m for m in engine_sweeps if m.system == system]
+    for system in sorted({m.system for m in http_sweeps}):
+        rows = [m for m in http_sweeps if m.system == system]
         best = max(rows, key=lambda m: m.decode_tok_s or 0)
         single = next((m for m in rows if m.batch_size == 1), None)
-        lines.append(
-            f"[{system}] peak decode throughput {best.decode_tok_s:.1f} tok/s at batch "
-            f"{best.batch_size} ({best.step_ms:.1f} ms per decode step)."
-        )
+        if best.decode_tok_s is not None:
+            lines.append(
+                f"[{system}] peak throughput {best.decode_tok_s:.1f} tok/s at batch "
+                f"{best.batch_size} (approximate: token counts are recovered by "
+                "re-encoding the response)."
+            )
         if single is not None:
             lines.append(
                 f"[{system}] a single sentence takes {single.wall_s:.2f} s end to end "
-                f"({single.decode_tok_s:.1f} tok/s, {single.output_tokens} output tokens)."
+                f"({single.output_tokens} output tokens)."
             )
-
-    for system in sorted({m.system for m in http_sweeps}):
-        for batch in sorted({m.batch_size for m in http_sweeps if m.system == system}):
-            http = next(
-                (m for m in http_sweeps if m.system == system and m.batch_size == batch), None
-            )
-            engine = next(
-                (m for m in engine_sweeps if m.system == system and m.batch_size == batch), None
-            )
-            if http and engine:
-                overhead = http.wall_s - engine.wall_s
-                lines.append(
-                    f"[{system}] HTTP adds {overhead * 1000:+.0f} ms over the engine at batch "
-                    f"{batch} ({http.wall_s:.2f} s vs {engine.wall_s:.2f} s)."
-                )
-            break  # One representative batch size is enough for the headline.
 
     for entry in page_entries:
         measurement: Measurement = entry["measurement"]
-        if measurement.error or entry["transport"] != "engine":
+        if measurement.error:
             continue
         page: PageSpec = entry["page"]
         minutes = measurement.wall_s / 60
@@ -971,9 +754,9 @@ def render_markdown(context: dict, sweeps, page_entries, pages, notes) -> str:
     out += [
         "## Method",
         "",
-        "- Measured through `TranslationEngine.translate` (transport `engine`) and "
-        "`POST /translate/batch` (transport `http`) — the served code path, not a "
-        "reimplementation.",
+        "- Measured through `POST /translate/batch` on the running API, which "
+        "renders the prompts and forwards them to vLLM — the served code path, not "
+        "a reimplementation.",
         f"- {context['repeats']} timed repeat(s) per configuration after "
         f"{context['warmup']} discarded warmup run(s); the reported time is the median.",
         "- `torch.cuda.synchronize()` brackets every timed region.",
@@ -994,6 +777,8 @@ def render_markdown(context: dict, sweeps, page_entries, pages, notes) -> str:
 def _settings_summary(settings: Settings) -> dict:
     return {
         "base_model_id": settings.base_model_id,
+        "vllm_base_url": settings.vllm_base_url,
+        "vllm_model": settings.vllm_model,
         "model_mode": str(settings.model_mode),
         "adapter_path": settings.adapter_path,
         "dtype": settings.dtype,
@@ -1019,18 +804,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["engine", "http", "both"],
-        default="engine",
+        choices=["http"],
+        default="http",
         help=(
-            "engine: load the model in this process (default). http: call a running "
-            "server. both: run each in turn — needs VRAM for a second copy of the "
-            "weights, so prefer two separate runs on a single-GPU host."
+            "Transport. Only 'http' exists: the API loads no weights, so there is "
+            "no in-process engine to benchmark. Kept so existing invocations that "
+            "pass --mode http keep working."
         ),
     )
     parser.add_argument(
         "--api-url",
         default=os.environ.get("TG_BENCHMARK_API_URL", "http://localhost:8000"),
-        help="Server base URL for --mode http/both.",
+        help="Base URL of the running API.",
     )
     parser.add_argument(
         "--http-timeout", type=float, default=1800.0, help="Per-request HTTP timeout, seconds."
@@ -1098,10 +883,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Segments per generate() call in mode=sentences. Default 1: one sentence "
-            "at a time, which is the honest per-document latency when a page is the "
-            "whole request. Raise it to see what batching the page buys. Engine "
-            "transport only — over HTTP the server batches by its own TG_BATCH_SIZE."
+            "Accepted for compatibility and reported in the 'batch' column only "
+            "when it matches the server. The page request is batched inside the API "
+            "by its own TG_BATCH_SIZE, which is what the rows actually measure."
         ),
     )
     parser.add_argument(
@@ -1144,13 +928,15 @@ def resolve_systems(settings: Settings, requested: str | None) -> list[System]:
 
 
 def load_tokenizer_only(settings: Settings):
-    """Tokenizer without the model, for token counts in HTTP-only runs."""
-    from transformers import AutoProcessor
+    """The tokenizer the server renders prompts with, for token counts.
 
-    processor = AutoProcessor.from_pretrained(
-        settings.base_model_id, use_fast=True, fix_mistral_regex=False
-    )
-    return processor.tokenizer
+    Loaded through translator.load_processor so this counts tokens with exactly
+    the front end the API uses, including its fallback for a model directory
+    that ships a bare tokenizer.
+    """
+    from translator import load_processor
+
+    return load_processor(settings.resolved_tokenizer_path).tokenizer
 
 
 def main(argv=None) -> int:
@@ -1162,17 +948,13 @@ def main(argv=None) -> int:
     sweep_max_new_tokens = args.max_new_tokens or settings.max_new_tokens
     notes: list[str] = []
 
-    if (
-        args.mode in ("http", "both")
-        and not args.skip_page
-        and args.page_batch_size != settings.batch_size
-    ):
+    if not args.skip_page and args.page_batch_size != settings.batch_size:
         notes.append(
-            f"--page-batch-size={args.page_batch_size} applies to the engine transport only. "
-            f"The HTTP page rows were batched by the server at TG_BATCH_SIZE="
-            f"{settings.batch_size}, and their 'batch' column reports that."
+            f"--page-batch-size={args.page_batch_size} has no effect: the page rows were "
+            f"batched by the server at TG_BATCH_SIZE={settings.batch_size}, and their "
+            "'batch' column reports that."
         )
-    if args.mode in ("http", "both") and max(batch_sizes, default=0) > settings.max_batch_items:
+    if max(batch_sizes, default=0) > settings.max_batch_items:
         notes.append(
             f"Batch sizes above TG_MAX_BATCH_ITEMS={settings.max_batch_items} were dropped "
             "from the HTTP sweep; the server rejects them with 413."
@@ -1191,11 +973,11 @@ def main(argv=None) -> int:
             )
 
     # --- runners ----------------------------------------------------------
-    runners = []
-    if args.mode in ("engine", "both"):
-        runners.append(EngineRunner(settings))
-    if args.mode in ("http", "both"):
-        runners.append(HttpRunner(settings, args.api_url, args.http_timeout))
+    # One transport: the API is a gateway, so there is nothing to measure
+    # in-process. Kept as a list because everything downstream iterates it, and
+    # a second transport (vLLM directly, bypassing the gateway) is the obvious
+    # next one to add.
+    runners = [HttpRunner(settings, args.api_url, args.http_timeout)]
 
     sweeps: list[Measurement] = []
     page_entries: list[dict] = []
@@ -1211,27 +993,25 @@ def main(argv=None) -> int:
         for runner in runners:
             print(f"\n>>> Starting {runner.transport} transport ...", flush=True)
             runner.start()
-            if isinstance(runner, EngineRunner):
-                environment.update(runner.describe())
-                tokenizer = runner.tokenizer
-            else:
-                if tokenizer is None:
-                    try:
-                        tokenizer = load_tokenizer_only(settings)
-                    except Exception as error:
-                        notes.append(
-                            f"HTTP token counts unavailable: could not load a tokenizer "
-                            f"({type(error).__name__}: {error})."
-                        )
-                runner.set_tokenizer(tokenizer)
-                environment["api_url"] = runner.api_url
-                served = runner.model_info.get("base_model_id")
-                if served and served != settings.base_model_id:
+            if tokenizer is None:
+                try:
+                    tokenizer = load_tokenizer_only(settings)
+                except Exception as error:
                     notes.append(
-                        f"The server reports base_model_id={served!r}, which differs from this "
-                        f"process's TG_BASE_MODEL_ID={settings.base_model_id!r}. The HTTP rows "
-                        "measure a different checkpoint than the engine rows."
+                        f"Token counts unavailable: could not load a tokenizer "
+                        f"({type(error).__name__}: {error})."
                     )
+            runner.set_tokenizer(tokenizer)
+            environment.update(runner.describe())
+            environment["api_url"] = runner.api_url
+            served = runner.model_info.get("base_model_id")
+            if served and served != settings.base_model_id:
+                notes.append(
+                    f"The server reports base_model_id={served!r}, which differs from this "
+                    f"process's TG_BASE_MODEL_ID={settings.base_model_id!r}. Token counts "
+                    "here were computed with a different tokenizer than the one that "
+                    "rendered the prompts."
+                )
 
             for page in pages:
                 if page.tokens is None and tokenizer is not None:
@@ -1307,7 +1087,6 @@ def main(argv=None) -> int:
                         )
 
             runner.stop()
-            _empty_cuda_cache()
     finally:
         for runner in runners:
             try:
@@ -1343,7 +1122,7 @@ def _page_token_budget(page: PageSpec, settings: Settings) -> int:
     TG_MAX_NEW_TOKENS is sized for a sentence. Translating a page unsplit under
     that cap measures truncation, not speed. English-to-Farsi output runs longer
     than the source in tokens, hence the 2x plus slack, capped at the 4096 the
-    API schema accepts so the engine and HTTP transports stay comparable.
+    API schema accepts, which is also the cap a caller can ask for.
     """
     source_tokens = page.tokens or int(page.words * 1.4)
     return min(4096, max(settings.max_new_tokens, int(source_tokens * 2.0) + 128))
@@ -1352,11 +1131,10 @@ def _page_token_budget(page: PageSpec, settings: Settings) -> int:
 def _page_effective_batch_size(args, settings: Settings, transport: str) -> int:
     """The batch size the page run really used.
 
-    --page-batch-size reaches the engine directly, but over HTTP the batching
-    happens inside the server, which chunks by its own TG_BATCH_SIZE regardless
-    of what this process asked for.
+    The batching happens inside the server, which chunks by its own
+    TG_BATCH_SIZE regardless of what this process asked for.
     """
-    return settings.batch_size if transport == "http" else args.page_batch_size
+    return settings.batch_size
 
 
 def _predict_page_seconds(
