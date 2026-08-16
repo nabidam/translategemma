@@ -25,8 +25,9 @@ services:
         #   IMAGE_TAG=cu128-fa3-py312 INSTALL_FLASH_ATTN3=1 docker compose build trainer
         INSTALL_FLASH_ATTN3: ${INSTALL_FLASH_ATTN3:-0}
         # Off by default. Setting it to 1 adds llm-compressor for
-        # scripts/quantize_fp8.py — a deployment tool, not a training one, and
-        # every extra package is one that can break training. Tag it separately:
+        # scripts/quantize_fp8.py — a deployment tool, not a training one. It
+        # moves pillow, accelerate and datasets off the locked versions, so the
+        # result MUST carry its own tag and MUST NOT be used to train:
         #   IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
         INSTALL_LLMCOMPRESSOR: ${INSTALL_LLMCOMPRESSOR:-0}
 

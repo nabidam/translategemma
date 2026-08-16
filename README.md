@@ -396,8 +396,13 @@ FP8_DYNAMIC needs no calibration corpus, which is why it is preferred here over
 4-bit AWQ/GPTQ: a general-purpose calibration set biases a domain-fine-tuned
 model away from its domain. The script refuses an adapter directory or an
 already-quantised input, and fails rather than write an output whose stop set
-has lost `<end_of_turn>` (106). llm-compressor is a build-arg opt-in so it stays
-out of the training image by default.
+has lost `<end_of_turn>` (106).
+
+`INSTALL_LLMCOMPRESSOR=1` moves `pillow`, `accelerate` and `datasets` off the
+locked versions — llm-compressor's declared ranges exclude them — so **the quant
+tag is not a training image**. `torch`, `transformers` and `tokenizers` are
+constrained to the locked versions, since those decide the numerics of the
+checkpoint it writes; the build fails rather than move them.
 
 The gateway reproduces the generation contract of `evaluate_translations.py`
 exactly — it renders prompts locally and sends **token ids** to vLLM's
