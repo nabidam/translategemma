@@ -3,8 +3,19 @@
 #
 # Images are built elsewhere; this file only wires them together.
 #
-# GPU: both vLLM servers share one device, so their memory fractions must add up
-# to less than 1.0 with room to spare. See the note on DOTS_GPU_MEMORY_UTILIZATION.
+# GPU: both vLLM servers share one device, so their --gpu-memory-utilization
+# fractions must add up to less than 1.0 with room to spare. They are fractions
+# of TOTAL VRAM, not of what is free, which is what keeps two servers starting
+# in any order from claiming the same bytes. Sized for a 32 GB 5090 serving an
+# FP8 TranslateGemma (~13 GB of weights) beside dots.ocr:
+#
+#   translategemma  0.55 -> 17.6 GB : ~13 GB weights, ~4 GB KV cache
+#   dots.ocr        0.30 ->  9.6 GB : ~4 GB weights,  ~5 GB KV cache
+#   unclaimed       0.15 ->  4.8 GB : CUDA contexts, activations, headroom
+#
+# Serving the bf16 merge instead needs ~24 GB of weights and does not fit beside
+# a second model at all. Re-measure these two numbers against `nvidia-smi` after
+# the first successful start rather than trusting them.
 
 x-gpu-device: &gpu-device
   resources:
@@ -99,16 +110,16 @@ services:
     # --generation-config defaults to auto; do NOT pass
     # `--generation-config vllm`, which discards the file.
     #
-    # No --max-model-len: vLLM derives the context length from the checkpoint's
-    # config.json, which for Gemma 3 is 131072. That is a KV-cache budget
-    # decision, not a request-size one. Gemma 3 12B costs ~64 KB/token across
-    # its 8 global-attention layers (the 40 sliding-window layers are capped at
-    # 1024 tokens each), so one full-length sequence needs ~9 GB of cache and
-    # vLLM refuses to start when the budget is smaller than that. On a card
-    # shared with another model, set --max-model-len to what a translation
-    # segment actually needs (8192 is already generous) and spend the rest of
-    # the cache on concurrency: KV budget is what decides how many requests
-    # batch together, and batching is where the throughput is.
+    # --max-model-len is a KV-cache budget decision, not a request-size one.
+    # Left unset, vLLM takes Gemma 3's 131072 from config.json; at ~64 KB/token
+    # across the 8 global-attention layers (the 40 sliding-window layers cap at
+    # 1024 tokens each) that reserves ~9 GB of cache for a single sequence, and
+    # vLLM refuses to start when the budget is smaller than one sequence.
+    #
+    # 8192 is already generous for a translation segment, and the cache it frees
+    # becomes concurrency: KV budget decides how many requests batch together,
+    # and batching is where vLLM's throughput comes from. Raise it only for long
+    # unsplit documents, and raise --gpu-memory-utilization with it.
     #
     # No --chat-template-content-format below: nothing here uses
     # /v1/chat/completions. The gateway renders prompts itself and posts token
@@ -127,7 +138,8 @@ services:
       --port 8000
       --served-model-name ${SERVED_TG_MODEL_NAME:-translategemma}
       --tensor-parallel-size 1
-      --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.45}
+      --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.55}
+      --max-model-len ${TG_MAX_MODEL_LEN:-8192}
       --dtype ${TG_DTYPE:-bfloat16}
       --trust-remote-code
     healthcheck:
@@ -202,7 +214,7 @@ services:
       --port 8000
       --served-model-name ${SERVED_DOT_MODEL_NAME:-model}
       --tensor-parallel-size 1
-      --gpu-memory-utilization ${DOTS_GPU_MEMORY_UTILIZATION:-0.40}
+      --gpu-memory-utilization ${DOTS_GPU_MEMORY_UTILIZATION:-0.30}
       --chat-template-content-format string
       --trust-remote-code
     healthcheck:
