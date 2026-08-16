@@ -159,3 +159,96 @@ def test_validate_adapter_compatibility_missing_base_identity(tmp_path):
         )
         assert matched is False
 
+
+def test_validate_adapter_architecture():
+    from scripts.merge_lora_adapter import validate_adapter_architecture
+
+    # Mock base model
+    mock_base = MagicMock()
+    mock_base.named_modules.return_value = [
+        ("model.layers.0.self_attn.q_proj", MagicMock()),
+        ("model.layers.0.self_attn.v_proj", MagicMock()),
+        ("model.layers.0.self_attn.k_proj", MagicMock()),
+        ("model.layers.0.self_attn.o_proj", MagicMock()),
+    ]
+    mock_base.config.model_type = "gemma2"
+
+    # 1. Matching target modules
+    peft_cfg_valid = MagicMock()
+    peft_cfg_valid.target_modules = ["q_proj", "v_proj"]
+    res = validate_adapter_architecture(mock_base, peft_cfg_valid)
+    assert res["validated"] is True
+    assert res["target_modules_matched"] == ["q_proj", "v_proj"]
+
+    # 2. Missing target modules without override -> raises
+    peft_cfg_bad = MagicMock()
+    peft_cfg_bad.target_modules = ["q_proj", "nonexistent_proj"]
+    with pytest.raises(ValueError, match="Adapter target modules.*not found"):
+        validate_adapter_architecture(mock_base, peft_cfg_bad, allow_mismatch=False)
+
+    # 3. Missing target modules with override -> passes with reason
+    res_override = validate_adapter_architecture(
+        mock_base,
+        peft_cfg_bad,
+        allow_mismatch=True,
+        override_reason="Experimental architecture test",
+    )
+    assert res_override["validated"] is False
+    assert res_override["target_modules_missing"] == ["nonexistent_proj"]
+
+
+def test_promote_and_rollback_release_pointers(tmp_path):
+    from scripts.promote_model_release import promote_release, rollback_release
+
+    # Create dummy verified release 1
+    rel1 = tmp_path / "releases" / "rel1"
+    rel1.mkdir(parents=True)
+    (rel1 / "config.json").write_text("{}")
+    (rel1 / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106]}))
+    (rel1 / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]}))
+    (rel1 / "tokenizer_config.json").write_text("{}")
+    (rel1 / "special_tokens_map.json").write_text("{}")
+    (rel1 / "model.safetensors").write_bytes(b"shard1")
+    (rel1 / "merge_manifest.json").write_text(json.dumps({
+        "release_id": "rel1", "created_at": "now", "base_model": "base", "adapter": "ad",
+        "stop_token_ids": [1, 106], "file_inventory": []
+    }))
+    (rel1 / "merge_manifest.sha256").write_text(f"{compute_file_sha256(rel1 / 'merge_manifest.json')}  merge_manifest.json\n")
+    (rel1 / "SHA256SUMS").write_text("")
+
+    # Create dummy verified release 2
+    rel2 = tmp_path / "releases" / "rel2"
+    rel2.mkdir(parents=True)
+    (rel2 / "config.json").write_text("{}")
+    (rel2 / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106]}))
+    (rel2 / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]}))
+    (rel2 / "tokenizer_config.json").write_text("{}")
+    (rel2 / "special_tokens_map.json").write_text("{}")
+    (rel2 / "model.safetensors").write_bytes(b"shard2")
+    (rel2 / "merge_manifest.json").write_text(json.dumps({
+        "release_id": "rel2", "created_at": "now", "base_model": "base", "adapter": "ad",
+        "stop_token_ids": [1, 106], "file_inventory": []
+    }))
+    (rel2 / "merge_manifest.sha256").write_text(f"{compute_file_sha256(rel2 / 'merge_manifest.json')}  merge_manifest.json\n")
+    (rel2 / "SHA256SUMS").write_text("")
+
+    curr_symlink = tmp_path / "current"
+    prev_symlink = tmp_path / "previous"
+
+    # Promote rel1
+    ok1 = promote_release(rel1, curr_symlink, prev_symlink, skip_checksums=True)
+    assert ok1 is True
+    assert curr_symlink.resolve() == rel1.resolve()
+
+    # Promote rel2 -> curr points to rel2, prev points to rel1
+    ok2 = promote_release(rel2, curr_symlink, prev_symlink, skip_checksums=True)
+    assert ok2 is True
+    assert curr_symlink.resolve() == rel2.resolve()
+    assert prev_symlink.resolve() == rel1.resolve()
+
+    # Rollback -> curr reverts to rel1
+    ok_roll = rollback_release(curr_symlink, prev_symlink, skip_checksums=True)
+    assert ok_roll is True
+    assert curr_symlink.resolve() == rel1.resolve()
+
+

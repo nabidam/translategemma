@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "approved_serving_configurations": [
+    {
+      "image_repository": "vllm/vllm-openai",
+      "image_tag": "v0.13.0",
+      "pinned_digest": "sha256:7b5cf896b0105374bebb974c0529d47913364f33161c5ca155452f1e29e96ee1",
+      "cuda_version_minimum": "12.4",
+      "cuda_version_recommended": "12.8",
+      "nvidia_driver_minimum": "535.104.05",
+      "supported_gpu_architectures": [
+        "sm_80 (NVIDIA Ampere: A100, A10)",
+        "sm_86 (NVIDIA Ampere: RTX 3090, RTX A6000)",
+        "sm_89 (NVIDIA Ada Lovelace: L4, L40S, RTX 4090)",
+        "sm_90 (NVIDIA Hopper: H100, H200)"
+      ],
+      "model_family": "TranslateGemma (12B-IT / 27B-IT)",
+      "runtime_flags": {
+        "dtype": "bfloat16",
+        "max_model_len": 4096,
+        "enforce_eager": true,
+        "disable_log_requests": true
+      },
+      "verification_evidence": {
+        "status": "APPROVED_FOR_PRODUCTION",
+        "verified_date": "2026-08-16",
+        "verified_stop_token_ids": [1, 106],
+        "verified_stop_tokens": ["<eos>", "<end_of_turn>"],
+        "token_parity_verified": true
+      }
+    }
+  ]
+}

@@ -121,6 +121,8 @@ class ReadyResponse(BaseModel):
     model_name: str
     estimator_mode: str
     processor_mode: str = "canonical"
+    manifest_verified: bool = False
+    authenticity_status: str = "unverified"
     detail: Optional[str] = None
 
 
@@ -145,3 +147,15 @@ class ModelInfoResponse(BaseModel):
     processor_mode: str = "canonical"
     prompt_contract_version: str = "2026-08-10"
     routing_policy_version: str = "v1"
+
+    # Manifest and Authenticity provenance
+    manifest_verified: bool = False
+    manifest_sha256: Optional[str] = None
+    authenticity_status: str = "unverified"  # "trusted_external_anchor" | "colocated_checksum_only" | "unverified"
+    resolved_base_commit: Optional[str] = None
+    resolved_adapter_commit: Optional[str] = None
+    base_fingerprint: Optional[Dict[str, str]] = None
+    adapter_fingerprint: Optional[Dict[str, str]] = None
+    architecture_fingerprint: Optional[Dict[str, Any]] = None
+    manifest_metadata: Optional[Dict[str, Any]] = None
+

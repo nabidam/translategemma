@@ -178,6 +178,82 @@ class VLLMClient:
                 detail=f"Inference gateway error: {e}",
             ) from e
 
+    def _parse_sse_event_block(
+        self,
+        event_block: str,
+        observed_finish: Optional[str],
+        request_id: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[Dict[str, str]], bool]:
+        """Parse an SSE event block into yielded chunks, updated finish state, and errors."""
+        yield_items: List[Dict[str, Any]] = []
+        is_done = False
+        new_finish = observed_finish
+
+        for line in event_block.splitlines():
+            line = line.strip()
+            if not line or line.startswith(":"):
+                continue
+
+            if not line.startswith("data:"):
+                logger.error("Unrecognized SSE line structure [req_id=%s]: %r", request_id, line[:100])
+                return (
+                    [],
+                    new_finish,
+                    {
+                        "error": "Malformed stream protocol frame received from backend.",
+                        "code": "MALFORMED_FRAME",
+                    },
+                    False,
+                )
+
+            data_str = line[len("data:") :].lstrip()
+            if data_str == "[DONE]":
+                is_done = True
+                if new_finish is None:
+                    logger.error(
+                        "Stream protocol error [req_id=%s]: received [DONE] before finish_reason",
+                        request_id,
+                    )
+                    return (
+                        [],
+                        None,
+                        {
+                            "error": "Inference stream terminated unexpectedly before completion.",
+                            "code": "UNEXPECTED_TERMINATION",
+                        },
+                        True,
+                    )
+                return (yield_items, new_finish, None, True)
+
+            try:
+                chunk = json.loads(data_str)
+            except Exception as je:
+                logger.error(
+                    "Malformed SSE JSON in stream [req_id=%s]: %r (%s)",
+                    request_id,
+                    data_str[:100],
+                    je,
+                )
+                return (
+                    [],
+                    new_finish,
+                    {
+                        "error": "Malformed stream frame received from backend.",
+                        "code": "MALFORMED_FRAME",
+                    },
+                    False,
+                )
+
+            choices = chunk.get("choices", [])
+            if choices:
+                text_part = choices[0].get("text", "")
+                finish = choices[0].get("finish_reason")
+                if finish is not None:
+                    new_finish = finish
+                yield_items.append({"text": text_part, "finish_reason": finish})
+
+        return (yield_items, new_finish, None, is_done)
+
     async def generate_stream_completion(
         self,
         prompt: str,
@@ -209,7 +285,7 @@ class VLLMClient:
                     err_text = err_bytes.decode("utf-8", errors="replace")
                     logger.error("vLLM streaming error [req_id=%s] HTTP %d: %s", request_id, resp.status_code, err_text)
                     yield {
-                        "error": f"Inference backend returned error status {resp.status_code}.",
+                        "error": "Inference backend returned an error.",
                         "code": "BACKEND_ERROR",
                     }
                     return
@@ -221,57 +297,25 @@ class VLLMClient:
                     except UnicodeDecodeError as ue:
                         logger.error("UTF-8 incremental decoding error in stream [req_id=%s]: %s", request_id, ue)
                         yield {
-                            "error": f"UTF-8 decoding failure in backend stream: {ue}",
+                            "error": "UTF-8 decoding failure in backend stream.",
                             "code": "DECODE_ERROR",
                         }
                         return
 
                     while "\n\n" in buffer:
                         event_block, buffer = buffer.split("\n\n", 1)
-                        for line in event_block.splitlines():
-                            line = line.strip()
-                            if not line or line.startswith(":"):
-                                continue
-                            if line.startswith("data:"):
-                                data_str = line[len("data:") :].lstrip()
-                                if data_str == "[DONE]":
-                                    if observed_finish is None:
-                                        logger.error(
-                                            "Stream protocol error [req_id=%s]: received [DONE] before finish_reason",
-                                            request_id,
-                                        )
-                                        yield {
-                                            "error": "Backend sent [DONE] without prior finish_reason.",
-                                            "code": "UNEXPECTED_TERMINATION",
-                                        }
-                                    return
-                                try:
-                                    chunk = json.loads(data_str)
-                                except Exception as je:
-                                    logger.error(
-                                        "Malformed SSE JSON in stream [req_id=%s]: %r (%s)",
-                                        request_id,
-                                        data_str[:100],
-                                        je,
-                                    )
-                                    yield {
-                                        "error": f"Malformed stream chunk payload: {data_str[:100]}",
-                                        "code": "MALFORMED_FRAME",
-                                    }
-                                    return
-
-                                choices = chunk.get("choices", [])
-                                if choices:
-                                    text_part = choices[0].get("text", "")
-                                    finish = choices[0].get("finish_reason")
-                                    if finish is not None:
-                                        observed_finish = finish
-                                    yield {
-                                        "text": text_part,
-                                        "finish_reason": finish,
-                                    }
-                                    if finish:
-                                        return
+                        items, observed_finish, err_dict, is_done = self._parse_sse_event_block(
+                            event_block, observed_finish, request_id
+                        )
+                        if err_dict:
+                            yield err_dict
+                            return
+                        for item in items:
+                            yield item
+                            if item.get("finish_reason"):
+                                return
+                        if is_done:
+                            return
 
                 # Flush any final decoder bytes
                 try:
@@ -279,55 +323,55 @@ class VLLMClient:
                 except UnicodeDecodeError as ue:
                     logger.error("Incomplete UTF-8 sequence at stream EOF [req_id=%s]: %s", request_id, ue)
                     yield {
-                        "error": f"Incomplete UTF-8 sequence at stream EOF: {ue}",
+                        "error": "Incomplete UTF-8 sequence at stream EOF.",
                         "code": "DECODE_ERROR",
                     }
                     return
 
-                # Process remaining buffer if it contains complete event blocks
+                # Process remaining buffer (including any blocks with or without trailing \n\n)
                 while "\n\n" in buffer:
                     event_block, buffer = buffer.split("\n\n", 1)
-                    for line in event_block.splitlines():
-                        line = line.strip()
-                        if line.startswith("data:"):
-                            data_str = line[len("data:") :].lstrip()
-                            if data_str == "[DONE]":
-                                if observed_finish is None:
-                                    yield {
-                                        "error": "Backend sent [DONE] without prior finish_reason.",
-                                        "code": "UNEXPECTED_TERMINATION",
-                                    }
-                                return
-                            try:
-                                chunk = json.loads(data_str)
-                                choices = chunk.get("choices", [])
-                                if choices:
-                                    finish = choices[0].get("finish_reason")
-                                    if finish is not None:
-                                        observed_finish = finish
-                                    yield {
-                                        "text": choices[0].get("text", ""),
-                                        "finish_reason": finish,
-                                    }
-                                    if finish:
-                                        return
-                            except Exception:
-                                pass
+                    items, observed_finish, err_dict, is_done = self._parse_sse_event_block(
+                        event_block, observed_finish, request_id
+                    )
+                    if err_dict:
+                        yield err_dict
+                        return
+                    for item in items:
+                        yield item
+                        if item.get("finish_reason"):
+                            return
+                    if is_done:
+                        return
+
+                if buffer.strip():
+                    items, observed_finish, err_dict, is_done = self._parse_sse_event_block(
+                        buffer, observed_finish, request_id
+                    )
+                    if err_dict:
+                        yield err_dict
+                        return
+                    for item in items:
+                        yield item
+                        if item.get("finish_reason"):
+                            return
+                    if is_done:
+                        return
 
                 if observed_finish is None:
                     logger.error("Stream closed prematurely [req_id=%s] without terminal finish_reason", request_id)
                     yield {
-                        "error": "Stream closed prematurely by backend without terminal reason.",
+                        "error": "Inference stream closed prematurely.",
                         "code": "PREMATURE_CLOSE",
                     }
 
         except httpx.ConnectError as e:
             logger.error("Backend unreachable during streaming [req_id=%s]: %s", request_id, e)
-            yield {"error": "Inference backend unreachable during stream.", "code": "BACKEND_UNAVAILABLE"}
+            yield {"error": "Inference engine backend is unreachable.", "code": "BACKEND_UNAVAILABLE"}
         except httpx.TimeoutException as e:
             logger.error("Streaming timeout [req_id=%s]: %s", request_id, e)
             yield {"error": "Inference stream timed out.", "code": "STREAM_TIMEOUT"}
         except Exception as e:
             logger.exception("Unexpected error during stream [req_id=%s]: %s", request_id, e)
-            yield {"error": f"Stream error: {e}", "code": "STREAM_ERROR"}
+            yield {"error": "Inference streaming error occurred.", "code": "STREAM_ERROR"}
 

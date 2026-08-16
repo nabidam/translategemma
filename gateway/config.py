@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     model_dir: Optional[str] = "/models/model"
     tokenizer_path: Optional[str] = "/models/model"
     require_exact_tokenizer: bool = False
+    require_verified_manifest: bool = False
+    trusted_manifest_sha256: Optional[str] = None
+    trusted_anchor_file: Optional[str] = None
 
     # Model identity & provenance
     model_release_id: str = "translategemma-12b-it-merged"

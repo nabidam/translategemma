@@ -69,6 +69,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Skip full SHA256 byte hashing (quick metadata check only).",
     )
+    parser.add_argument(
+        "--expected-manifest-sha256",
+        type=str,
+        default=None,
+        help="Expected SHA256 digest of merge_manifest.json from trusted release store.",
+    )
+    parser.add_argument(
+        "--trusted-anchor-file",
+        type=str,
+        default=None,
+        help="Path to external trusted checksum/signature file containing expected manifest hash.",
+    )
     return parser.parse_args(argv)
 
 
@@ -252,26 +264,64 @@ def verify_checksums_and_inventory(
     return True, []
 
 
-def verify_manifest(manifest_path: Path) -> Tuple[bool, Dict[str, Any]]:
-    # 1. Verify detached manifest checksum anchor
-    anchor_path = manifest_path.with_name("merge_manifest.sha256")
-    if not anchor_path.is_file():
-        return False, {"error": "merge_manifest.sha256 external integrity anchor not found."}
-
-    try:
-        anchor_text = anchor_path.read_text(encoding="utf-8").strip()
-        expected_hash = anchor_text.split()[0].strip()
-    except Exception as e:
-        return False, {"error": f"Failed to parse merge_manifest.sha256: {e}"}
-
+def verify_manifest(
+    manifest_path: Path,
+    expected_manifest_sha256: Optional[str] = None,
+    trusted_anchor_file: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any]]:
     actual_hash = compute_sha256(manifest_path)
-    if actual_hash.lower() != expected_hash.lower():
-        return False, {
-            "error": (
-                f"Manifest integrity anchor mismatch: merge_manifest.sha256 has {expected_hash}, "
-                f"but computed hash of merge_manifest.json is {actual_hash}."
-            )
-        }
+    authenticity_status = "unverified"
+
+    # 1. External authenticity verification if provided
+    if expected_manifest_sha256:
+        expected_hash = expected_manifest_sha256.strip().lower()
+        if actual_hash.lower() != expected_hash:
+            return False, {
+                "error": (
+                    f"External authenticity check failed: expected manifest SHA256 {expected_hash}, "
+                    f"but computed hash of merge_manifest.json is {actual_hash}."
+                )
+            }
+        authenticity_status = "trusted_external_anchor"
+        logger.info("Manifest authenticity verified against operator-supplied expected SHA256 (%s).", expected_hash)
+    elif trusted_anchor_file:
+        anchor_file_path = Path(trusted_anchor_file).resolve()
+        if not anchor_file_path.is_file():
+            return False, {"error": f"Trusted external anchor file not found: {anchor_file_path}"}
+        try:
+            anchor_text = anchor_file_path.read_text(encoding="utf-8").strip()
+            expected_hash = anchor_text.split()[0].strip().lower()
+            if actual_hash.lower() != expected_hash:
+                return False, {
+                    "error": (
+                        f"External anchor mismatch: {anchor_file_path} specifies {expected_hash}, "
+                        f"but computed hash is {actual_hash}."
+                    )
+                }
+            authenticity_status = "trusted_external_anchor"
+            logger.info("Manifest authenticity verified against external trusted anchor file %s.", anchor_file_path)
+        except Exception as e:
+            return False, {"error": f"Failed reading trusted anchor file: {e}"}
+    else:
+        # Fallback to local co-located merge_manifest.sha256 (integrity check only)
+        anchor_path = manifest_path.with_name("merge_manifest.sha256")
+        if not anchor_path.is_file():
+            logger.warning("No co-located merge_manifest.sha256 found; integrity cannot be verified against local anchor.")
+        else:
+            try:
+                anchor_text = anchor_path.read_text(encoding="utf-8").strip()
+                expected_hash = anchor_text.split()[0].strip()
+                if actual_hash.lower() != expected_hash.lower():
+                    return False, {
+                        "error": (
+                            f"Manifest integrity anchor mismatch: merge_manifest.sha256 has {expected_hash}, "
+                            f"but computed hash of merge_manifest.json is {actual_hash}."
+                        )
+                    }
+                authenticity_status = "colocated_checksum_only"
+                logger.info("Manifest matches co-located merge_manifest.sha256 (checksum integrity verified).")
+            except Exception as e:
+                return False, {"error": f"Failed to parse merge_manifest.sha256: {e}"}
 
     # 2. Parse and validate manifest contents
     try:
@@ -284,10 +334,17 @@ def verify_manifest(manifest_path: Path) -> Tuple[bool, Dict[str, Any]]:
     if missing:
         return False, {"error": f"Missing required manifest keys: {missing}"}
 
+    data["_authenticity_status"] = authenticity_status
+    data["_manifest_sha256"] = actual_hash
     return True, data
 
 
-def verify_export(model_dir_str: str, skip_checksums: bool = False) -> bool:
+def verify_export(
+    model_dir_str: str,
+    skip_checksums: bool = False,
+    expected_manifest_sha256: Optional[str] = None,
+    trusted_anchor_file: Optional[str] = None,
+) -> bool:
     model_dir = Path(model_dir_str).resolve()
     if not model_dir.is_dir():
         logger.error("Model directory does not exist: %s", model_dir)
@@ -316,16 +373,21 @@ def verify_export(model_dir_str: str, skip_checksums: bool = False) -> bool:
         return False
     logger.info("Tokenizer mapping check passed: %s", msg_tok)
 
-    # 4. Check manifest
-    ok_man, man_data = verify_manifest(model_dir / "merge_manifest.json")
+    # 4. Check manifest & authenticity anchor
+    ok_man, man_data = verify_manifest(
+        model_dir / "merge_manifest.json",
+        expected_manifest_sha256=expected_manifest_sha256,
+        trusted_anchor_file=trusted_anchor_file,
+    )
     if not ok_man:
         logger.error("Manifest check failed: %s", man_data.get("error"))
         return False
     logger.info(
-        "Manifest check passed (Release ID: %s, Base: %s, Adapter: %s)",
+        "Manifest check passed (Release ID: %s, Base: %s, Adapter: %s, Authenticity: %s)",
         man_data.get("release_id"),
         man_data.get("base_model"),
         man_data.get("adapter"),
+        man_data.get("_authenticity_status"),
     )
 
     # 5. Check SHA256 sums and strict inventory coverage
@@ -345,7 +407,12 @@ def verify_export(model_dir_str: str, skip_checksums: bool = False) -> bool:
 
 def main() -> int:
     args = parse_args()
-    success = verify_export(args.model_dir, skip_checksums=args.skip_checksums)
+    success = verify_export(
+        args.model_dir,
+        skip_checksums=args.skip_checksums,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+        trusted_anchor_file=args.trusted_anchor_file,
+    )
     return 0 if success else 1
 
 

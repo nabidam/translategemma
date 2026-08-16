@@ -149,5 +149,20 @@ def test_verify_export_end_to_end(tmp_path):
     manifest_hash = compute_sha256(manifest_path)
     (model_dir / "merge_manifest.sha256").write_text(f"{manifest_hash}  merge_manifest.json\n")
 
+    # 1. Verification with local anchor
     assert verify_export(str(model_dir), skip_checksums=False) is True
+
+    # 2. Verification with expected manifest SHA256
+    assert verify_export(str(model_dir), expected_manifest_sha256=manifest_hash) is True
+    assert verify_export(str(model_dir), expected_manifest_sha256="wronghash123") is False
+
+    # 3. Verification with external trusted anchor file
+    ext_anchor_file = tmp_path / "trusted_anchor.sha256"
+    ext_anchor_file.write_text(f"{manifest_hash}  merge_manifest.json\n")
+    assert verify_export(str(model_dir), trusted_anchor_file=str(ext_anchor_file)) is True
+
+    bad_ext_anchor = tmp_path / "bad_anchor.sha256"
+    bad_ext_anchor.write_text("badhash99999  merge_manifest.json\n")
+    assert verify_export(str(model_dir), trusted_anchor_file=str(bad_ext_anchor)) is False
+
 

@@ -294,3 +294,52 @@ def test_gateway_api_endpoints():
     assert resp_down.status_code == 503
     assert resp_down.json() == {"translator": "FAIL"}
 
+
+def test_body_size_limit_middleware_chunked_streaming():
+    """Verify ASGI body limit middleware rejects streaming/chunked requests exceeding limit without crashing."""
+    settings = Settings(max_request_body_bytes=50)
+    app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_request_body_bytes)
+    client = TestClient(app)
+
+    def chunk_generator():
+        yield b'{"text": "'
+        yield b'A' * 60
+        yield b'"}'
+
+    resp = client.post(
+        "/translate",
+        content=chunk_generator(),
+        headers={"Transfer-Encoding": "chunked"},
+    )
+    assert resp.status_code == 413
+    assert "exceeded limit" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_vllm_client_stream_error_sanitization():
+    """Verify stream errors never leak raw exception text, raw bytes, or internal URLs."""
+    settings = Settings(vllm_model_name="translategemma")
+    client = VLLMClient(settings)
+
+    # Test malformed frame parsing
+    items, finish, err, is_done = client._parse_sse_event_block(
+        "data: {invalid json frame}\n\n",
+        observed_finish=None,
+        request_id="test-req-1",
+    )
+    assert err is not None
+    assert err["code"] == "MALFORMED_FRAME"
+    assert "{invalid json frame}" not in err["error"]  # Sanitized!
+    assert err["error"] == "Malformed stream frame received from backend."
+
+    # Test unrecognized SSE line structure
+    items, finish, err, is_done = client._parse_sse_event_block(
+        "raw_garbage_without_sse_prefix\n\n",
+        observed_finish=None,
+        request_id="test-req-2",
+    )
+    assert err is not None
+    assert err["code"] == "MALFORMED_FRAME"
+    assert "raw_garbage" not in err["error"]
+
+
