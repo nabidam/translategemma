@@ -67,6 +67,40 @@ def test_verify_checksums_and_inventory_traversal_rejection(tmp_path):
     assert any("path traversal" in err for err in errors)
 
 
+def test_verify_manifest_anchor_validation(tmp_path):
+    manifest_path = tmp_path / "merge_manifest.json"
+    anchor_path = tmp_path / "merge_manifest.sha256"
+
+    manifest_data = {
+        "release_id": "test-v1",
+        "created_at": "2026-08-16T00:00:00Z",
+        "base_model": "google/translategemma-12b-it",
+        "adapter": "test-adapter",
+        "stop_token_ids": [1, 106],
+        "file_inventory": [],
+    }
+    manifest_bytes = json.dumps(manifest_data, indent=2).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+
+    # 1. Missing anchor -> fail
+    ok, err = verify_manifest(manifest_path)
+    assert not ok
+    assert "anchor not found" in err["error"]
+
+    # 2. Tampered anchor -> fail
+    anchor_path.write_text("badhash12345  merge_manifest.json\n")
+    ok, err = verify_manifest(manifest_path)
+    assert not ok
+    assert "anchor mismatch" in err["error"]
+
+    # 3. Valid anchor -> pass
+    valid_hash = compute_sha256(manifest_path)
+    anchor_path.write_text(f"{valid_hash}  merge_manifest.json\n")
+    ok, parsed = verify_manifest(manifest_path)
+    assert ok
+    assert parsed["release_id"] == "test-v1"
+
+
 def test_verify_export_end_to_end(tmp_path):
     model_dir = tmp_path / "test_release"
     model_dir.mkdir()
@@ -108,6 +142,12 @@ def test_verify_export_end_to_end(tmp_path):
         "stop_token_ids": [1, 106],
         "file_inventory": file_inventory,
     }
-    (model_dir / "merge_manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest_path = model_dir / "merge_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    # Write detached merge_manifest.sha256 anchor
+    manifest_hash = compute_sha256(manifest_path)
+    (model_dir / "merge_manifest.sha256").write_text(f"{manifest_hash}  merge_manifest.json\n")
 
     assert verify_export(str(model_dir), skip_checksums=False) is True
+

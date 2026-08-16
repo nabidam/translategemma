@@ -46,33 +46,85 @@ logging.basicConfig(
 logger = logging.getLogger("gateway.main")
 
 
-class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
-    """Rejects oversized requests with HTTP 413 before body parsing."""
+class BodySizeLimitMiddleware:
+    """Rejects oversized requests before/during body reading, handling chunked, missing-length, and invalid headers."""
 
     def __init__(self, app, max_body_bytes: int):
-        super().__init__(app)
+        self.app = app
         self.max_body_bytes = max_body_bytes
 
-    async def dispatch(self, request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length:
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        cl_header = headers.get(b"content-length")
+        if cl_header is not None:
             try:
-                length = int(content_length)
+                length = int(cl_header.decode("latin1"))
+                if length < 0:
+                    response = JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={"detail": "Invalid negative Content-Length header."},
+                    )
+                    await response(scope, receive, send)
+                    return
                 if length > self.max_body_bytes:
-                    return JSONResponse(
+                    response = JSONResponse(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         content={"detail": f"Request body ({length} bytes) exceeds limit ({self.max_body_bytes} bytes)."},
                     )
+                    await response(scope, receive, send)
+                    return
             except ValueError:
-                pass
-        return await call_next(request)
+                response = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid non-integer Content-Length header."},
+                )
+                await response(scope, receive, send)
+                return
+
+        total_received = 0
+
+        async def limited_receive():
+            nonlocal total_received
+            message = await receive()
+            if message["type"] == "http.request":
+                body = message.get("body", b"")
+                total_received += len(body)
+                if total_received > self.max_body_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Request body exceeded limit of {self.max_body_bytes} bytes during stream transfer.",
+                    )
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
+                response = JSONResponse(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    content={"detail": exc.detail},
+                )
+                await response(scope, receive, send)
+            else:
+                raise
 
 
 class CanonicalPromptRenderer:
     """Renders prompts using the canonical TranslateGemma chat template and boundary cut."""
 
-    def __init__(self, processor_or_tokenizer: Any = None):
+    def __init__(self, processor_or_tokenizer: Any = None, allow_fallback: bool = False):
         self.processor = processor_or_tokenizer
+        self.allow_fallback = allow_fallback
+        if self.processor is not None and hasattr(self.processor, "apply_chat_template"):
+            self.mode = "canonical"
+        elif allow_fallback:
+            self.mode = "fallback"
+        else:
+            self.mode = "none"
 
     def render(self, source_lang: str, target_lang: str, text: str) -> str:
         # Structured user message matching train.py and api/translator.py exactly
@@ -91,8 +143,13 @@ class CanonicalPromptRenderer:
         if self.processor is not None and hasattr(self.processor, "apply_chat_template"):
             return render_training_prompt(self.processor, user_message)
 
-        # Fallback only when processor is absent in standalone/test execution
-        # SFT block indentation prefix
+        if not self.allow_fallback:
+            raise RuntimeError(
+                "Canonical processor rendering is required in production, but AutoProcessor with apply_chat_template "
+                "is not initialized. Check model mount and dependencies."
+            )
+
+        # Fallback only when explicitly permitted in isolated unit-test execution
         marker_template = (
             f"<start_of_turn>user\n"
             f"<<<source>>>{source_lang}<<<target>>>{target_lang}<<<text>>>{text}<end_of_turn>\n"
@@ -107,33 +164,44 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Initializing TranslateGemma Serving Gateway (1 worker per process)...")
 
-    # Startup validation: ensure context limits align
+    # Startup validation: ensure context limits strictly align
     if settings.max_total_context_tokens != settings.vllm_max_model_len:
-        if settings.max_total_context_tokens > settings.vllm_max_model_len:
-            raise ValueError(
-                f"Configuration mismatch: TG_MAX_TOTAL_CONTEXT_TOKENS ({settings.max_total_context_tokens}) "
-                f"cannot exceed TG_VLLM_MAX_MODEL_LEN ({settings.vllm_max_model_len})."
-            )
+        raise ValueError(
+            f"Configuration mismatch: TG_MAX_TOTAL_CONTEXT_TOKENS ({settings.max_total_context_tokens}) "
+            f"must equal TG_VLLM_MAX_MODEL_LEN ({settings.vllm_max_model_len}) for single authoritative context alignment."
+        )
 
     # Load processor/tokenizer for exact rendering & admission token counting
     processor_or_tok = None
     tok_path = settings.tokenizer_path or settings.model_dir
+    processor_mode = "none"
     if tok_path:
         try:
             from transformers import AutoProcessor
             processor_or_tok = AutoProcessor.from_pretrained(tok_path, fix_markdown=False)
-            logger.info("Loaded exact AutoProcessor from %s for prompt rendering.", tok_path)
+            if hasattr(processor_or_tok, "apply_chat_template"):
+                processor_mode = "canonical"
+                logger.info("Loaded exact AutoProcessor from %s for prompt rendering.", tok_path)
         except Exception as e:
             logger.debug("AutoProcessor not loaded from %s (%s); trying TokenEstimator...", tok_path, e)
 
     estimator = TokenEstimator(tokenizer_path=tok_path)
-    if settings.require_exact_tokenizer and estimator.mode != "exact":
-        raise RuntimeError(
-            f"TG_REQUIRE_EXACT_TOKENIZER=true, but exact tokenizer could not be loaded from {tok_path}. "
-            "Mount the verified model artifact or check tokenizer dependencies."
-        )
+    if settings.require_exact_tokenizer:
+        if estimator.mode != "exact":
+            raise RuntimeError(
+                f"TG_REQUIRE_EXACT_TOKENIZER=true, but exact tokenizer could not be loaded from {tok_path}. "
+                "Mount the verified model artifact or check tokenizer dependencies."
+            )
+        if processor_mode != "canonical":
+            raise RuntimeError(
+                f"TG_REQUIRE_EXACT_TOKENIZER=true, but canonical AutoProcessor chat template could not be loaded from {tok_path}. "
+                "Mount the verified model artifact or check transformers dependencies."
+            )
 
-    renderer = CanonicalPromptRenderer(processor_or_tok)
+    renderer = CanonicalPromptRenderer(
+        processor_or_tok,
+        allow_fallback=(not settings.require_exact_tokenizer),
+    )
     vllm_client = VLLMClient(settings)
     concurrency_mgr = ConcurrencyManager(settings)
     validator = RequestValidator(settings, estimator)
@@ -177,7 +245,7 @@ app = FastAPI(
 
 _initial_settings = get_settings()
 app.add_middleware(
-    ContentLengthLimitMiddleware,
+    BodySizeLimitMiddleware,
     max_body_bytes=_initial_settings.max_request_body_bytes,
 )
 app.add_middleware(
@@ -295,15 +363,17 @@ async def ready_check(
     settings: Settings = Depends(get_settings),
     vllm_client: VLLMClient = Depends(get_vllm_client),
 ):
-    """Extended readiness probe verifying engine and exact model registration."""
+    """Extended readiness probe verifying engine, exact tokenizer, and canonical processor."""
     is_healthy = await vllm_client.check_health()
     estimator = request.app.state.estimator
+    renderer = request.app.state.renderer
     if is_healthy:
         return ReadyResponse(
             translator="OK",
             ready=True,
             model_name=settings.vllm_model_name,
             estimator_mode=estimator.mode,
+            processor_mode=renderer.mode,
         )
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -312,6 +382,7 @@ async def ready_check(
             "ready": False,
             "model_name": settings.vllm_model_name,
             "estimator_mode": estimator.mode,
+            "processor_mode": renderer.mode,
             "detail": "Backend vLLM server is unreachable or exact model is not loaded.",
         },
     )
@@ -324,6 +395,7 @@ async def model_info(
 ):
     """Reports provenance, exact context limits, and runtime configuration."""
     estimator = request.app.state.estimator
+    renderer = request.app.state.renderer
     return ModelInfoResponse(
         model_release_id=settings.model_release_id,
         base_model_id=settings.base_model_id,
@@ -340,6 +412,7 @@ async def model_info(
         vllm_model_name=settings.vllm_model_name,
         vllm_base_url=settings.vllm_base_url,
         estimator_mode=estimator.mode,
+        processor_mode=renderer.mode,
     )
 
 
@@ -387,7 +460,11 @@ async def translate(
                     is_bulk=False,
                 )
 
-            translated_sentences = await dispatch_structured_batch(sentences, _tr_sentence)
+            translated_sentences = await dispatch_structured_batch(
+                sentences,
+                _tr_sentence,
+                max_concurrency=settings.max_concurrent_requests,
+            )
             final_translation = " ".join(translated_sentences)
             return TranslationResponse(
                 translation=final_translation,
@@ -458,7 +535,11 @@ async def translate_batch(
             is_bulk=True,
         )
 
-    translations = await dispatch_structured_batch(prompt.texts, _tr_item)
+    translations = await dispatch_structured_batch(
+        prompt.texts,
+        _tr_item,
+        max_concurrency=settings.max_bulk_concurrent_requests,
+    )
     return BatchTranslationResponse(
         translations=translations,
         system=system_name,
@@ -489,6 +570,7 @@ async def translate_stream(
 
     async def _event_generator():
         await concurrency_mgr.acquire(is_bulk=False)
+        emitted_terminal = False
         try:
             async for chunk in vllm_client.generate_stream_completion(
                 prompt=raw_prompt,
@@ -502,6 +584,7 @@ async def translate_stream(
                         "request_id": req_id,
                     }
                     yield f"event: error\ndata: {json.dumps(err_event)}\n\n"
+                    emitted_terminal = True
                     break
 
                 text_chunk = chunk.get("text", "")
@@ -530,7 +613,17 @@ async def translate_stream(
                             "request_id": req_id,
                         }
                         yield f"event: done\ndata: {json.dumps(done_event)}\n\n"
+                    emitted_terminal = True
                     break
+
+            if not emitted_terminal:
+                incomplete_err = {
+                    "error": "Stream closed prematurely without terminal completion event.",
+                    "code": "INCOMPLETE_STREAM",
+                    "request_id": req_id,
+                }
+                yield f"event: error\ndata: {json.dumps(incomplete_err)}\n\n"
+
         finally:
             concurrency_mgr.release(is_bulk=False)
 

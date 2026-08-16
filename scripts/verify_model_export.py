@@ -39,12 +39,14 @@ REQUIRED_BASE_FILES: Set[str] = {
     "tokenizer_config.json",
     "special_tokens_map.json",
     "merge_manifest.json",
+    "merge_manifest.sha256",
     "SHA256SUMS",
 }
 
 METADATA_RELEASE_FILES: Set[str] = {
     "SHA256SUMS",
     "merge_manifest.json",
+    "merge_manifest.sha256",
 }
 
 EXPECTED_STOP_TOKEN_IDS: Set[int] = {1, 106}
@@ -251,6 +253,27 @@ def verify_checksums_and_inventory(
 
 
 def verify_manifest(manifest_path: Path) -> Tuple[bool, Dict[str, Any]]:
+    # 1. Verify detached manifest checksum anchor
+    anchor_path = manifest_path.with_name("merge_manifest.sha256")
+    if not anchor_path.is_file():
+        return False, {"error": "merge_manifest.sha256 external integrity anchor not found."}
+
+    try:
+        anchor_text = anchor_path.read_text(encoding="utf-8").strip()
+        expected_hash = anchor_text.split()[0].strip()
+    except Exception as e:
+        return False, {"error": f"Failed to parse merge_manifest.sha256: {e}"}
+
+    actual_hash = compute_sha256(manifest_path)
+    if actual_hash.lower() != expected_hash.lower():
+        return False, {
+            "error": (
+                f"Manifest integrity anchor mismatch: merge_manifest.sha256 has {expected_hash}, "
+                f"but computed hash of merge_manifest.json is {actual_hash}."
+            )
+        }
+
+    # 2. Parse and validate manifest contents
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as e:

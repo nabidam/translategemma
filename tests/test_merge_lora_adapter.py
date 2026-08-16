@@ -66,16 +66,22 @@ def test_validate_adapter_compatibility_exact_match(tmp_path):
         "peft_type": "LORA",
         "r": 16,
         "lora_alpha": 32,
+        "target_modules": ["q_proj", "v_proj"],
     }))
 
     with patch("peft.PeftConfig.from_pretrained") as mock_peft_config:
         mock_obj = MagicMock()
         mock_obj.base_model_name_or_path = "google/translategemma-12b-it"
+        mock_obj.peft_type = "LORA"
+        mock_obj.r = 16
+        mock_obj.lora_alpha = 32
+        mock_obj.target_modules = ["q_proj", "v_proj"]
         mock_peft_config.return_value = mock_obj
 
-        peft_cfg, matched = validate_adapter_compatibility("google/translategemma-12b-it", adapter_dir)
+        peft_cfg, matched, arch = validate_adapter_compatibility("google/translategemma-12b-it", adapter_dir)
         assert peft_cfg == mock_obj
         assert matched is True
+        assert arch["r"] == 16
 
 
 def test_validate_adapter_compatibility_unrelated_repo_rejection(tmp_path):
@@ -90,9 +96,11 @@ def test_validate_adapter_compatibility_unrelated_repo_rejection(tmp_path):
     with patch("peft.PeftConfig.from_pretrained") as mock_peft_config:
         mock_obj = MagicMock()
         mock_obj.base_model_name_or_path = "other-org/translategemma-12b-it"
+        mock_obj.peft_type = "LORA"
+        mock_obj.target_modules = []
         mock_peft_config.return_value = mock_obj
 
-        # Even with same basename, different org repository ID must be rejected
+        # Rejection without override
         with pytest.raises(ValueError, match="does not match requested base model"):
             validate_adapter_compatibility(
                 "google/translategemma-12b-it",
@@ -100,10 +108,54 @@ def test_validate_adapter_compatibility_unrelated_repo_rejection(tmp_path):
                 allow_mismatch=False,
             )
 
-        # With explicit override: succeeds
-        peft_cfg, matched = validate_adapter_compatibility(
+        # Rejection with override but missing reason
+        with pytest.raises(ValueError, match="requires an explicit --override-reason"):
+            validate_adapter_compatibility(
+                "google/translategemma-12b-it",
+                adapter_dir,
+                allow_mismatch=True,
+                override_reason=None,
+            )
+
+        # Success with explicit override reason
+        peft_cfg, matched, _ = validate_adapter_compatibility(
             "google/translategemma-12b-it",
             adapter_dir,
             allow_mismatch=True,
+            override_reason="Forked base model with identical weights.",
         )
         assert matched is False
+
+
+def test_validate_adapter_compatibility_missing_base_identity(tmp_path):
+    adapter_dir = tmp_path / "adapter_missing_base"
+    adapter_dir.mkdir()
+    config_file = adapter_dir / "adapter_config.json"
+    config_file.write_text(json.dumps({
+        "peft_type": "LORA",
+    }))
+
+    with patch("peft.PeftConfig.from_pretrained") as mock_peft_config:
+        mock_obj = MagicMock()
+        mock_obj.base_model_name_or_path = None
+        mock_obj.peft_type = "LORA"
+        mock_obj.target_modules = []
+        mock_peft_config.return_value = mock_obj
+
+        # Rejection without override
+        with pytest.raises(ValueError, match="Adapter config does not specify base_model_name_or_path"):
+            validate_adapter_compatibility(
+                "google/translategemma-12b-it",
+                adapter_dir,
+                allow_mismatch=False,
+            )
+
+        # Success with override and reason
+        peft_cfg, matched, _ = validate_adapter_compatibility(
+            "google/translategemma-12b-it",
+            adapter_dir,
+            allow_mismatch=True,
+            override_reason="Legacy fine-tune without base path tag.",
+        )
+        assert matched is False
+

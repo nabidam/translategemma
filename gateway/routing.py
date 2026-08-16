@@ -67,12 +67,24 @@ class SentenceSplitter:
 async def dispatch_structured_batch(
     items: List[str],
     translate_fn: Callable[[str], Coroutine[None, None, str]],
+    max_concurrency: int = 16,
 ) -> List[str]:
-    """Execute concurrent translations with structured cancellation on failure."""
-    tasks = [asyncio.create_task(translate_fn(item)) for item in items]
+    """Execute translations with bounded worker concurrency and structured cancellation on failure."""
+    if not items:
+        return []
+
+    results: List[Optional[str]] = [None] * len(items)
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _worker(idx: int, item: str):
+        async with sem:
+            res = await translate_fn(item)
+            results[idx] = res
+
+    tasks = [asyncio.create_task(_worker(i, item)) for i, item in enumerate(items)]
     try:
-        results = await asyncio.gather(*tasks)
-        return list(results)
+        await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
     except Exception as e:
         logger.error("Error during structured batch execution; cancelling pending tasks: %s", e)
         for t in tasks:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -120,10 +121,10 @@ class VLLMClient:
         try:
             resp = await self.client.post("/completions", json=payload, headers=headers)
             if resp.status_code != 200:
-                logger.error("vLLM error HTTP %d: %s", resp.status_code, resp.text)
+                logger.error("vLLM error [req_id=%s] HTTP %d: %s", request_id, resp.status_code, resp.text)
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"vLLM backend returned error {resp.status_code}: {resp.text}",
+                    detail=f"Inference backend returned error status {resp.status_code}.",
                 )
 
             data = resp.json()
@@ -131,7 +132,7 @@ class VLLMClient:
             if not choices:
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="vLLM returned empty completion choices.",
+                    detail="Inference backend returned empty completion choices.",
                 )
 
             choice = choices[0]
@@ -141,8 +142,9 @@ class VLLMClient:
 
             if finish_reason == "length":
                 logger.error(
-                    "Generation truncated by max_tokens limit (%d tokens) without reaching stop token.",
+                    "Generation truncated by max_tokens limit (%d tokens) [req_id=%s].",
                     max_tokens,
+                    request_id,
                 )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -156,13 +158,13 @@ class VLLMClient:
             return text, finish_reason, usage
 
         except httpx.ConnectError as e:
-            logger.error("Cannot connect to vLLM at %s: %s", self.base_url, e)
+            logger.error("Cannot connect to vLLM at %s [req_id=%s]: %s", self.base_url, request_id, e)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Inference engine backend is unreachable.",
             ) from e
         except httpx.TimeoutException as e:
-            logger.error("vLLM request timed out: %s", e)
+            logger.error("vLLM request timed out [req_id=%s]: %s", request_id, e)
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Inference generation timed out.",
@@ -170,7 +172,7 @@ class VLLMClient:
         except HTTPException:
             raise
         except Exception as e:
-            logger.exception("Unexpected error in vLLM communication: %s", e)
+            logger.exception("Unexpected error in vLLM communication [req_id=%s]: %s", request_id, e)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Inference gateway error: {e}",
@@ -184,7 +186,7 @@ class VLLMClient:
         stop_tokens: Optional[List[str]] = None,
         request_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream completion chunks via SSE from vLLM without corrupting chunk framing."""
+        """Stream completion chunks via SSE from vLLM with stateful UTF-8 decoding and terminal validation."""
         payload = self.build_raw_completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -197,46 +199,135 @@ class VLLMClient:
         if request_id:
             headers["X-Request-ID"] = request_id
 
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        observed_finish: Optional[str] = None
+
         try:
             async with self.client.stream("POST", "/completions", json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
-                    err_text = await resp.aread()
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"vLLM streaming error {resp.status_code}: {err_text.decode('utf-8', errors='replace')}",
-                    )
+                    err_bytes = await resp.aread()
+                    err_text = err_bytes.decode("utf-8", errors="replace")
+                    logger.error("vLLM streaming error [req_id=%s] HTTP %d: %s", request_id, resp.status_code, err_text)
+                    yield {
+                        "error": f"Inference backend returned error status {resp.status_code}.",
+                        "code": "BACKEND_ERROR",
+                    }
+                    return
 
                 buffer = ""
                 async for raw_bytes in resp.aiter_bytes():
-                    buffer += raw_bytes.decode("utf-8", errors="replace")
+                    try:
+                        buffer += utf8_decoder.decode(raw_bytes, final=False)
+                    except UnicodeDecodeError as ue:
+                        logger.error("UTF-8 incremental decoding error in stream [req_id=%s]: %s", request_id, ue)
+                        yield {
+                            "error": f"UTF-8 decoding failure in backend stream: {ue}",
+                            "code": "DECODE_ERROR",
+                        }
+                        return
+
                     while "\n\n" in buffer:
                         event_block, buffer = buffer.split("\n\n", 1)
                         for line in event_block.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith(":"):
+                                continue
                             if line.startswith("data:"):
                                 data_str = line[len("data:") :].lstrip()
                                 if data_str == "[DONE]":
+                                    if observed_finish is None:
+                                        logger.error(
+                                            "Stream protocol error [req_id=%s]: received [DONE] before finish_reason",
+                                            request_id,
+                                        )
+                                        yield {
+                                            "error": "Backend sent [DONE] without prior finish_reason.",
+                                            "code": "UNEXPECTED_TERMINATION",
+                                        }
                                     return
                                 try:
                                     chunk = json.loads(data_str)
-                                    choices = chunk.get("choices", [])
-                                    if choices:
-                                        text_part = choices[0].get("text", "")
-                                        finish = choices[0].get("finish_reason")
-                                        yield {
-                                            "text": text_part,
-                                            "finish_reason": finish,
-                                        }
-                                        if finish:
-                                            return
-                                except Exception:
-                                    continue
+                                except Exception as je:
+                                    logger.error(
+                                        "Malformed SSE JSON in stream [req_id=%s]: %r (%s)",
+                                        request_id,
+                                        data_str[:100],
+                                        je,
+                                    )
+                                    yield {
+                                        "error": f"Malformed stream chunk payload: {data_str[:100]}",
+                                        "code": "MALFORMED_FRAME",
+                                    }
+                                    return
+
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    text_part = choices[0].get("text", "")
+                                    finish = choices[0].get("finish_reason")
+                                    if finish is not None:
+                                        observed_finish = finish
+                                    yield {
+                                        "text": text_part,
+                                        "finish_reason": finish,
+                                    }
+                                    if finish:
+                                        return
+
+                # Flush any final decoder bytes
+                try:
+                    buffer += utf8_decoder.decode(b"", final=True)
+                except UnicodeDecodeError as ue:
+                    logger.error("Incomplete UTF-8 sequence at stream EOF [req_id=%s]: %s", request_id, ue)
+                    yield {
+                        "error": f"Incomplete UTF-8 sequence at stream EOF: {ue}",
+                        "code": "DECODE_ERROR",
+                    }
+                    return
+
+                # Process remaining buffer if it contains complete event blocks
+                while "\n\n" in buffer:
+                    event_block, buffer = buffer.split("\n\n", 1)
+                    for line in event_block.splitlines():
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            data_str = line[len("data:") :].lstrip()
+                            if data_str == "[DONE]":
+                                if observed_finish is None:
+                                    yield {
+                                        "error": "Backend sent [DONE] without prior finish_reason.",
+                                        "code": "UNEXPECTED_TERMINATION",
+                                    }
+                                return
+                            try:
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    finish = choices[0].get("finish_reason")
+                                    if finish is not None:
+                                        observed_finish = finish
+                                    yield {
+                                        "text": choices[0].get("text", ""),
+                                        "finish_reason": finish,
+                                    }
+                                    if finish:
+                                        return
+                            except Exception:
+                                pass
+
+                if observed_finish is None:
+                    logger.error("Stream closed prematurely [req_id=%s] without terminal finish_reason", request_id)
+                    yield {
+                        "error": "Stream closed prematurely by backend without terminal reason.",
+                        "code": "PREMATURE_CLOSE",
+                    }
 
         except httpx.ConnectError as e:
-            logger.error("Backend unreachable during streaming: %s", e)
+            logger.error("Backend unreachable during streaming [req_id=%s]: %s", request_id, e)
             yield {"error": "Inference backend unreachable during stream.", "code": "BACKEND_UNAVAILABLE"}
         except httpx.TimeoutException as e:
-            logger.error("Streaming timeout: %s", e)
+            logger.error("Streaming timeout [req_id=%s]: %s", request_id, e)
             yield {"error": "Inference stream timed out.", "code": "STREAM_TIMEOUT"}
         except Exception as e:
-            logger.exception("Unexpected error during stream: %s", e)
+            logger.exception("Unexpected error during stream [req_id=%s]: %s", request_id, e)
             yield {"error": f"Stream error: {e}", "code": "STREAM_ERROR"}
+

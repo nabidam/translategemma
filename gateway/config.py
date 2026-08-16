@@ -35,9 +35,12 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = 64
     max_bulk_concurrent_requests: int = 16
     max_queue_depth: int = 128
+    max_interactive_queue_depth: int = 128
+    max_bulk_queue_depth: int = 64
     max_request_body_bytes: int = 1_000_000  # 1MB
     max_batch_items: int = 128
     max_batch_total_chars: int = 200_000
+    max_batch_total_tokens: int = 32_768
     max_source_chars_per_text: int = 50_000
     max_estimated_source_tokens: int = 3584
     max_total_context_tokens: int = 4096  # strictly aligned with vllm_max_model_len

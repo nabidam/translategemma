@@ -1,6 +1,7 @@
 services:
   vllm:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.13.0}
+    # Production deployment requires immutable digest pinning to guarantee engine kernel parity
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.13.0@sha256:7b5cf896b0105374bebb974c0529d47913364f33161c5ca155452f1e29e96ee1}
     container_name: translategemma-vllm
     restart: unless-stopped
     ipc: host

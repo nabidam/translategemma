@@ -120,6 +120,7 @@ class ReadyResponse(BaseModel):
     ready: bool
     model_name: str
     estimator_mode: str
+    processor_mode: str = "canonical"
     detail: Optional[str] = None
 
 
@@ -141,5 +142,6 @@ class ModelInfoResponse(BaseModel):
     vllm_model_name: str
     vllm_base_url: str
     estimator_mode: str
+    processor_mode: str = "canonical"
     prompt_contract_version: str = "2026-08-10"
     routing_policy_version: str = "v1"

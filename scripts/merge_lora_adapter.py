@@ -86,13 +86,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--base-revision",
         type=str,
         default=None,
-        help="Base model revision/commit hash for provenance tracking.",
+        help="Base model revision/commit hash for model loading and provenance tracking.",
     )
     parser.add_argument(
         "--adapter-revision",
         type=str,
         default=None,
-        help="Adapter git commit or version tag for provenance tracking.",
+        help="Adapter git commit or version tag for adapter loading and provenance tracking.",
     )
     parser.add_argument(
         "--dtype",
@@ -122,6 +122,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Allow merge even if adapter's configured base model differs from --base-model.",
     )
+    parser.add_argument(
+        "--override-reason",
+        type=str,
+        default=None,
+        help="Explicit justification required when using --allow-base-mismatch.",
+    )
     return parser.parse_args(argv)
 
 
@@ -132,6 +138,19 @@ def compute_file_sha256(file_path: Path) -> str:
         while chunk := f.read(1024 * 1024):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def compute_directory_fingerprint(dir_path: Path) -> Dict[str, str]:
+    """Compute SHA256 fingerprints of key configuration and weight files in a directory."""
+    fingerprints = {}
+    for item in sorted(dir_path.iterdir()):
+        if item.is_file() and (
+            item.name.endswith(".json")
+            or item.name.endswith(".safetensors")
+            or item.name.endswith(".bin")
+        ):
+            fingerprints[item.name] = compute_file_sha256(item)
+    return fingerprints
 
 
 def get_package_versions() -> Dict[str, str]:
@@ -158,15 +177,17 @@ def validate_adapter_compatibility(
     base_model_id: str,
     adapter_path: Path,
     allow_mismatch: bool = False,
-) -> Tuple[PeftConfig, bool]:
-    """Ensure adapter exists and matches the exact base model."""
+    override_reason: Optional[str] = None,
+    adapter_revision: Optional[str] = None,
+) -> Tuple[PeftConfig, bool, Dict[str, Any]]:
+    """Ensure adapter exists and matches the exact base model and architecture."""
     adapter_config_file = adapter_path / "adapter_config.json"
     if not adapter_config_file.is_file():
         raise FileNotFoundError(
             f"adapter_config.json not found in adapter directory: {adapter_path}"
         )
 
-    peft_config = PeftConfig.from_pretrained(str(adapter_path))
+    peft_config = PeftConfig.from_pretrained(str(adapter_path), revision=adapter_revision)
     logger.info("Loaded adapter config: %s", peft_config)
 
     configured_base = getattr(peft_config, "base_model_name_or_path", None)
@@ -185,12 +206,28 @@ def validate_adapter_compatibility(
                 f"requested base model ({base_model_id!r})."
             )
             if not allow_mismatch:
-                raise ValueError(f"{msg} Pass --allow-base-mismatch to force merge.")
-            logger.warning("%s Proceeding because --allow-base-mismatch is enabled.", msg)
+                raise ValueError(f"{msg} Pass --allow-base-mismatch and --override-reason to force merge.")
+            if not override_reason or not override_reason.strip():
+                raise ValueError(f"{msg} --allow-base-mismatch requires an explicit --override-reason.")
+            logger.warning("%s Proceeding under explicit override: %s", msg, override_reason)
     else:
-        logger.warning("Adapter config does not specify base_model_name_or_path.")
+        msg = "Adapter config does not specify base_model_name_or_path."
+        if not allow_mismatch:
+            raise ValueError(f"{msg} Rejecting merge. Pass --allow-base-mismatch and --override-reason to force.")
+        if not override_reason or not override_reason.strip():
+            raise ValueError(f"{msg} --allow-base-mismatch requires an explicit --override-reason.")
+        logger.warning("%s Proceeding under explicit override: %s", msg, override_reason)
 
-    return peft_config, base_matched
+    arch_fingerprint = {
+        "peft_type": str(getattr(peft_config, "peft_type", "unknown")),
+        "r": getattr(peft_config, "r", None),
+        "lora_alpha": getattr(peft_config, "lora_alpha", None),
+        "target_modules": sorted(list(getattr(peft_config, "target_modules", [])))
+        if isinstance(getattr(peft_config, "target_modules", None), (list, set, tuple))
+        else getattr(peft_config, "target_modules", None),
+    }
+
+    return peft_config, base_matched, arch_fingerprint
 
 
 def build_deterministic_generation_config(
@@ -234,9 +271,13 @@ def merge_and_export(
     max_shard_size: str = "5GB",
     force: bool = False,
     allow_base_mismatch: bool = False,
+    override_reason: Optional[str] = None,
     command_args: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Execute the merge, validation, and atomic directory export with retained backup."""
+    """Execute the merge, validation, detached integrity anchoring, and verified export."""
+    # Lazy import of verification to avoid circular dependencies
+    from verify_model_export import verify_export
+
     out_path = Path(output_dir).resolve()
     adapter_path = Path(adapter_dir).resolve()
 
@@ -245,26 +286,28 @@ def merge_and_export(
             raise FileExistsError(
                 f"Output directory already exists: {out_path}. Pass --force to export and retain backup."
             )
-        logger.warning("Output directory %s exists; existing release will be retained as backup.", out_path)
+        logger.warning("Output directory %s exists; existing release will be retained as backup upon verified promotion.", out_path)
 
     if release_id is None:
         timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         release_id = f"tg-merged-{timestamp_str}"
 
-    # 1. Validate adapter compatibility
-    _, base_matched = validate_adapter_compatibility(
+    # 1. Validate adapter compatibility and capture architecture fingerprint
+    peft_config, base_matched, arch_fingerprint = validate_adapter_compatibility(
         base_model_id,
         adapter_path,
         allow_mismatch=allow_base_mismatch,
+        override_reason=override_reason,
+        adapter_revision=adapter_revision,
     )
 
     # 2. Resolve torch dtype
     torch_dtype = resolve_dtype(dtype_name)
     logger.info("Using dtype: %s (%s)", dtype_name, torch_dtype)
 
-    # 3. Load processor & tokenizer
-    logger.info("Loading processor from %s...", base_model_id)
-    processor = AutoProcessor.from_pretrained(base_model_id, fix_markdown=False)
+    # 3. Load processor & tokenizer with base revision selection
+    logger.info("Loading processor from %s (revision=%s)...", base_model_id, base_revision)
+    processor = AutoProcessor.from_pretrained(base_model_id, revision=base_revision, fix_markdown=False)
     tokenizer = processor.tokenizer
 
     # Verify stop tokens at extraction time
@@ -279,28 +322,34 @@ def merge_and_export(
             f"Expected <end_of_turn> ({turn_end_id}) to be in stop tokens {stop_token_ids}."
         )
 
-    # 4. Load base model configuration and weights
-    logger.info("Loading model config from %s...", base_model_id)
-    model_config = load_generation_safe_model_config(base_model_id)
+    # 4. Load base model configuration and weights with base revision selection
+    logger.info("Loading model config from %s (revision=%s)...", base_model_id, base_revision)
+    model_config = load_generation_safe_model_config(base_model_id, revision=base_revision)
 
     device_map = device if device in ("auto", "cpu", "cuda") else "auto"
     if device == "auto" and not torch.cuda.is_available():
         device_map = "cpu"
 
-    logger.info("Loading base model %s (device_map=%s)...", base_model_id, device_map)
+    logger.info("Loading base model %s (revision=%s, device_map=%s)...", base_model_id, base_revision, device_map)
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_id,
+        revision=base_revision,
         config=model_config,
         torch_dtype=torch_dtype,
         device_map=device_map,
         low_cpu_mem_usage=True,
     )
 
-    # 5. Attach adapter via PEFT
-    logger.info("Attaching LoRA adapter from %s...", adapter_path)
+    resolved_base_commit = getattr(base_model.config, "_commit_hash", None)
+    base_fingerprint = compute_directory_fingerprint(Path(base_model_id)) if Path(base_model_id).is_dir() else None
+    adapter_fingerprint = compute_directory_fingerprint(adapter_path) if adapter_path.is_dir() else None
+
+    # 5. Attach adapter via PEFT with adapter revision selection
+    logger.info("Attaching LoRA adapter from %s (revision=%s)...", adapter_path, adapter_revision)
     peft_model = PeftModel.from_pretrained(
         base_model,
         str(adapter_path),
+        revision=adapter_revision,
         torch_dtype=torch_dtype,
     )
 
@@ -362,15 +411,20 @@ def merge_and_export(
         sha256sums_path = tmp_dir / "SHA256SUMS"
         sha256sums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
 
-        # Write merge_manifest.json (contains payload file inventory)
+        # Write merge_manifest.json (contains payload file inventory and provenance)
         manifest = {
             "release_id": release_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "base_model": base_model_id,
             "base_revision": base_revision,
+            "resolved_base_commit": resolved_base_commit,
+            "base_fingerprint": base_fingerprint,
             "adapter": str(adapter_path),
             "adapter_revision": adapter_revision,
+            "adapter_fingerprint": adapter_fingerprint,
             "base_match_verified": base_matched,
+            "override_reason": override_reason if allow_base_mismatch else None,
+            "architecture_fingerprint": arch_fingerprint,
             "dtype": dtype_name,
             "stop_token_ids": stop_token_ids,
             "stop_tokens": stop_tokens,
@@ -383,6 +437,17 @@ def merge_and_export(
         manifest_path = tmp_dir / "merge_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
+        # Write detached manifest checksum anchor
+        manifest_sha256 = compute_file_sha256(manifest_path)
+        manifest_anchor_path = tmp_dir / "merge_manifest.sha256"
+        manifest_anchor_path.write_text(f"{manifest_sha256}  merge_manifest.json\n", encoding="utf-8")
+
+        # Verification gate BEFORE promotion
+        logger.info("Executing verification gate on staged export before promotion...")
+        is_valid = verify_export(str(tmp_dir), skip_checksums=False)
+        if not is_valid:
+            raise RuntimeError(f"Export verification gate failed on staged directory {tmp_dir}. Promotion aborted.")
+
         # Atomic promotion: retain existing release as retained backup if present
         backup_dir: Optional[Path] = None
         if out_path.exists():
@@ -392,7 +457,7 @@ def merge_and_export(
 
         try:
             tmp_dir.rename(out_path)
-            logger.info("Successfully exported merged checkpoint to: %s", out_path)
+            logger.info("Successfully exported and verified merged checkpoint at: %s", out_path)
             if backup_dir and backup_dir.exists():
                 logger.info("Previous release retained at %s for rollback.", backup_dir)
         except Exception:
@@ -428,6 +493,7 @@ def main() -> int:
             max_shard_size=args.max_shard_size,
             force=args.force,
             allow_base_mismatch=args.allow_base_mismatch,
+            override_reason=args.override_reason,
             command_args=command_args,
         )
         return 0
@@ -438,3 +504,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -71,34 +71,61 @@ class TokenEstimator:
 
 
 class ConcurrencyManager:
-    """Bounded in-flight concurrency limiter with queue depth tracking and fair bulk queuing."""
+    """Bounded in-flight concurrency limiter with isolated interactive and bulk queues."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
         self.bulk_semaphore = asyncio.Semaphore(settings.max_bulk_concurrent_requests)
-        self.in_flight = 0
-        self.queued = 0
+        self.interactive_in_flight = 0
+        self.bulk_in_flight = 0
+        self.interactive_queued = 0
+        self.bulk_queued = 0
         self._lock = asyncio.Lock()
+
+    @property
+    def queued(self) -> int:
+        return self.interactive_queued + self.bulk_queued
+
+    @property
+    def in_flight(self) -> int:
+        return self.interactive_in_flight + self.bulk_in_flight
 
     async def acquire(self, is_bulk: bool = False) -> float:
         """Attempt to enter execution queue with leak-free cancellation handling. Returns wait time."""
         async with self._lock:
-            if self.queued >= self.settings.max_queue_depth:
-                logger.warning(
-                    "Gateway queue saturated (queued=%d, in_flight=%d, max_queue=%d)",
-                    self.queued,
-                    self.in_flight,
-                    self.settings.max_queue_depth,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=(
-                        f"Server is under high load. Waiting queue saturated "
-                        f"({self.queued}/{self.settings.max_queue_depth}). Please retry with backoff."
-                    ),
-                )
-            self.queued += 1
+            if is_bulk:
+                max_depth = self.settings.max_bulk_queue_depth
+                if self.bulk_queued >= max_depth:
+                    logger.warning(
+                        "Gateway bulk queue saturated (bulk_queued=%d, max_bulk_queue=%d)",
+                        self.bulk_queued,
+                        max_depth,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=(
+                            f"Bulk processing queue is saturated "
+                            f"({self.bulk_queued}/{max_depth}). Please retry with backoff."
+                        ),
+                    )
+                self.bulk_queued += 1
+            else:
+                max_depth = self.settings.max_interactive_queue_depth
+                if self.interactive_queued >= max_depth:
+                    logger.warning(
+                        "Gateway interactive queue saturated (interactive_queued=%d, max_interactive_queue=%d)",
+                        self.interactive_queued,
+                        max_depth,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=(
+                            f"Interactive request queue is saturated "
+                            f"({self.interactive_queued}/{max_depth}). Please retry with backoff."
+                        ),
+                    )
+                self.interactive_queued += 1
 
         start_wait = time.perf_counter()
         acquired_global = False
@@ -112,13 +139,17 @@ class ConcurrencyManager:
             acquired_global = True
         finally:
             async with self._lock:
-                self.queued -= 1
-                if acquired_global:
-                    self.in_flight += 1
+                if is_bulk:
+                    self.bulk_queued -= 1
+                    if acquired_global and acquired_bulk:
+                        self.bulk_in_flight += 1
+                    else:
+                        if acquired_bulk:
+                            self.bulk_semaphore.release()
                 else:
-                    # Clean up bulk semaphore if global acquisition failed or was cancelled
-                    if acquired_bulk:
-                        self.bulk_semaphore.release()
+                    self.interactive_queued -= 1
+                    if acquired_global:
+                        self.interactive_in_flight += 1
 
         wait_time = time.perf_counter() - start_wait
         return wait_time
@@ -128,7 +159,9 @@ class ConcurrencyManager:
         self.semaphore.release()
         if is_bulk:
             self.bulk_semaphore.release()
-        self.in_flight = max(0, self.in_flight - 1)
+            self.bulk_in_flight = max(0, self.bulk_in_flight - 1)
+        else:
+            self.interactive_in_flight = max(0, self.interactive_in_flight - 1)
 
 
 class RequestValidator:
@@ -204,9 +237,20 @@ class RequestValidator:
                 ),
             )
 
+        total_tokens = sum(self.estimator.count_tokens(t) for t in texts)
+        if total_tokens > self.settings.max_batch_total_tokens:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Aggregate batch estimated tokens ({total_tokens}) exceeds maximum allowed "
+                    f"({self.settings.max_batch_total_tokens} tokens)."
+                ),
+            )
+
         for i, text in enumerate(texts):
             if not text.strip():
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Batch item at index {i} is empty or whitespace only.",
                 )
+

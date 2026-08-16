@@ -24,9 +24,9 @@ def resolve_dtype(name):
     return dtype
 
 
-def load_generation_safe_model_config(base_model_id):
+def load_generation_safe_model_config(base_model_id, revision=None):
     """Load model config without TranslateGemma's invalid sampling defaults."""
-    config = AutoConfig.from_pretrained(base_model_id)
+    config = AutoConfig.from_pretrained(base_model_id, revision=revision)
     # Apply this to both multimodal wrappers and their decoder config. Model
     # construction creates GenerationConfig objects for nested models too.
     for candidate in (config, config.get_text_config()):
