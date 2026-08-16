@@ -71,17 +71,18 @@ class TokenEstimator:
 
 
 class ConcurrencyManager:
-    """Bounded in-flight concurrency limiter with queue depth tracking and 429 backpressure."""
+    """Bounded in-flight concurrency limiter with queue depth tracking and fair bulk queuing."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+        self.bulk_semaphore = asyncio.Semaphore(settings.max_bulk_concurrent_requests)
         self.in_flight = 0
         self.queued = 0
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> float:
-        """Attempt to enter the execution queue. Returns wait time in seconds."""
+    async def acquire(self, is_bulk: bool = False) -> float:
+        """Attempt to enter execution queue with leak-free cancellation handling. Returns wait time."""
         async with self._lock:
             if self.queued >= self.settings.max_queue_depth:
                 logger.warning(
@@ -100,19 +101,33 @@ class ConcurrencyManager:
             self.queued += 1
 
         start_wait = time.perf_counter()
+        acquired_global = False
+        acquired_bulk = False
         try:
+            if is_bulk:
+                await self.bulk_semaphore.acquire()
+                acquired_bulk = True
+
             await self.semaphore.acquire()
+            acquired_global = True
         finally:
             async with self._lock:
                 self.queued -= 1
-                self.in_flight += 1
+                if acquired_global:
+                    self.in_flight += 1
+                else:
+                    # Clean up bulk semaphore if global acquisition failed or was cancelled
+                    if acquired_bulk:
+                        self.bulk_semaphore.release()
 
         wait_time = time.perf_counter() - start_wait
         return wait_time
 
-    def release(self):
-        """Release concurrency slot."""
+    def release(self, is_bulk: bool = False):
+        """Release acquired concurrency slots."""
         self.semaphore.release()
+        if is_bulk:
+            self.bulk_semaphore.release()
         self.in_flight = max(0, self.in_flight - 1)
 
 
@@ -178,3 +193,20 @@ class RequestValidator:
                     f"({self.settings.max_batch_items})."
                 ),
             )
+
+        total_chars = sum(len(t) for t in texts)
+        if total_chars > self.settings.max_batch_total_chars:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Aggregate batch length ({total_chars} chars) exceeds maximum allowed "
+                    f"({self.settings.max_batch_total_chars} chars)."
+                ),
+            )
+
+        for i, text in enumerate(texts):
+            if not text.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Batch item at index {i} is empty or whitespace only.",
+                )

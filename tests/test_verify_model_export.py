@@ -15,7 +15,6 @@ from scripts.verify_model_export import (
 
 
 def test_import_script():
-    # Proves Any import and module evaluation passes
     import scripts.verify_model_export as script
     assert hasattr(script, "verify_export")
 
@@ -44,7 +43,6 @@ def test_verify_generation_config_missing_turn_end(tmp_path):
 
 
 def test_verify_tokenizer_token_mapping(tmp_path):
-    # Valid mapping
     tok_json = tmp_path / "tokenizer.json"
     tok_json.write_text(json.dumps({
         "added_tokens": [{"id": 106, "content": "<end_of_turn>"}, {"id": 1, "content": "<eos>"}]
@@ -53,7 +51,6 @@ def test_verify_tokenizer_token_mapping(tmp_path):
     assert ok
     assert "verified" in msg.lower()
 
-    # Invalid mapping
     tok_json.write_text(json.dumps({
         "added_tokens": [{"id": 106, "content": "<other_token>"}]
     }))
@@ -74,38 +71,43 @@ def test_verify_export_end_to_end(tmp_path):
     model_dir = tmp_path / "test_release"
     model_dir.mkdir()
 
-    # Create dummy files
-    (model_dir / "config.json").write_text('{"model_type": "gemma"}')
-    (model_dir / "generation_config.json").write_text('{"eos_token_id": [1, 106]}')
-    (model_dir / "tokenizer.json").write_text(json.dumps({
-        "added_tokens": [{"id": 106, "content": "<end_of_turn>"}]
-    }))
-    (model_dir / "tokenizer_config.json").write_text('{}')
-    (model_dir / "special_tokens_map.json").write_text('{}')
-    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"dummy_weights")
+    # Create payload files
+    payload_files = {
+        "config.json": b'{"model_type": "gemma"}',
+        "generation_config.json": b'{"eos_token_id": [1, 106]}',
+        "tokenizer.json": json.dumps({"added_tokens": [{"id": 106, "content": "<end_of_turn>"}]}).encode("utf-8"),
+        "tokenizer_config.json": b'{}',
+        "special_tokens_map.json": b'{}',
+        "model-00001-of-00001.safetensors": b"dummy_weights",
+    }
 
+    file_inventory = []
+    checksum_lines = []
+
+    for name, content in payload_files.items():
+        p = model_dir / name
+        p.write_bytes(content)
+        file_hash = compute_sha256(p)
+        file_size = len(content)
+        file_inventory.append({
+            "path": name,
+            "size_bytes": file_size,
+            "sha256": file_hash,
+        })
+        checksum_lines.append(f"{file_hash}  {name}")
+
+    # Write SHA256SUMS covering all payload files
+    (model_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
+
+    # Write merge_manifest.json containing inventory
     manifest = {
         "release_id": "test-v1",
         "created_at": "2026-08-16T00:00:00Z",
         "base_model": "google/translategemma-12b-it",
         "adapter": "test-adapter",
         "stop_token_ids": [1, 106],
-        "file_inventory": [],
+        "file_inventory": file_inventory,
     }
-    (model_dir / "merge_manifest.json").write_text(json.dumps(manifest))
-
-    # Compute checksums covering every file
-    checksum_lines = []
-    for f in sorted(model_dir.iterdir()):
-        if f.is_file():
-            checksum_lines.append(f"{compute_sha256(f)}  {f.name}")
-    (model_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
-
-    # Update SHA256SUMS itself in the file list
-    checksum_lines = []
-    for f in sorted(model_dir.iterdir()):
-        if f.is_file():
-            checksum_lines.append(f"{compute_sha256(f)}  {f.name}")
-    (model_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
+    (model_dir / "merge_manifest.json").write_text(json.dumps(manifest, indent=2))
 
     assert verify_export(str(model_dir), skip_checksums=False) is True

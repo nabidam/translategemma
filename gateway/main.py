@@ -7,6 +7,7 @@ Preserves canonical SFT training prompt rendering, stop contracts, and response 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -16,6 +17,7 @@ from typing import Any, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import Settings, get_settings
 from limits import ConcurrencyManager, RequestValidator, TokenEstimator
@@ -32,6 +34,7 @@ from schemas import (
     HealthResponse,
     ModelInfoResponse,
     Prompt,
+    ReadyResponse,
     TranslationResponse,
 )
 from vllm_client import VLLMClient
@@ -43,25 +46,56 @@ logging.basicConfig(
 logger = logging.getLogger("gateway.main")
 
 
+class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
+    """Rejects oversized requests with HTTP 413 before body parsing."""
+
+    def __init__(self, app, max_body_bytes: int):
+        super().__init__(app)
+        self.max_body_bytes = max_body_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                length = int(content_length)
+                if length > self.max_body_bytes:
+                    return JSONResponse(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        content={"detail": f"Request body ({length} bytes) exceeds limit ({self.max_body_bytes} bytes)."},
+                    )
+            except ValueError:
+                pass
+        return await call_next(request)
+
+
 class CanonicalPromptRenderer:
-    """Renders prompts using canonical chat template and assistant-turn boundary marker."""
+    """Renders prompts using the canonical TranslateGemma chat template and boundary cut."""
 
     def __init__(self, processor_or_tokenizer: Any = None):
         self.processor = processor_or_tokenizer
 
     def render(self, source_lang: str, target_lang: str, text: str) -> str:
+        # Structured user message matching train.py and api/translator.py exactly
         user_message = {
             "role": "user",
-            "content": f"<<<source>>>{source_lang}<<<target>>>{target_lang}<<<text>>>{text}",
+            "content": [
+                {
+                    "type": "text",
+                    "source_lang_code": source_lang,
+                    "target_lang_code": target_lang,
+                    "text": text,
+                }
+            ],
         }
+
         if self.processor is not None and hasattr(self.processor, "apply_chat_template"):
             return render_training_prompt(self.processor, user_message)
 
-        # Canonical fallback matching exact chat_template.jinja SFT block formatting
-        # with the exact TARGET_BOUNDARY_MARKER cut
+        # Fallback only when processor is absent in standalone/test execution
+        # SFT block indentation prefix
         marker_template = (
             f"<start_of_turn>user\n"
-            f"{user_message['content']}<end_of_turn>\n"
+            f"<<<source>>>{source_lang}<<<target>>>{target_lang}<<<text>>>{text}<end_of_turn>\n"
             f"<start_of_turn>model\n\n        {TARGET_BOUNDARY_MARKER}<end_of_turn>\n"
         )
         boundary = marker_template.rindex(TARGET_BOUNDARY_MARKER)
@@ -74,14 +108,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing TranslateGemma Serving Gateway (1 worker per process)...")
 
     # Startup validation: ensure context limits align
-    if settings.max_total_context_tokens > settings.vllm_max_model_len:
-        logger.warning(
-            "TG_MAX_TOTAL_CONTEXT_TOKENS (%d) exceeds TG_VLLM_MAX_MODEL_LEN (%d). Clamping to %d.",
-            settings.max_total_context_tokens,
-            settings.vllm_max_model_len,
-            settings.vllm_max_model_len,
-        )
-        settings.max_total_context_tokens = settings.vllm_max_model_len
+    if settings.max_total_context_tokens != settings.vllm_max_model_len:
+        if settings.max_total_context_tokens > settings.vllm_max_model_len:
+            raise ValueError(
+                f"Configuration mismatch: TG_MAX_TOTAL_CONTEXT_TOKENS ({settings.max_total_context_tokens}) "
+                f"cannot exceed TG_VLLM_MAX_MODEL_LEN ({settings.vllm_max_model_len})."
+            )
 
     # Load processor/tokenizer for exact rendering & admission token counting
     processor_or_tok = None
@@ -92,9 +124,15 @@ async def lifespan(app: FastAPI):
             processor_or_tok = AutoProcessor.from_pretrained(tok_path, fix_markdown=False)
             logger.info("Loaded exact AutoProcessor from %s for prompt rendering.", tok_path)
         except Exception as e:
-            logger.debug("AutoProcessor not loaded from %s (%s); checking TokenEstimator...", tok_path, e)
+            logger.debug("AutoProcessor not loaded from %s (%s); trying TokenEstimator...", tok_path, e)
 
     estimator = TokenEstimator(tokenizer_path=tok_path)
+    if settings.require_exact_tokenizer and estimator.mode != "exact":
+        raise RuntimeError(
+            f"TG_REQUIRE_EXACT_TOKENIZER=true, but exact tokenizer could not be loaded from {tok_path}. "
+            "Mount the verified model artifact or check tokenizer dependencies."
+        )
+
     renderer = CanonicalPromptRenderer(processor_or_tok)
     vllm_client = VLLMClient(settings)
     concurrency_mgr = ConcurrencyManager(settings)
@@ -138,6 +176,10 @@ app = FastAPI(
 )
 
 _initial_settings = get_settings()
+app.add_middleware(
+    ContentLengthLimitMiddleware,
+    max_body_bytes=_initial_settings.max_request_body_bytes,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_initial_settings.cors_origins,
@@ -196,12 +238,13 @@ async def _execute_single_translation(
     metrics: MetricsCollector,
     workload_class: str,
     request_id: Optional[str] = None,
+    is_bulk: bool = False,
 ) -> str:
     """Render canonical prompt, validate context, acquire concurrency slot, call vLLM."""
     raw_prompt = renderer.render(source_lang, target_lang, text)
     validator.validate_request(raw_text=text, rendered_prompt=raw_prompt, max_new_tokens=max_new_tokens)
 
-    queue_wait = await concurrency_mgr.acquire()
+    queue_wait = await concurrency_mgr.acquire(is_bulk=is_bulk)
     start_infer = time.perf_counter()
     try:
         completion_text, finish_reason, usage = await vllm_client.generate_raw_completion(
@@ -223,27 +266,54 @@ async def _execute_single_translation(
         # Return completion text without strip() to preserve stop diagnostics
         return completion_text
     finally:
-        concurrency_mgr.release()
+        concurrency_mgr.release(is_bulk=is_bulk)
 
 
 @app.get("/live")
 async def live_check():
-    """Liveness probe: verifies process is alive."""
+    """Liveness probe: verifies gateway process is up."""
     return {"status": "ALIVE"}
 
 
-@app.get("/ready")
-@app.get("/health-check")
-async def health_check(
+@app.get("/health-check", response_model=HealthResponse)
+async def health_check_legacy(
     vllm_client: VLLMClient = Depends(get_vllm_client),
 ):
-    """Readiness probe: returns 200 OK when vLLM is ready, 503 when backend is down."""
+    """Strict legacy health check response shape: {'translator': 'OK'|'FAIL'}."""
     is_healthy = await vllm_client.check_health()
     if is_healthy:
-        return HealthResponse(translator="OK", ready=True)
+        return HealthResponse(translator="OK")
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"translator": "FAIL", "ready": False, "detail": "Backend vLLM server is unreachable or unready."},
+        content={"translator": "FAIL"},
+    )
+
+
+@app.get("/ready", response_model=ReadyResponse)
+async def ready_check(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    vllm_client: VLLMClient = Depends(get_vllm_client),
+):
+    """Extended readiness probe verifying engine and exact model registration."""
+    is_healthy = await vllm_client.check_health()
+    estimator = request.app.state.estimator
+    if is_healthy:
+        return ReadyResponse(
+            translator="OK",
+            ready=True,
+            model_name=settings.vllm_model_name,
+            estimator_mode=estimator.mode,
+        )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "translator": "FAIL",
+            "ready": False,
+            "model_name": settings.vllm_model_name,
+            "estimator_mode": estimator.mode,
+            "detail": "Backend vLLM server is unreachable or exact model is not loaded.",
+        },
     )
 
 
@@ -314,6 +384,7 @@ async def translate(
                     metrics=metrics,
                     workload_class=WorkloadClass.DOCUMENT.value,
                     request_id=req_id,
+                    is_bulk=False,
                 )
 
             translated_sentences = await dispatch_structured_batch(sentences, _tr_sentence)
@@ -337,6 +408,7 @@ async def translate(
         metrics=metrics,
         workload_class=workload_class,
         request_id=req_id,
+        is_bulk=False,
     )
 
     return TranslationResponse(
@@ -358,7 +430,7 @@ async def translate_batch(
     concurrency_mgr: ConcurrencyManager = Depends(get_concurrency_mgr),
     classifier: WorkloadClassifier = Depends(get_classifier),
 ):
-    """Translate multiple texts concurrently using structured batching, preserving input ordering."""
+    """Translate multiple texts concurrently using structured batching and bulk fairness."""
     req_id = str(uuid.uuid4())
     system_name = validate_system_option(prompt.system, settings.default_system)
     source_lang = prompt.source_lang or settings.source_lang
@@ -383,6 +455,7 @@ async def translate_batch(
             metrics=metrics,
             workload_class=workload_class,
             request_id=req_id,
+            is_bulk=True,
         )
 
     translations = await dispatch_structured_batch(prompt.texts, _tr_item)
@@ -404,7 +477,7 @@ async def translate_stream(
     validator: RequestValidator = Depends(get_validator),
     concurrency_mgr: ConcurrencyManager = Depends(get_concurrency_mgr),
 ):
-    """Stream translation tokens using Server-Sent Events (SSE) without stripping chunk content."""
+    """Stream translation tokens using structured JSON SSE records to prevent framing corruption."""
     validate_system_option(prompt.system, settings.default_system)
     source_lang = prompt.source_lang or settings.source_lang
     target_lang = prompt.target_lang or settings.target_lang
@@ -415,25 +488,51 @@ async def translate_stream(
     validator.validate_request(raw_text=prompt.text, rendered_prompt=raw_prompt, max_new_tokens=max_new_tokens)
 
     async def _event_generator():
-        await concurrency_mgr.acquire()
+        await concurrency_mgr.acquire(is_bulk=False)
         try:
             async for chunk in vllm_client.generate_stream_completion(
                 prompt=raw_prompt,
                 max_tokens=max_new_tokens,
                 request_id=req_id,
             ):
+                if "error" in chunk:
+                    err_event = {
+                        "error": chunk["error"],
+                        "code": chunk.get("code", "STREAM_ERROR"),
+                        "request_id": req_id,
+                    }
+                    yield f"event: error\ndata: {json.dumps(err_event)}\n\n"
+                    break
+
                 text_chunk = chunk.get("text", "")
                 finish = chunk.get("finish_reason")
+
                 if text_chunk:
-                    yield f"data: {text_chunk}\n\n"
+                    event_data = {
+                        "text": text_chunk,
+                        "finish_reason": finish,
+                        "request_id": req_id,
+                    }
+                    yield f"data: {json.dumps(event_data)}\n\n"
+
                 if finish:
                     if finish == "length":
-                        yield f"event: error\ndata: Generation truncated by max_new_tokens\n\n"
+                        len_err = {
+                            "error": "Generation truncated by max_new_tokens budget.",
+                            "code": "TRUNCATED_LENGTH",
+                            "request_id": req_id,
+                        }
+                        yield f"event: error\ndata: {json.dumps(len_err)}\n\n"
                     else:
-                        yield f"event: done\ndata: {finish}\n\n"
+                        done_event = {
+                            "text": "",
+                            "finish_reason": finish,
+                            "request_id": req_id,
+                        }
+                        yield f"event: done\ndata: {json.dumps(done_event)}\n\n"
                     break
         finally:
-            concurrency_mgr.release()
+            concurrency_mgr.release(is_bulk=False)
 
     return StreamingResponse(_event_generator(), media_type="text/event-stream")
 

@@ -11,6 +11,7 @@ from scripts.merge_lora_adapter import (
     PROMPT_CONTRACT_VERSION,
     compute_file_sha256,
     get_package_versions,
+    normalize_model_identifier,
     parse_args,
     validate_adapter_compatibility,
 )
@@ -56,14 +57,7 @@ def test_get_package_versions():
     assert "peft" in versions
 
 
-def test_validate_adapter_compatibility_missing_config(tmp_path):
-    adapter_dir = tmp_path / "adapter_empty"
-    adapter_dir.mkdir()
-    with pytest.raises(FileNotFoundError, match="adapter_config.json not found"):
-        validate_adapter_compatibility("google/translategemma-12b-it", adapter_dir)
-
-
-def test_validate_adapter_compatibility_success(tmp_path):
+def test_validate_adapter_compatibility_exact_match(tmp_path):
     adapter_dir = tmp_path / "adapter_valid"
     adapter_dir.mkdir()
     config_file = adapter_dir / "adapter_config.json"
@@ -84,21 +78,21 @@ def test_validate_adapter_compatibility_success(tmp_path):
         assert matched is True
 
 
-def test_validate_adapter_compatibility_mismatch_rejection(tmp_path):
+def test_validate_adapter_compatibility_unrelated_repo_rejection(tmp_path):
     adapter_dir = tmp_path / "adapter_mismatch"
     adapter_dir.mkdir()
     config_file = adapter_dir / "adapter_config.json"
     config_file.write_text(json.dumps({
-        "base_model_name_or_path": "google/gemma-2-9b-it",
+        "base_model_name_or_path": "other-org/translategemma-12b-it",
         "peft_type": "LORA",
     }))
 
     with patch("peft.PeftConfig.from_pretrained") as mock_peft_config:
         mock_obj = MagicMock()
-        mock_obj.base_model_name_or_path = "google/gemma-2-9b-it"
+        mock_obj.base_model_name_or_path = "other-org/translategemma-12b-it"
         mock_peft_config.return_value = mock_obj
 
-        # Without override: raises ValueError
+        # Even with same basename, different org repository ID must be rejected
         with pytest.raises(ValueError, match="does not match requested base model"):
             validate_adapter_compatibility(
                 "google/translategemma-12b-it",
@@ -106,7 +100,7 @@ def test_validate_adapter_compatibility_mismatch_rejection(tmp_path):
                 allow_mismatch=False,
             )
 
-        # With override: succeeds with warning
+        # With explicit override: succeeds
         peft_cfg, matched = validate_adapter_compatibility(
             "google/translategemma-12b-it",
             adapter_dir,

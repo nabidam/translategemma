@@ -61,13 +61,21 @@ services:
     depends_on:
       vllm:
         condition: service_healthy
+    volumes:
+      # Mount model artifact read-only for exact tokenizer and processor loading
+      - ${MODEL_DIR:-/opt/models/translategemma/current}:/models/model:ro
     environment:
       - TG_VLLM_BASE_URL=http://vllm:8000/v1
       - TG_VLLM_MODEL_NAME=${SERVED_MODEL_NAME:-translategemma}
+      - TG_VLLM_MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+      - TG_MAX_TOTAL_CONTEXT_TOKENS=${MAX_MODEL_LEN:-4096}
+      - TG_MODEL_DIR=/models/model
+      - TG_TOKENIZER_PATH=/models/model
+      - TG_REQUIRE_EXACT_TOKENIZER=${REQUIRE_EXACT_TOKENIZER:-true}
       - TG_MODEL_RELEASE_ID=${MODEL_RELEASE_ID:-tg-12b-merged}
       - TG_MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-64}
+      - TG_MAX_BULK_CONCURRENT_REQUESTS=${MAX_BULK_CONCURRENT_REQUESTS:-16}
       - TG_MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-128}
-      - TG_MAX_TOTAL_CONTEXT_TOKENS=${MAX_MODEL_LEN:-4096}
       - TG_HOST=0.0.0.0
       - TG_PORT=8080
     ports:

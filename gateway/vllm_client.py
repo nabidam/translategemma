@@ -1,5 +1,7 @@
 """Async HTTP client for communicating with the backend vLLM OpenAI server."""
 
+from __future__ import annotations
+
 import json
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -37,27 +39,62 @@ class VLLMClient:
         await self.client.aclose()
 
     async def check_health(self) -> bool:
-        """Check if vLLM server is responsive and models are registered."""
-        # 1. Try root /health endpoint
+        """Check if vLLM server is responsive and the exact configured model is registered."""
+        # 1. Check root /health endpoint
         root_url = self.base_url.removesuffix("/v1") + "/health"
         try:
             resp = await self.client.get(root_url)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
+            if resp.status_code != 200:
+                logger.warning("vLLM /health returned status %d", resp.status_code)
+                return False
+        except Exception as e:
+            logger.warning("Cannot contact vLLM /health: %s", e)
+            return False
 
-        # 2. Fall back to /models
+        # 2. Verify exact configured model is loaded in /models
         try:
             resp = await self.client.get("/models")
             if resp.status_code == 200:
                 data = resp.json()
                 models = [m.get("id") for m in data.get("data", [])]
-                return self.settings.vllm_model_name in models or len(models) > 0
+                if self.settings.vllm_model_name not in models:
+                    logger.error(
+                        "Configured model %r not found in vLLM /models: %s",
+                        self.settings.vllm_model_name,
+                        models,
+                    )
+                    return False
+                return True
         except Exception as e:
-            logger.warning("Failed to contact vLLM /models: %s", e)
+            logger.warning("Failed to query vLLM /models: %s", e)
 
         return False
+
+    def build_raw_completion_payload(
+        self,
+        prompt: str,
+        max_tokens: int,
+        stream: bool = False,
+        stop_token_ids: Optional[List[int]] = None,
+        stop_tokens: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Construct raw JSON request body for vLLM /v1/completions endpoint."""
+        stop_list = stop_tokens or self.settings.stop_tokens
+        stop_ids = stop_token_ids or self.settings.stop_token_ids
+
+        # vLLM OpenAI completions schema: top-level stop and stop_token_ids
+        payload: Dict[str, Any] = {
+            "model": self.settings.vllm_model_name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "n": 1,
+            "stream": stream,
+            "stop": stop_list,
+            "stop_token_ids": stop_ids,
+        }
+        return payload
 
     async def generate_raw_completion(
         self,
@@ -67,27 +104,14 @@ class VLLMClient:
         stop_tokens: Optional[List[str]] = None,
         request_id: Optional[str] = None,
     ) -> Tuple[str, str, Dict[str, int]]:
-        """Call /v1/completions with rendered prompt and return (text, finish_reason, usage).
-
-        Output text is preserved without stripping to retain stop diagnostics.
-        Finish reason 'length' is treated as an explicit error.
-        """
-        stop_list = stop_tokens or self.settings.stop_tokens
-        stop_ids = stop_token_ids or self.settings.stop_token_ids
-
-        payload: Dict[str, Any] = {
-            "model": self.settings.vllm_model_name,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "n": 1,
-            "stream": False,
-            "stop": stop_list,
-            "extra_body": {
-                "stop_token_ids": stop_ids,
-            },
-        }
+        """Call /v1/completions with rendered prompt and return (text, finish_reason, usage)."""
+        payload = self.build_raw_completion_payload(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            stream=False,
+            stop_token_ids=stop_token_ids,
+            stop_tokens=stop_tokens,
+        )
 
         headers = {}
         if request_id:
@@ -160,23 +184,14 @@ class VLLMClient:
         stop_tokens: Optional[List[str]] = None,
         request_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream completion chunks via SSE from vLLM without stripping content."""
-        stop_list = stop_tokens or self.settings.stop_tokens
-        stop_ids = stop_token_ids or self.settings.stop_token_ids
-
-        payload: Dict[str, Any] = {
-            "model": self.settings.vllm_model_name,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "n": 1,
-            "stream": True,
-            "stop": stop_list,
-            "extra_body": {
-                "stop_token_ids": stop_ids,
-            },
-        }
+        """Stream completion chunks via SSE from vLLM without corrupting chunk framing."""
+        payload = self.build_raw_completion_payload(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            stream=True,
+            stop_token_ids=stop_token_ids,
+            stop_tokens=stop_tokens,
+        )
 
         headers = {}
         if request_id:
@@ -217,12 +232,11 @@ class VLLMClient:
                                     continue
 
         except httpx.ConnectError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Inference backend unreachable during stream.",
-            ) from e
+            logger.error("Backend unreachable during streaming: %s", e)
+            yield {"error": "Inference backend unreachable during stream.", "code": "BACKEND_UNAVAILABLE"}
         except httpx.TimeoutException as e:
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Inference stream timed out.",
-            ) from e
+            logger.error("Streaming timeout: %s", e)
+            yield {"error": "Inference stream timed out.", "code": "STREAM_TIMEOUT"}
+        except Exception as e:
+            logger.exception("Unexpected error during stream: %s", e)
+            yield {"error": f"Stream error: {e}", "code": "STREAM_ERROR"}

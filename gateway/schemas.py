@@ -106,13 +106,21 @@ class BatchTranslationResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Health check response format compatible with existing monitor probes."""
+    """Legacy health check response format: exactly {'translator': 'OK'|'FAIL'}."""
 
     translator: str
-    ready: bool = True
-    detail: Optional[str] = None
 
-    model_config = {"json_schema_extra": {"examples": [{"translator": "OK", "ready": True}]}}
+    model_config = {"json_schema_extra": {"examples": [{"translator": "OK"}]}}
+
+
+class ReadyResponse(BaseModel):
+    """Extended readiness probe response."""
+
+    translator: str
+    ready: bool
+    model_name: str
+    estimator_mode: str
+    detail: Optional[str] = None
 
 
 class ModelInfoResponse(BaseModel):

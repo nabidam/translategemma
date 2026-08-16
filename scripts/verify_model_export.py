@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Verify the integrity, completeness, and stop configuration of an exported model release.
 
 This script can be executed on BOTH the fine-tune machine and the offline serving host.
@@ -6,11 +5,12 @@ It requires only standard Python libraries (no PyTorch or CUDA required).
 
 Checks performed:
   1. Presence of required files (config.json, generation_config.json, safetensors, tokenizer, manifest, SHA256SUMS).
-  2. Strict cryptographic SHA256 checksum verification across all inventory files.
-  3. Verification that no untracked/extra or malicious files exist (rejects path traversal).
-  4. Verification that generation_config.json contains <end_of_turn> (id 106) and <eos> (id 1).
-  5. Verification that tokenizer files actually map token 106 to '<end_of_turn>'.
-  6. Verification of merge_manifest.json fields, file inventory match, and provenance.
+  2. Strict cryptographic SHA256 checksum verification across all payload files.
+  3. Verification that disk payload files match SHA256SUMS and merge_manifest.json inventory exactly.
+  4. Verification of file sizes, hash consistency, and path traversal rejection.
+  5. Verification that generation_config.json contains <end_of_turn> (id 106) and <eos> (id 1).
+  6. Verification that tokenizer files actually map token 106 to '<end_of_turn>'.
+  7. Verification of merge_manifest.json fields and provenance.
 
 Usage:
   python scripts/verify_model_export.py --model-dir exports/translategemma-12b-it-merged-v1
@@ -40,6 +40,11 @@ REQUIRED_BASE_FILES: Set[str] = {
     "special_tokens_map.json",
     "merge_manifest.json",
     "SHA256SUMS",
+}
+
+METADATA_RELEASE_FILES: Set[str] = {
+    "SHA256SUMS",
+    "merge_manifest.json",
 }
 
 EXPECTED_STOP_TOKEN_IDS: Set[int] = {1, 106}
@@ -127,7 +132,6 @@ def verify_tokenizer_token_mapping(model_dir: Path) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Failed to parse tokenizer.json: {e}"
 
-    # 1. Check added_tokens list in tokenizer.json
     added_tokens = tok_data.get("added_tokens", [])
     found_turn_end = False
     for item in added_tokens:
@@ -135,7 +139,6 @@ def verify_tokenizer_token_mapping(model_dir: Path) -> Tuple[bool, str]:
             found_turn_end = True
             break
 
-    # 2. Check model vocabulary if not found in added_tokens
     if not found_turn_end:
         vocab = tok_data.get("model", {}).get("vocab", {})
         if vocab.get(EXPECTED_TURN_END_TOKEN) == 106:
@@ -172,49 +175,78 @@ def verify_checksums_and_inventory(
 
         expected_hash, rel_path = parts[0], parts[1].lstrip("*").strip()
 
-        # Reject path traversal
+        # Reject path traversal and absolute paths
         if ".." in rel_path or rel_path.startswith("/") or rel_path.startswith("\\"):
             errors.append(f"Security error: path traversal or absolute path in SHA256SUMS: {rel_path}")
             continue
 
+        if rel_path in checksum_map:
+            errors.append(f"Duplicate entry in SHA256SUMS: {rel_path}")
+            continue
+
         checksum_map[rel_path] = expected_hash
 
-    # Check files on disk
-    disk_files = {
-        p.relative_to(model_dir).as_posix()
+    # Payload files on disk (excluding metadata files SHA256SUMS, merge_manifest.json, and .tmp*)
+    disk_payload_files = {
+        p.name
         for p in model_dir.iterdir()
-        if p.is_file() and not p.name.startswith(".tmp")
+        if p.is_file() and p.name not in METADATA_RELEASE_FILES and not p.name.startswith(".tmp")
     }
 
-    manifest_inventory = {
-        entry["path"]: entry.get("sha256")
-        for entry in manifest_data.get("file_inventory", [])
-        if isinstance(entry, dict) and "path" in entry
-    }
+    manifest_inventory_map: Dict[str, Dict[str, Any]] = {}
+    for entry in manifest_data.get("file_inventory", []):
+        if isinstance(entry, dict) and "path" in entry:
+            manifest_inventory_map[entry["path"]] = entry
 
-    # Verify inventory completeness
-    untracked_on_disk = disk_files - set(checksum_map.keys())
+    # 1. Assert exact set equality between disk payload files and SHA256SUMS entries
+    untracked_on_disk = disk_payload_files - set(checksum_map.keys())
     if untracked_on_disk:
-        errors.append(f"Untracked files present on disk but missing from SHA256SUMS: {sorted(list(untracked_on_disk))}")
+        errors.append(f"Untracked payload files present on disk but missing from SHA256SUMS: {sorted(list(untracked_on_disk))}")
 
-    missing_from_disk = set(checksum_map.keys()) - disk_files
+    missing_from_disk = set(checksum_map.keys()) - disk_payload_files
     if missing_from_disk:
-        errors.append(f"Files listed in SHA256SUMS missing from disk: {sorted(list(missing_from_disk))}")
+        errors.append(f"Payload files listed in SHA256SUMS missing from disk: {sorted(list(missing_from_disk))}")
 
-    # Check byte hashes
+    # 2. Assert exact set equality with merge_manifest.json file_inventory
+    manifest_untracked = disk_payload_files - set(manifest_inventory_map.keys())
+    if manifest_untracked:
+        errors.append(f"Files present on disk but missing from merge_manifest.json inventory: {sorted(list(manifest_untracked))}")
+
+    manifest_missing = set(manifest_inventory_map.keys()) - disk_payload_files
+    if manifest_missing:
+        errors.append(f"Files in manifest inventory missing from disk: {sorted(list(manifest_missing))}")
+
+    # 3. Check byte hashes and sizes
     for rel_path, expected_hash in checksum_map.items():
         target_file = model_dir / rel_path
         if not target_file.is_file():
             continue
+
+        actual_size = target_file.stat().st_size
         actual_hash = compute_sha256(target_file)
+
         if actual_hash.lower() != expected_hash.lower():
             errors.append(
-                f"Checksum mismatch for {rel_path}: expected {expected_hash}, got {actual_hash}"
+                f"Checksum mismatch for {rel_path}: SHA256SUMS expected {expected_hash}, got {actual_hash}"
             )
+
+        if rel_path in manifest_inventory_map:
+            manifest_entry = manifest_inventory_map[rel_path]
+            man_hash = manifest_entry.get("sha256", "")
+            man_size = manifest_entry.get("size_bytes")
+
+            if man_hash.lower() != actual_hash.lower():
+                errors.append(
+                    f"Manifest hash mismatch for {rel_path}: manifest has {man_hash}, actual is {actual_hash}"
+                )
+            if man_size is not None and man_size != actual_size:
+                errors.append(
+                    f"Manifest file size mismatch for {rel_path}: manifest has {man_size} bytes, actual is {actual_size} bytes"
+                )
 
     if errors:
         return False, errors
-    logger.info("Successfully verified checksums and strict inventory for %d files.", len(checksum_map))
+    logger.info("Successfully verified checksums and strict inventory for %d payload files.", len(checksum_map))
     return True, []
 
 

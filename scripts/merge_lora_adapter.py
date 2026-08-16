@@ -115,12 +115,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite output directory if it already exists.",
+        help="Allow exporting to existing destination (retains existing release as backup).",
     )
     parser.add_argument(
         "--allow-base-mismatch",
         action="store_true",
-        help="Allow merge even if adapter's configured base model name differs from --base-model.",
+        help="Allow merge even if adapter's configured base model differs from --base-model.",
     )
     return parser.parse_args(argv)
 
@@ -147,7 +147,7 @@ def get_package_versions() -> Dict[str, str]:
 
 
 def normalize_model_identifier(ident: str) -> str:
-    """Normalize model string or local path for comparison."""
+    """Normalize model string or local path for exact comparison."""
     p = Path(ident)
     if p.exists():
         return p.resolve().as_posix()
@@ -159,7 +159,7 @@ def validate_adapter_compatibility(
     adapter_path: Path,
     allow_mismatch: bool = False,
 ) -> Tuple[PeftConfig, bool]:
-    """Ensure adapter exists and is configured for the given base model."""
+    """Ensure adapter exists and matches the exact base model."""
     adapter_config_file = adapter_path / "adapter_config.json"
     if not adapter_config_file.is_file():
         raise FileNotFoundError(
@@ -175,13 +175,8 @@ def validate_adapter_compatibility(
         norm_conf = normalize_model_identifier(configured_base)
         norm_req = normalize_model_identifier(base_model_id)
 
-        # Match exact string, normalized path, or matching trailing repo name
-        if (
-            norm_conf == norm_req
-            or norm_conf.endswith(norm_req)
-            or norm_req.endswith(norm_conf)
-            or Path(norm_conf).name == Path(norm_req).name
-        ):
+        # Exact normalized equality
+        if norm_conf == norm_req:
             base_matched = True
             logger.info("Adapter base model verified: %s matches %s", configured_base, base_model_id)
         else:
@@ -241,16 +236,16 @@ def merge_and_export(
     allow_base_mismatch: bool = False,
     command_args: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Execute the merge, validation, and atomic directory export with safe backup rollback."""
+    """Execute the merge, validation, and atomic directory export with retained backup."""
     out_path = Path(output_dir).resolve()
     adapter_path = Path(adapter_dir).resolve()
 
     if out_path.exists():
         if not force:
             raise FileExistsError(
-                f"Output directory already exists: {out_path}. Pass --force to overwrite."
+                f"Output directory already exists: {out_path}. Pass --force to export and retain backup."
             )
-        logger.warning("Output directory %s exists and --force was provided.", out_path)
+        logger.warning("Output directory %s exists; existing release will be retained as backup.", out_path)
 
     if release_id is None:
         timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -346,7 +341,7 @@ def merge_and_export(
         logger.info("Saving generation_config.json...")
         gen_config.save_pretrained(str(tmp_dir))
 
-        # Build inventory and checksums
+        # Build inventory and checksums for all payload files
         logger.info("Computing artifact checksums and building manifest...")
         file_inventory = []
         checksum_lines = []
@@ -363,17 +358,11 @@ def merge_and_export(
                 })
                 checksum_lines.append(f"{sha256_hex}  {rel_name}")
 
-        # Write SHA256SUMS
+        # Write SHA256SUMS (covers all payload files)
         sha256sums_path = tmp_dir / "SHA256SUMS"
         sha256sums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
-        sha256sums_hash = compute_file_sha256(sha256sums_path)
-        file_inventory.append({
-            "path": "SHA256SUMS",
-            "size_bytes": sha256sums_path.stat().st_size,
-            "sha256": sha256sums_hash,
-        })
 
-        # Write merge_manifest.json
+        # Write merge_manifest.json (contains payload file inventory)
         manifest = {
             "release_id": release_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -394,18 +383,18 @@ def merge_and_export(
         manifest_path = tmp_dir / "merge_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        # Atomic promotion with rollback preservation
+        # Atomic promotion: retain existing release as retained backup if present
         backup_dir: Optional[Path] = None
         if out_path.exists():
-            backup_dir = parent_dir / f".backup_{out_path.name}_{os.getpid()}_{int(time.time())}"
-            logger.info("Moving existing release to temporary backup: %s", backup_dir)
+            backup_dir = out_path.with_name(f"{out_path.name}.backup_{int(time.time())}")
+            logger.info("Moving existing release to retained backup: %s", backup_dir)
             out_path.rename(backup_dir)
 
         try:
             tmp_dir.rename(out_path)
             logger.info("Successfully exported merged checkpoint to: %s", out_path)
             if backup_dir and backup_dir.exists():
-                shutil.rmtree(backup_dir, ignore_errors=True)
+                logger.info("Previous release retained at %s for rollback.", backup_dir)
         except Exception:
             if backup_dir and backup_dir.exists():
                 logger.error("Promotion failed; restoring previous release from backup...")

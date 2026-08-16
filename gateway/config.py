@@ -12,9 +12,10 @@ class Settings(BaseSettings):
     vllm_connect_timeout_seconds: float = 5.0
     vllm_max_model_len: int = 4096
 
-    # Model & Tokenizer directory (for offline exact prompt rendering and token counting)
+    # Model & Tokenizer directory for offline exact prompt rendering and token counting
     model_dir: Optional[str] = "/models/model"
-    tokenizer_path: Optional[str] = None
+    tokenizer_path: Optional[str] = "/models/model"
+    require_exact_tokenizer: bool = False
 
     # Model identity & provenance
     model_release_id: str = "translategemma-12b-it-merged"
@@ -32,9 +33,11 @@ class Settings(BaseSettings):
 
     # Admission & Concurrency Controls
     max_concurrent_requests: int = 64
+    max_bulk_concurrent_requests: int = 16
     max_queue_depth: int = 128
     max_request_body_bytes: int = 1_000_000  # 1MB
     max_batch_items: int = 128
+    max_batch_total_chars: int = 200_000
     max_source_chars_per_text: int = 50_000
     max_estimated_source_tokens: int = 3584
     max_total_context_tokens: int = 4096  # strictly aligned with vllm_max_model_len
