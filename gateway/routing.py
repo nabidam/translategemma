@@ -1,4 +1,6 @@
-"""Workload classification, sentence splitting, and request dispatch routing."""
+"""Workload classification, sentence splitting, and structured batch dispatch routing."""
+
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -33,7 +35,7 @@ class WorkloadClassifier:
 
     def classify_batch(self, texts: List[str]) -> WorkloadClass:
         if len(texts) == 1:
-            est = self.estimator.estimate_tokens(texts[0])
+            est = self.estimator.count_tokens(texts[0])
             return self.classify_single(texts[0], est)
         return WorkloadClass.BULK
 
@@ -58,16 +60,23 @@ class SentenceSplitter:
             return []
         segmenter = self._get_segmenter(lang)
         segments = segmenter.segment(text)
-        # Filter out empty whitespace-only segments
         cleaned = [s.strip() for s in segments if s.strip()]
         return cleaned if cleaned else [text.strip()]
 
 
-async def dispatch_concurrent_translations(
+async def dispatch_structured_batch(
     items: List[str],
     translate_fn: Callable[[str], Coroutine[None, None, str]],
 ) -> List[str]:
-    """Fan out translations concurrently via vLLM continuous batching and preserve input order."""
-    tasks = [translate_fn(item) for item in items]
-    results = await asyncio.gather(*tasks)
-    return list(results)
+    """Execute concurrent translations with structured cancellation on failure."""
+    tasks = [asyncio.create_task(translate_fn(item)) for item in items]
+    try:
+        results = await asyncio.gather(*tasks)
+        return list(results)
+    except Exception as e:
+        logger.error("Error during structured batch execution; cancelling pending tasks: %s", e)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise

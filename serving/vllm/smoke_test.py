@@ -6,11 +6,13 @@ Runs on the serving machine to validate:
   2. Exact raw prompt completion endpoint (/v1/completions).
   3. Stop token handling (<end_of_turn> token 106, finish_reason="stop").
   4. Determinism of greedy decoding (temperature=0.0).
-  5. Concurrent request batching.
+  5. Concurrent request batching with exact unified payload contract.
 
 Usage:
   python serving/vllm/smoke_test.py --base-url http://localhost:8000/v1 --model-name translategemma
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -60,6 +62,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def build_completion_payload(
+    model_name: str,
+    prompt: str = PROMPT_TEMPLATE,
+    max_tokens: int = 128,
+) -> Dict[str, Any]:
+    """Single canonical request payload builder for all completion tests."""
+    return {
+        "model": model_name,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "n": 1,
+        "stream": False,
+        "stop": ["<end_of_turn>"],
+        "extra_body": {
+            "stop_token_ids": [1, 106],
+        },
+    }
+
+
 def http_get(url: str, timeout: float = 10.0) -> Dict[str, Any]:
     req = urllib.request.Request(url, headers={"User-Agent": "TranslateGemma-SmokeTest/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -82,19 +105,17 @@ def http_post(url: str, payload: Dict[str, Any], timeout: float = 30.0) -> Dict[
 
 def test_health_and_models(base_url: str, model_name: str, timeout: float) -> bool:
     logger.info("Checking server health and model registration...")
-    # Health endpoint is usually at root /health
-    root_url = base_url.rstrip("/").removesuffix("/v1")
-    health_url = f"{root_url}/health"
+    root_url = base_url.rstrip("/").removesuffix("/v1") + "/health"
 
     try:
-        req = urllib.request.Request(health_url)
+        req = urllib.request.Request(root_url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 logger.error("Health check failed with status %d", resp.status)
                 return False
         logger.info("vLLM /health returned 200 OK.")
     except Exception as e:
-        logger.warning("Could not probe %s (%s); proceeding to /v1/models check.", health_url, e)
+        logger.warning("Could not probe %s (%s); proceeding to /v1/models check.", root_url, e)
 
     models_url = f"{base_url.rstrip('/')}/models"
     try:
@@ -113,19 +134,9 @@ def test_health_and_models(base_url: str, model_name: str, timeout: float) -> bo
 
 def test_completion_and_stop(base_url: str, model_name: str, timeout: float) -> Optional[str]:
     completions_url = f"{base_url.rstrip('/')}/completions"
-    payload = {
-        "model": model_name,
-        "prompt": PROMPT_TEMPLATE,
-        "max_tokens": 128,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "stop": ["<end_of_turn>"],
-        "extra_body": {
-            "stop_token_ids": [1, 106],
-        },
-    }
+    payload = build_completion_payload(model_name=model_name)
 
-    logger.info("Sending raw completion request to %s...", completions_url)
+    logger.info("Sending canonical completion request to %s...", completions_url)
     start_t = time.perf_counter()
     try:
         resp = http_post(completions_url, payload, timeout=timeout)
@@ -148,7 +159,7 @@ def test_completion_and_stop(base_url: str, model_name: str, timeout: float) -> 
     finish_reason = choice.get("finish_reason")
 
     logger.info("Generation completed in %.3fs. Finish reason: %r", elapsed, finish_reason)
-    logger.info("Generated translation: %r", text.strip())
+    logger.info("Generated raw translation: %r", text)
 
     if finish_reason != "stop":
         logger.error("Expected finish_reason='stop', got %r. Generation did not stop on token.", finish_reason)
@@ -162,7 +173,7 @@ def test_completion_and_stop(base_url: str, model_name: str, timeout: float) -> 
         logger.error("Empty completion text returned.")
         return None
 
-    return text.strip()
+    return text
 
 
 def test_determinism(base_url: str, model_name: str, timeout: float, expected_text: str) -> bool:
@@ -179,13 +190,7 @@ def test_determinism(base_url: str, model_name: str, timeout: float, expected_te
 def test_concurrency(base_url: str, model_name: str, timeout: float, num_workers: int = 8) -> bool:
     logger.info("Testing continuous batching concurrency with %d parallel requests...", num_workers)
     completions_url = f"{base_url.rstrip('/')}/completions"
-    payload = {
-        "model": model_name,
-        "prompt": PROMPT_TEMPLATE,
-        "max_tokens": 128,
-        "temperature": 0.0,
-        "stop": ["<end_of_turn>"],
-    }
+    payload = build_completion_payload(model_name=model_name)
 
     start_all = time.perf_counter()
     errors = 0

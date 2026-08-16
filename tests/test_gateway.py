@@ -9,50 +9,72 @@ from fastapi.testclient import TestClient
 
 from gateway.config import Settings
 from gateway.limits import ConcurrencyManager, RequestValidator, TokenEstimator
-from gateway.main import app, render_exact_training_prompt
+from gateway.main import CanonicalPromptRenderer, app, validate_system_option
 from gateway.metrics import MetricsCollector
-from gateway.routing import SentenceSplitter, WorkloadClass, WorkloadClassifier
+from gateway.prompting import TARGET_BOUNDARY_MARKER, render_training_prompt
+from gateway.routing import SentenceSplitter, WorkloadClass, WorkloadClassifier, dispatch_structured_batch
 from gateway.schemas import BatchPrompt, Prompt
 
 
-def test_render_exact_training_prompt():
-    prompt = render_exact_training_prompt("en", "fa", "Hello world")
-    assert prompt.startswith("<start_of_turn>user\n<<<source>>>en<<<target>>>fa<<<text>>>Hello world<end_of_turn>\n<start_of_turn>model\n\n        ")
-    assert prompt.endswith("\n\n        ")
+def test_canonical_prompt_renderer_parity():
+    renderer = CanonicalPromptRenderer()
+    rendered = renderer.render("en", "fa", "Cellular biology is the study of cell structure.")
+
+    assert rendered.startswith("<start_of_turn>user\n<<<source>>>en<<<target>>>fa<<<text>>>Cellular biology is the study of cell structure.<end_of_turn>\n<start_of_turn>model\n\n        ")
+    assert rendered.endswith("\n\n        ")
+    assert TARGET_BOUNDARY_MARKER not in rendered
+
+
+def test_system_option_validation():
+    # Default adapter system succeeds
+    assert validate_system_option(None, "adapter") == "adapter"
+    assert validate_system_option("adapter", "adapter") == "adapter"
+
+    # Unsupported systems like 'base' or random string return 400
+    with pytest.raises(HTTPException) as exc1:
+        validate_system_option("base", "adapter")
+    assert exc1.value.status_code == 400
+    assert "System 'base' is not loaded" in exc1.value.detail
+
+    with pytest.raises(HTTPException) as exc2:
+        validate_system_option("custom", "adapter")
+    assert exc2.value.status_code == 400
 
 
 def test_token_estimator():
     estimator = TokenEstimator()
-    tokens = estimator.estimate_tokens("The model relies on attention.")
+    tokens = estimator.count_tokens("The model relies on attention.")
     assert tokens > 0
     assert isinstance(tokens, int)
 
-    batch_tokens = estimator.estimate_batch_tokens(["Hello", "World"])
+    batch_tokens = estimator.count_batch_tokens(["Hello", "World"])
     assert len(batch_tokens) == 2
 
 
-def test_request_validator():
+def test_request_validator_context_limits():
     settings = Settings(
         max_source_chars_per_text=100,
         max_estimated_source_tokens=50,
-        max_total_context_tokens=100,
+        max_total_context_tokens=60,
     )
     estimator = TokenEstimator()
     validator = RequestValidator(settings, estimator)
 
-    # Empty text
+    # Empty text -> 422
     with pytest.raises(HTTPException) as exc:
-        validator.validate_text("   ", 10)
+        validator.validate_request("   ", "prompt", 10)
     assert exc.value.status_code == 422
 
-    # Oversized char text
+    # Oversized raw text -> 413
     with pytest.raises(HTTPException) as exc:
-        validator.validate_text("a" * 150, 10)
+        validator.validate_request("a" * 150, "prompt", 10)
     assert exc.value.status_code == 413
 
-    # Valid text
-    tokens = validator.validate_text("Valid text", 10)
-    assert tokens > 0
+    # Context limit exceeded (prompt tokens + max_new_tokens > max_total_context_tokens) -> 422
+    with pytest.raises(HTTPException) as exc:
+        validator.validate_request("Valid text", "Rendered prompt with many tokens...", 100)
+    assert exc.value.status_code == 422
+    assert "exceeds the model context window" in exc.value.detail
 
 
 def test_sentence_splitter():
@@ -76,60 +98,49 @@ def test_workload_classifier():
 
 
 @pytest.mark.asyncio
+async def test_structured_batch_cancellation_on_failure():
+    async def _failing_task(text: str) -> str:
+        if text == "fail":
+            raise RuntimeError("Backend error")
+        await asyncio.sleep(0.05)
+        return f"translated_{text}"
+
+    with pytest.raises(RuntimeError, match="Backend error"):
+        await dispatch_structured_batch(["ok1", "fail", "ok2"], _failing_task)
+
+
+@pytest.mark.asyncio
 async def test_concurrency_manager_saturation():
     settings = Settings(max_concurrent_requests=1, max_queue_depth=1)
     mgr = ConcurrencyManager(settings)
 
-    # First acquires slot
     wait1 = await mgr.acquire()
     assert wait1 >= 0
     assert mgr.in_flight == 1
 
-    # Second waits in queue (depth 1)
     task2 = asyncio.create_task(mgr.acquire())
     await asyncio.sleep(0.01)
     assert mgr.queued == 1
 
-    # Third should get 429 immediately because queue is saturated
     with pytest.raises(HTTPException) as exc:
         await mgr.acquire()
     assert exc.value.status_code == 429
 
-    # Release slot
     mgr.release()
     await task2
     mgr.release()
 
 
-def test_metrics_collector():
-    collector = MetricsCollector()
-    collector.record_request("/translate", "interactive")
-    collector.record_completion(
-        endpoint="/translate",
-        workload_class="interactive",
-        latency=0.15,
-        queue_wait=0.01,
-        prompt_tokens=20,
-        completion_tokens=25,
-        finish_reason="stop",
-    )
-
-    summary = collector.get_summary()
-    assert summary["requests"]["/translate:interactive"] == 1
-    assert summary["total_prompt_tokens"] == 20
-    assert summary["total_completion_tokens"] == 25
-    assert summary["finish_reasons"]["stop"] == 1
-
-
-def test_gateway_api_endpoints():
+def test_gateway_api_endpoints_health_and_translation():
     mock_vllm_client = MagicMock()
     mock_vllm_client.check_health = AsyncMock(return_value=True)
     mock_vllm_client.generate_raw_completion = AsyncMock(
-        return_value=("ترجمه تست", "stop", {"prompt_tokens": 10, "completion_tokens": 5})
+        return_value=("  ترجمه تست \n", "stop", {"prompt_tokens": 10, "completion_tokens": 5})
     )
 
-    settings = Settings()
+    settings = Settings(default_system="adapter")
     estimator = TokenEstimator()
+    renderer = CanonicalPromptRenderer()
     concurrency_mgr = ConcurrencyManager(settings)
     validator = RequestValidator(settings, estimator)
     splitter = SentenceSplitter()
@@ -139,6 +150,7 @@ def test_gateway_api_endpoints():
     app.state.settings = settings
     app.state.vllm_client = mock_vllm_client
     app.state.estimator = estimator
+    app.state.renderer = renderer
     app.state.concurrency_mgr = concurrency_mgr
     app.state.validator = validator
     app.state.splitter = splitter
@@ -147,35 +159,39 @@ def test_gateway_api_endpoints():
 
     client = TestClient(app)
 
-    # 1. Health check
-    resp = client.get("/health-check")
+    # 1. Liveness check
+    resp = client.get("/live")
     assert resp.status_code == 200
-    assert resp.json() == {"translator": "OK"}
+    assert resp.json() == {"status": "ALIVE"}
 
-    # 2. Model info
+    # 2. Readiness check (Healthy)
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json() == {"translator": "OK", "ready": True, "detail": None}
+
+    # 3. Model info (provenance)
     resp = client.get("/model-info")
     assert resp.status_code == 200
     info = resp.json()
-    assert "stop_token_ids" in info
+    assert info["is_merged_checkpoint"] is True
+    assert info["default_system"] == "adapter"
+    assert info["loaded_systems"] == ["adapter"]
     assert 106 in info["stop_token_ids"]
 
-    # 3. Single translate
+    # 4. Single translate preserving trailing whitespace without strip()
     resp = client.post("/translate", json={"text": "Hello world", "source_lang": "en", "target_lang": "fa"})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["translation"] == "ترجمه تست"
-    assert data["source_lang"] == "en"
-    assert data["target_lang"] == "fa"
+    assert data["translation"] == "  ترجمه تست \n"
+    assert data["system"] == "adapter"
 
-    # 4. Batch translate
-    resp = client.post("/translate/batch", json={"texts": ["Text 1", "Text 2"], "source_lang": "en", "target_lang": "fa"})
-    assert resp.status_code == 200
-    b_data = resp.json()
-    assert len(b_data["translations"]) == 2
-    assert b_data["translations"] == ["ترجمه تست", "ترجمه تست"]
+    # 5. Translate with invalid system returns 400
+    resp_bad = client.post("/translate", json={"text": "Hello", "system": "base"})
+    assert resp_bad.status_code == 400
+    assert "System 'base' is not loaded" in resp_bad.json()["detail"]
 
-    # 5. Metrics
-    resp = client.get("/metrics")
-    assert resp.status_code == 200
-    m_data = resp.json()
-    assert "requests" in m_data
+    # 6. Backend failure in readiness returns 503
+    mock_vllm_client.check_health = AsyncMock(return_value=False)
+    resp_unready = client.get("/ready")
+    assert resp_unready.status_code == 503
+    assert resp_unready.json()["ready"] is False

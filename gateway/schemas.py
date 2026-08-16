@@ -12,7 +12,10 @@ class TranslationOptions(BaseModel):
 
     system: Optional[str] = Field(
         default=None,
-        description="System identifier, defaults to 'adapter' in merged checkpoint serving.",
+        description=(
+            "Target system identifier. Merged checkpoint gateway serves 'adapter'. "
+            "Specifying an unsupported system (such as 'base') returns 400 Bad Request."
+        ),
     )
     source_lang: Optional[str] = Field(
         default=None,
@@ -106,8 +109,10 @@ class HealthResponse(BaseModel):
     """Health check response format compatible with existing monitor probes."""
 
     translator: str
+    ready: bool = True
+    detail: Optional[str] = None
 
-    model_config = {"json_schema_extra": {"examples": [{"translator": "OK"}]}}
+    model_config = {"json_schema_extra": {"examples": [{"translator": "OK", "ready": True}]}}
 
 
 class ModelInfoResponse(BaseModel):
@@ -115,7 +120,8 @@ class ModelInfoResponse(BaseModel):
 
     model_release_id: str
     base_model_id: str
-    adapter_path: Optional[str]
+    source_adapter_path: Optional[str]
+    is_merged_checkpoint: bool = True
     default_system: str
     loaded_systems: List[str]
     stop_token_ids: List[int]
@@ -123,7 +129,9 @@ class ModelInfoResponse(BaseModel):
     default_source_lang: str
     default_target_lang: str
     max_new_tokens: int
+    max_total_context_tokens: int
     vllm_model_name: str
     vllm_base_url: str
+    estimator_mode: str
     prompt_contract_version: str = "2026-08-10"
     routing_policy_version: str = "v1"

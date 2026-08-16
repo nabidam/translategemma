@@ -16,6 +16,8 @@ Usage:
       --output-dir exports/translategemma-12b-it-merged-v1
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -115,6 +117,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Overwrite output directory if it already exists.",
     )
+    parser.add_argument(
+        "--allow-base-mismatch",
+        action="store_true",
+        help="Allow merge even if adapter's configured base model name differs from --base-model.",
+    )
     return parser.parse_args(argv)
 
 
@@ -139,7 +146,19 @@ def get_package_versions() -> Dict[str, str]:
     return versions
 
 
-def validate_adapter_compatibility(base_model_id: str, adapter_path: Path) -> PeftConfig:
+def normalize_model_identifier(ident: str) -> str:
+    """Normalize model string or local path for comparison."""
+    p = Path(ident)
+    if p.exists():
+        return p.resolve().as_posix()
+    return ident.strip().rstrip("/")
+
+
+def validate_adapter_compatibility(
+    base_model_id: str,
+    adapter_path: Path,
+    allow_mismatch: bool = False,
+) -> Tuple[PeftConfig, bool]:
     """Ensure adapter exists and is configured for the given base model."""
     adapter_config_file = adapter_path / "adapter_config.json"
     if not adapter_config_file.is_file():
@@ -151,13 +170,32 @@ def validate_adapter_compatibility(base_model_id: str, adapter_path: Path) -> Pe
     logger.info("Loaded adapter config: %s", peft_config)
 
     configured_base = getattr(peft_config, "base_model_name_or_path", None)
+    base_matched = False
     if configured_base:
-        logger.info(
-            "Adapter configured base: %s | Requested base: %s",
-            configured_base,
-            base_model_id,
-        )
-    return peft_config
+        norm_conf = normalize_model_identifier(configured_base)
+        norm_req = normalize_model_identifier(base_model_id)
+
+        # Match exact string, normalized path, or matching trailing repo name
+        if (
+            norm_conf == norm_req
+            or norm_conf.endswith(norm_req)
+            or norm_req.endswith(norm_conf)
+            or Path(norm_conf).name == Path(norm_req).name
+        ):
+            base_matched = True
+            logger.info("Adapter base model verified: %s matches %s", configured_base, base_model_id)
+        else:
+            msg = (
+                f"Adapter configured base model ({configured_base!r}) does not match "
+                f"requested base model ({base_model_id!r})."
+            )
+            if not allow_mismatch:
+                raise ValueError(f"{msg} Pass --allow-base-mismatch to force merge.")
+            logger.warning("%s Proceeding because --allow-base-mismatch is enabled.", msg)
+    else:
+        logger.warning("Adapter config does not specify base_model_name_or_path.")
+
+    return peft_config, base_matched
 
 
 def build_deterministic_generation_config(
@@ -200,9 +238,10 @@ def merge_and_export(
     adapter_revision: Optional[str] = None,
     max_shard_size: str = "5GB",
     force: bool = False,
+    allow_base_mismatch: bool = False,
     command_args: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Execute the merge, validation, and atomic directory export."""
+    """Execute the merge, validation, and atomic directory export with safe backup rollback."""
     out_path = Path(output_dir).resolve()
     adapter_path = Path(adapter_dir).resolve()
 
@@ -211,14 +250,18 @@ def merge_and_export(
             raise FileExistsError(
                 f"Output directory already exists: {out_path}. Pass --force to overwrite."
             )
-        logger.warning("Output directory %s exists and --force was provided. Overwriting.", out_path)
+        logger.warning("Output directory %s exists and --force was provided.", out_path)
 
     if release_id is None:
         timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         release_id = f"tg-merged-{timestamp_str}"
 
-    # 1. Validate adapter
-    validate_adapter_compatibility(base_model_id, adapter_path)
+    # 1. Validate adapter compatibility
+    _, base_matched = validate_adapter_compatibility(
+        base_model_id,
+        adapter_path,
+        allow_mismatch=allow_base_mismatch,
+    )
 
     # 2. Resolve torch dtype
     torch_dtype = resolve_dtype(dtype_name)
@@ -338,6 +381,7 @@ def merge_and_export(
             "base_revision": base_revision,
             "adapter": str(adapter_path),
             "adapter_revision": adapter_revision,
+            "base_match_verified": base_matched,
             "dtype": dtype_name,
             "stop_token_ids": stop_token_ids,
             "stop_tokens": stop_tokens,
@@ -350,11 +394,25 @@ def merge_and_export(
         manifest_path = tmp_dir / "merge_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        # Atomic promotion
+        # Atomic promotion with rollback preservation
+        backup_dir: Optional[Path] = None
         if out_path.exists():
-            shutil.rmtree(out_path)
-        tmp_dir.rename(out_path)
-        logger.info("Successfully exported merged checkpoint to: %s", out_path)
+            backup_dir = parent_dir / f".backup_{out_path.name}_{os.getpid()}_{int(time.time())}"
+            logger.info("Moving existing release to temporary backup: %s", backup_dir)
+            out_path.rename(backup_dir)
+
+        try:
+            tmp_dir.rename(out_path)
+            logger.info("Successfully exported merged checkpoint to: %s", out_path)
+            if backup_dir and backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        except Exception:
+            if backup_dir and backup_dir.exists():
+                logger.error("Promotion failed; restoring previous release from backup...")
+                if out_path.exists():
+                    shutil.rmtree(out_path, ignore_errors=True)
+                backup_dir.rename(out_path)
+            raise
 
     except Exception:
         logger.exception("Merge export failed. Cleaning up temporary directory %s...", tmp_dir)
@@ -380,6 +438,7 @@ def main() -> int:
             adapter_revision=args.adapter_revision,
             max_shard_size=args.max_shard_size,
             force=args.force,
+            allow_base_mismatch=args.allow_base_mismatch,
             command_args=command_args,
         )
         return 0

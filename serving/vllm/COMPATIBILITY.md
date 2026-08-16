@@ -1,20 +1,21 @@
 # vLLM Compatibility and TranslateGemma Serving Guide
 
-Status: Verified Reference
-Target Engine: `vllm/vllm-openai:v0.13.0`
+Status: Target Specification (Host Verification Required via smoke_test.py)
+Target Image Tag: `vllm/vllm-openai:v0.13.0`
+Recommended Digest Pinning Format: `vllm/vllm-openai:v0.13.0@sha256:<pinned-digest-from-target-gpu-host>`
 
-## 1. Engine Compatibility Summary
+## 1. Engine Compatibility Specification
 
 TranslateGemma-12B-IT is built on the Gemma 2 architecture with multi-query attention, local-global sliding window attention layers, and specific vocabulary/token configurations.
 
 | Component | Invariant | vLLM 0.13.0 Configuration |
 |---|---|---|
-| **Model Type** | Gemma2 CausalLM / Merged LoRA | `--model /models/translategemma/current --served-model-name translategemma` |
+| **Model Type** | Gemma2 CausalLM / Merged LoRA | `--model /models/model --served-model-name translategemma` |
 | **Data Type** | BFloat16 | `--dtype bfloat16` |
-| **Stop Tokens** | `<eos>` (1), `<end_of_turn>` (106) | Passed in `generation_config.json` and request `stop: ["<end_of_turn>"]` / `extra_body: {"stop_token_ids": [1, 106]}` |
-| **Max Model Length** | 4096 / 8192 | `--max-model-len 4096` |
+| **Stop Tokens** | `<eos>` (1), `<end_of_turn>` (106) | Configured in `generation_config.json` and request `stop: ["<end_of_turn>"]`, `extra_body: {"stop_token_ids": [1, 106]}` |
+| **Max Model Length** | 4096 tokens | `--max-model-len 4096` |
 | **Continuous Batching** | Dynamic paged attention | `--max-num-batched-tokens 8192 --max-num-seqs 128` |
-| **Offline Mode** | No Hugging Face Hub calls | `VLLM_OFFLINE=1 HF_HUB_OFFLINE=1` |
+| **Offline Mode** | Zero Hugging Face Hub runtime calls | `VLLM_OFFLINE=1 HF_HUB_OFFLINE=1` |
 
 ## 2. Stop Token Resolution in vLLM
 
@@ -31,7 +32,7 @@ The FastAPI gateway passes both `stop=["<end_of_turn>"]` and `stop_token_ids=[1,
 
 ```bash
 python3 -m vllm.entrypoints.openai.api_server \
-    --model /models/current \
+    --model /models/model \
     --served-model-name translategemma \
     --dtype bfloat16 \
     --tensor-parallel-size 1 \
@@ -45,4 +46,16 @@ python3 -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0
 ```
 
-> **Note on `--enforce-eager`**: Gemma 2 models with sliding window attention can encounter CUDA graph capture issues depending on the CUDA runtime / PyTorch version. If CUDA graph capture is stable in production, `--enforce-eager` may be removed for ~5-10% latency improvement.
+## 4. Verification Evidence Protocol
+
+Prior to production traffic cutover on the serving machine:
+1. Pull the pinned container image and record exact digest:
+   ```bash
+   docker pull vllm/vllm-openai:v0.13.0
+   docker inspect --format='{{index .RepoDigests 0}}' vllm/vllm-openai:v0.13.0
+   ```
+2. Run `serving/vllm/smoke_test.py` against the running container:
+   ```bash
+   python serving/vllm/smoke_test.py --base-url http://localhost:8000/v1 --model-name translategemma
+   ```
+3. Archive smoke test output in `reports/vllm_smoke_test_results.json` along with host GPU, driver, and CUDA versions.

@@ -1,9 +1,12 @@
-"""Admission control, token estimation, and concurrency/queue management for the Gateway."""
+"""Admission control, exact token counting, and concurrency/queue management for the Gateway."""
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 from fastapi import HTTPException, status
 
 from config import Settings
@@ -12,29 +15,59 @@ logger = logging.getLogger("gateway.limits")
 
 
 class TokenEstimator:
-    """Estimates token counts for admission control and length bucketing."""
+    """Exact tokenizer loader with safe heuristic fallback."""
 
     def __init__(self, tokenizer_path: Optional[str] = None):
         self._tokenizer = None
-        if tokenizer_path:
-            try:
-                from transformers import AutoTokenizer
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, fix_markdown=False)
-                logger.info("Loaded exact tokenizer from %s for estimation.", tokenizer_path)
-            except Exception as e:
-                logger.warning("Could not load tokenizer from %s (%s); using heuristic estimator.", tokenizer_path, e)
+        self.mode = "heuristic"
 
-    def estimate_tokens(self, text: str) -> int:
+        if tokenizer_path:
+            p = Path(tokenizer_path)
+            if p.is_dir() or p.is_file():
+                try:
+                    # 1. Try tokenizers Fast Tokenizer
+                    from tokenizers import Tokenizer
+                    tok_file = p if p.is_file() else (p / "tokenizer.json")
+                    if tok_file.is_file():
+                        self._tokenizer = Tokenizer.from_file(str(tok_file))
+                        self.mode = "exact"
+                        logger.info("Loaded exact fast tokenizer from %s", tok_file)
+                except Exception as e1:
+                    logger.debug("Fast tokenizer load failed (%s); trying transformers AutoTokenizer...", e1)
+                    try:
+                        from transformers import AutoTokenizer
+                        self._tokenizer = AutoTokenizer.from_pretrained(str(p), fix_markdown=False)
+                        self.mode = "exact"
+                        logger.info("Loaded exact AutoTokenizer from %s", p)
+                    except Exception as e2:
+                        logger.warning(
+                            "Could not load exact tokenizer from %s (Fast: %s, HF: %s). Falling back to heuristic.",
+                            tokenizer_path,
+                            e1,
+                            e2,
+                        )
+
+        if self.mode == "heuristic":
+            logger.warning(
+                "TokenEstimator running in HEURISTIC mode. For production admission accuracy, configure TG_TOKENIZER_PATH."
+            )
+
+    def count_tokens(self, text: str) -> int:
         if self._tokenizer is not None:
             try:
-                return len(self._tokenizer.encode(text, add_special_tokens=False))
+                if hasattr(self._tokenizer, "encode"):
+                    res = self._tokenizer.encode(text)
+                    if hasattr(res, "ids"):
+                        return len(res.ids)
+                    if isinstance(res, list):
+                        return len(res)
             except Exception:
                 pass
-        # Fast heuristic: ~3.5 characters per token for English & Persian mixed scripts + overhead
+        # Heuristic fallback: ~3.2 characters per token for mixed English/Persian + 4 token framing
         return max(1, int(len(text) / 3.2) + 4)
 
-    def estimate_batch_tokens(self, texts: List[str]) -> List[int]:
-        return [self.estimate_tokens(t) for t in texts]
+    def count_batch_tokens(self, texts: List[str]) -> List[int]:
+        return [self.count_tokens(t) for t in texts]
 
 
 class ConcurrencyManager:
@@ -84,52 +117,53 @@ class ConcurrencyManager:
 
 
 class RequestValidator:
-    """Enforces size and token limits before dispatching to backend."""
+    """Enforces size, character, and context window limits before dispatching to backend."""
 
     def __init__(self, settings: Settings, estimator: TokenEstimator):
         self.settings = settings
         self.estimator = estimator
 
-    def validate_text(self, text: str, max_new_tokens: int) -> int:
-        stripped = text.strip()
+    def validate_request(self, raw_text: str, rendered_prompt: str, max_new_tokens: int) -> int:
+        stripped = raw_text.strip()
         if not stripped:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Source text cannot be empty or whitespace only.",
             )
 
-        if len(stripped) > self.settings.max_source_chars_per_text:
+        if len(raw_text) > self.settings.max_source_chars_per_text:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=(
-                    f"Text length ({len(stripped)} chars) exceeds maximum allowed "
+                    f"Text length ({len(raw_text)} chars) exceeds maximum allowed "
                     f"({self.settings.max_source_chars_per_text} chars)."
                 ),
             )
 
-        est_tokens = self.estimator.estimate_tokens(stripped)
-        if est_tokens > self.settings.max_estimated_source_tokens:
+        prompt_tokens = self.estimator.count_tokens(rendered_prompt)
+        if prompt_tokens > self.settings.max_estimated_source_tokens:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=(
-                    f"Estimated source tokens ({est_tokens}) exceeds maximum limit "
+                    f"Prompt tokens ({prompt_tokens}) exceeds maximum prompt token limit "
                     f"({self.settings.max_estimated_source_tokens})."
                 ),
             )
 
-        total_context = est_tokens + max_new_tokens + 32
+        total_context = prompt_tokens + max_new_tokens
         if total_context > self.settings.max_total_context_tokens:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    f"Combined prompt + output budget ({total_context} tokens) exceeds "
-                    f"model context window ({self.settings.max_total_context_tokens})."
+                    f"Combined prompt ({prompt_tokens} tokens) + output budget ({max_new_tokens} tokens) = "
+                    f"{total_context} tokens, which exceeds the model context window "
+                    f"({self.settings.max_total_context_tokens} tokens)."
                 ),
             )
 
-        return est_tokens
+        return prompt_tokens
 
-    def validate_batch(self, texts: List[str], max_new_tokens: int) -> List[int]:
+    def validate_batch(self, texts: List[str], max_new_tokens: int) -> None:
         if not texts:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -144,5 +178,3 @@ class RequestValidator:
                     f"({self.settings.max_batch_items})."
                 ),
             )
-
-        return [self.validate_text(t, max_new_tokens) for t in texts]

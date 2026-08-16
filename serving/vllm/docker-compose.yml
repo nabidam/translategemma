@@ -11,7 +11,7 @@ services:
     volumes:
       - ${MODEL_DIR:-/opt/models/translategemma/current}:/models/model:ro
     ports:
-      # Expose only to internal network / localhost, not to public internet
+      # Expose only to internal network / localhost
       - "127.0.0.1:${VLLM_PORT:-8000}:8000"
     command:
       - "--model"
@@ -44,7 +44,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request, sys; r = urllib.request.urlopen('http://localhost:8000/health'); sys.exit(0 if r.status == 200 else 1)\" || curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10

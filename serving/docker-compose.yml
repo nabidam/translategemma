@@ -10,7 +10,7 @@ services:
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
     volumes:
       - ${MODEL_DIR:-/opt/models/translategemma/current}:/models/model:ro
-    # Do NOT publish vLLM port to host public interface; communicate over internal docker network
+    # Expose only to internal network, not to host public interface
     expose:
       - "8000"
     command:
@@ -44,7 +44,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request, sys; r = urllib.request.urlopen('http://localhost:8000/health'); sys.exit(0 if r.status == 200 else 1)\" || curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -67,10 +67,17 @@ services:
       - TG_MODEL_RELEASE_ID=${MODEL_RELEASE_ID:-tg-12b-merged}
       - TG_MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-64}
       - TG_MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-128}
+      - TG_MAX_TOTAL_CONTEXT_TOKENS=${MAX_MODEL_LEN:-4096}
       - TG_HOST=0.0.0.0
       - TG_PORT=8080
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request, sys; r = urllib.request.urlopen('http://localhost:8080/ready'); sys.exit(0 if r.status == 200 else 1)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
       - serving_net
 

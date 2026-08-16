@@ -30,7 +30,7 @@ class VLLMClient:
             base_url=self.base_url,
             timeout=timeout,
             limits=limits,
-            headers={"User-Agent": "TranslateGemma-Gateway/0.1.0"},
+            headers={"User-Agent": "TranslateGemma-Gateway/1.0.0"},
         )
 
     async def close(self):
@@ -67,7 +67,11 @@ class VLLMClient:
         stop_tokens: Optional[List[str]] = None,
         request_id: Optional[str] = None,
     ) -> Tuple[str, str, Dict[str, int]]:
-        """Call /v1/completions with rendered prompt and return (text, finish_reason, usage)."""
+        """Call /v1/completions with rendered prompt and return (text, finish_reason, usage).
+
+        Output text is preserved without stripping to retain stop diagnostics.
+        Finish reason 'length' is treated as an explicit error.
+        """
         stop_list = stop_tokens or self.settings.stop_tokens
         stop_ids = stop_token_ids or self.settings.stop_token_ids
 
@@ -112,11 +116,19 @@ class VLLMClient:
             usage = data.get("usage", {})
 
             if finish_reason == "length":
-                logger.warning(
-                    "Generation hit max_tokens length cap (%d tokens). Output may be truncated.",
+                logger.error(
+                    "Generation truncated by max_tokens limit (%d tokens) without reaching stop token.",
                     max_tokens,
                 )
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=(
+                        f"Generation truncated: model reached maximum token budget ({max_tokens}) "
+                        "without producing an EOS stop token."
+                    ),
+                )
 
+            # Return raw text without strip() to preserve stop diagnostics
             return text, finish_reason, usage
 
         except httpx.ConnectError as e:
@@ -148,7 +160,7 @@ class VLLMClient:
         stop_tokens: Optional[List[str]] = None,
         request_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream completion chunks via SSE from vLLM."""
+        """Stream completion chunks via SSE from vLLM without stripping content."""
         stop_list = stop_tokens or self.settings.stop_tokens
         stop_ids = stop_token_ids or self.settings.stop_token_ids
 
@@ -179,24 +191,30 @@ class VLLMClient:
                         detail=f"vLLM streaming error {resp.status_code}: {err_text.decode('utf-8', errors='replace')}",
                     )
 
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("data: "):
-                        data_str = line[len("data: ") :].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            choices = chunk.get("choices", [])
-                            if choices:
-                                yield {
-                                    "text": choices[0].get("text", ""),
-                                    "finish_reason": choices[0].get("finish_reason"),
-                                }
-                        except Exception:
-                            continue
+                buffer = ""
+                async for raw_bytes in resp.aiter_bytes():
+                    buffer += raw_bytes.decode("utf-8", errors="replace")
+                    while "\n\n" in buffer:
+                        event_block, buffer = buffer.split("\n\n", 1)
+                        for line in event_block.splitlines():
+                            if line.startswith("data:"):
+                                data_str = line[len("data:") :].lstrip()
+                                if data_str == "[DONE]":
+                                    return
+                                try:
+                                    chunk = json.loads(data_str)
+                                    choices = chunk.get("choices", [])
+                                    if choices:
+                                        text_part = choices[0].get("text", "")
+                                        finish = choices[0].get("finish_reason")
+                                        yield {
+                                            "text": text_part,
+                                            "finish_reason": finish,
+                                        }
+                                        if finish:
+                                            return
+                                except Exception:
+                                    continue
 
         except httpx.ConnectError as e:
             raise HTTPException(
