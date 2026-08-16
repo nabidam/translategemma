@@ -386,9 +386,8 @@ quantise it to FP8 **after** the merge — merging into quantised weights rounds
 the adapter delta away:
 
 ```bash
-IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
-IMAGE_TAG=cu128-quant-py312 docker compose run --rm trainer \
-  python scripts/quantize_fp8.py \
+docker compose build quantizer                      # once, needs network
+docker compose run --rm quantizer \
   /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
 ```
 
@@ -398,11 +397,12 @@ model away from its domain. The script refuses an adapter directory or an
 already-quantised input, and fails rather than write an output whose stop set
 has lost `<end_of_turn>` (106).
 
-`INSTALL_LLMCOMPRESSOR=1` moves `pillow`, `accelerate` and `datasets` off the
-locked versions — llm-compressor's declared ranges exclude them — so **the quant
-tag is not a training image**. `torch`, `transformers` and `tokenizers` are
-constrained to the locked versions, since those decide the numerics of the
-checkpoint it writes; the build fails rather than move them.
+The quantiser is a separate image because no llm-compressor release installs
+against this repository's lock — every version needs either `transformers`
+below 4.57.6, `transformers` v5, or `torch` 2.9+. It is built from the vLLM
+image instead, which already carries the torch llm-compressor wants. The
+tokenizer and chat template are **copied** into the FP8 directory rather than
+re-saved, so the other transformers version cannot rewrite them.
 
 The gateway reproduces the generation contract of `evaluate_translations.py`
 exactly — it renders prompts locally and sends **token ids** to vLLM's

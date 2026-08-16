@@ -87,38 +87,6 @@ RUN case "$PYTORCH_CUDA" in \
 # cu128. Older versions lack sm_120 (Blackwell) kernels and fail QLoRA with
 # "no kernel image is available for execution on the device".
 
-# llm-compressor, for scripts/quantize_fp8.py. Optional and off by default: it
-# is a deployment tool, not part of training, and every package in the image is
-# a package that can break training.
-#
-#     IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
-#
-# THE RESULTING TAG IS NOT A TRAINING IMAGE. Installing llm-compressor moves
-# pillow, accelerate and datasets off the locked versions -- its declared ranges
-# genuinely exclude them -- so build it under its own tag and train with the
-# default one.
-#
-# The constraint covers torch, transformers and tokenizers only, rather than the
-# whole `uv pip freeze`. Those three decide the numerics of the checkpoint this
-# image writes: the weights it reads, the scales it computes, and the tokenizer
-# that produced the training data. Everything else is packaging. Constraining
-# the full freeze is what the first version did, and it simply cannot resolve --
-# which is the correct answer to "may llm-compressor move `datasets`?" only if
-# the answer is no, and here it does not need to be.
-#
-# The pins are read out of the installed environment rather than written by
-# hand, so they cannot drift from uv.lock. A release of llm-compressor that
-# needs a different torch or transformers still fails this layer loudly.
-ARG INSTALL_LLMCOMPRESSOR=0
-RUN if [ "$INSTALL_LLMCOMPRESSOR" = "1" ]; then \
-        uv pip freeze | grep -E '^(torch|transformers|tokenizers)==' > /tmp/numerics-constraints.txt \
-        && cat /tmp/numerics-constraints.txt \
-        && uv pip install --constraint /tmp/numerics-constraints.txt "llmcompressor>=0.8,<1.0" \
-        && python -c 'import torch, transformers; assert torch.__version__.split("+")[0] == "2.8.0", torch.__version__; assert transformers.__version__ == "4.57.6", transformers.__version__' \
-        && python -c 'from llmcompressor import oneshot; from llmcompressor.modifiers.quantization import QuantizationModifier'; \
-    fi \
-    && rm -f /tmp/numerics-constraints.txt
-
 # FlashAttention 3, installed from a wheel that was fetched or compiled
 # *outside* this build by scripts/fetch_flash_attn3_wheel.sh or
 # scripts/build_flash_attn3_wheel.sh.

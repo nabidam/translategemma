@@ -22,18 +22,20 @@ computed at run time. That choice is deliberate over 4-bit AWQ/GPTQ:
 
 Two things the output directory needs beyond the weights, both handled here:
 
-  * the processor (tokenizer + chat template), because vLLM loads the tokenizer
-    from the model directory;
+  * the processor (tokenizer + chat template), copied byte for byte rather than
+    re-saved, because vLLM loads the tokenizer from the model directory and this
+    image runs a different transformers than the API does;
   * generation_config.json, whose stop set includes <end_of_turn> (106). Lose
     it and the decoder does not stop on a fine-tuned model at all, while still
     returning fluent text. See docs/2026-08-10_adapter_degeneration_analysis.md.
     The final check below refuses to leave a directory without it.
 
-Run it in the trainer image, built with llm-compressor:
+Run it in the quantiser image, which carries llm-compressor. It is a separate
+image because no llm-compressor release installs against the training lock; the
+version table is in scripts/quantize.Dockerfile.
 
-    IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
-    IMAGE_TAG=cu128-quant-py312 docker compose run --rm trainer \\
-      python scripts/quantize_fp8.py \\
+    docker compose build quantizer
+    docker compose run --rm quantizer \\
       /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
 
 The quantisation is a weight transform, not a forward pass, so --device cpu (the
@@ -60,7 +62,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from logging_utils import console, logger
 
@@ -87,6 +89,28 @@ PROVENANCE_FILENAMES = (
     "merge_metadata.json",
     "adapter_adapter_config.json",
     "adapter_run_metadata.json",
+)
+
+# The processor: tokenizer, chat template, and the preprocessor configs that
+# come with a multimodal checkpoint. COPIED byte for byte, never re-saved
+# through save_pretrained.
+#
+# This image runs a different transformers than the API and the evaluation
+# harness do -- it has to, since no llm-compressor release installs against the
+# training lock (see scripts/quantize.Dockerfile). Re-serialising the tokenizer
+# under that other version is exactly the kind of silent rewrite that produced
+# docs/2026-08-10_adapter_degeneration_analysis.md: a chat template that renders
+# one space differently still yields fluent Farsi. Copying cannot drift.
+PROCESSOR_FILENAMES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "processor_config.json",
 )
 
 
@@ -150,9 +174,9 @@ def load_oneshot():
             from llmcompressor.transformers import oneshot
         except ImportError as error:
             raise SystemExit(
-                "llm-compressor is not installed in this image. Rebuild the trainer "
-                "image with it: IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 "
-                "docker compose build trainer"
+                "llm-compressor is not installed in this image. Run this script through "
+                "the quantiser image: docker compose build quantizer && "
+                "docker compose run --rm quantizer ..."
             ) from error
     return oneshot
 
@@ -194,6 +218,27 @@ def resolve_device_map(device):
     if device == "auto":
         return "auto"
     return {"": device}
+
+
+def copy_processor_files(input_dir, output_dir):
+    """Copy the tokenizer and chat template verbatim from the merged checkpoint.
+
+    Raises if the tokenizer itself is missing: vLLM loads it from the model
+    directory, and a directory without one is unservable.
+    """
+    copied = []
+    for filename in PROCESSOR_FILENAMES:
+        source = input_dir / filename
+        if source.is_file():
+            shutil.copy2(source, output_dir / filename)
+            copied.append(filename)
+    if not any(name.startswith("tokenizer") for name in copied):
+        raise FileNotFoundError(
+            f"No tokenizer files in {input_dir}. vLLM loads the tokenizer from the model "
+            "directory, so the merged checkpoint must carry one; re-run "
+            "scripts/merge_lora_adapter.py."
+        )
+    return copied
 
 
 def copy_provenance_files(input_dir, output_dir):
@@ -314,14 +359,10 @@ def main():
     )
 
     with progress:
-        task = progress.add_task("Loading processor", total=4)
+        task = progress.add_task("Loading merged model", total=3)
 
         # dtype="auto" keeps the merged checkpoint's own precision; this script
         # must not be the place a bf16 merge silently becomes fp16.
-        processor = AutoProcessor.from_pretrained(
-            str(input_dir), use_fast=True, fix_mistral_regex=False
-        )
-        progress.update(task, advance=1, description="Loading merged model")
 
         model = AutoModelForCausalLM.from_pretrained(
             str(input_dir),
@@ -343,15 +384,19 @@ def main():
             save_compressed=True,
             max_shard_size=args.max_shard_size,
         )
-        processor.save_pretrained(str(output_dir))
         progress.update(task, advance=1, description="Quantised model saved")
 
     quantization_config = verify_quantized(output_dir)
+    processor_files = copy_processor_files(input_dir, output_dir)
     stop_ids = ensure_generation_config(input_dir, output_dir)
     copied = copy_provenance_files(input_dir, output_dir)
     metadata_path = write_quantization_metadata(output_dir, input_dir, args, ignore)
 
-    stop_tokens = processor.tokenizer.convert_ids_to_tokens(stop_ids)
+    # Loaded from the *output* directory, so this reports what was actually
+    # written rather than what was intended.
+    tokenizer = AutoTokenizer.from_pretrained(str(output_dir), use_fast=True)
+    stop_tokens = tokenizer.convert_ids_to_tokens(stop_ids)
+    logger.info("Copied processor files: %s", ", ".join(processor_files))
     logger.info("Stop set preserved: %s -> %s", stop_tokens, stop_ids)
     logger.info("quantization_config: %s", json.dumps(quantization_config, sort_keys=True)[:400])
     if copied:
