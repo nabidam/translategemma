@@ -362,37 +362,44 @@ start fresh. Resume stages in separate invocations to avoid either ambiguity.
 
 ## Serving
 
-[`api/`](api/README.md) is a FastAPI service for a trained adapter, with the same
-endpoint shapes as the existing NLLB service plus a batch endpoint. It is a
-self-contained deployment unit: copy the directory to the serving host and build
-from inside it, with no part of this repository present.
+TranslateGemma supports two serving topologies:
+
+### 1. Production: Merged Weights on vLLM + FastAPI Gateway (Recommended)
+
+In production, fine-tuned LoRA adapters are merged into base weights on the fine-tune host, exported as immutable release directories with cryptographic checksums, and served on an offline host via **vLLM (continuous batching)** fronted by a **FastAPI Gateway (admission control, sentence routing, exact prompt rendering)**.
+
+```bash
+# 1. Merge adapter into base model (on fine-tune machine)
+uv run python scripts/merge_lora_adapter.py \
+    --base-model google/translategemma-12b-it \
+    --adapter checkpoints/sft-translategemma-12b-it \
+    --output-dir exports/tg-12b-merged-v1 \
+    --dtype bfloat16
+
+# 2. Verify export and stop-token invariants
+python scripts/verify_model_export.py --model-dir exports/tg-12b-merged-v1
+
+# 3. Transfer to serving host and launch vLLM + Gateway
+# (See docs/INFERENCE_SERVING_RUNBOOK.md for step-by-step instructions)
+cd serving && docker compose up -d
+```
+
+- **Runbook**: [`docs/INFERENCE_SERVING_RUNBOOK.md`](docs/INFERENCE_SERVING_RUNBOOK.md)
+- **Transfer Protocol**: [`docs/INFERENCE_ARTIFACT_TRANSFER.md`](docs/INFERENCE_ARTIFACT_TRANSFER.md)
+- **Serving Benchmarks**: [`docs/INFERENCE_SERVING_BENCHMARKS.md`](docs/INFERENCE_SERVING_BENCHMARKS.md)
+- **Architecture Plan**: [`docs/INFERENCE_SERVING_PLAN.md`](docs/INFERENCE_SERVING_PLAN.md)
+
+### 2. Reference: Single-Process PyTorch/PEFT API (`api/`)
+
+[`api/`](api/README.md) is a single-process FastAPI service serving the base model or adapter directly via HuggingFace/PEFT. It is kept as a correctness oracle and verification baseline during migration.
 
 ```bash
 cd api && docker build -t translategemma-api .
 ```
 
-Its generation path mirrors `evaluate_translations.py` exactly, so a served
-translation is the translation the harness scored. That requires copies of
-`prompting.py` and `model_loading.py` inside `api/`, which are kept
-byte-identical from here:
-
+`prompting.py` and `model_loading.py` are mirrored inside `api/` and `gateway/`:
 ```bash
-uv run python scripts/sync_api_vendored.py          # after editing either root module
-uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift; also a test
+uv run python scripts/sync_api_vendored.py          # sync root modules into api/ and gateway/
+uv run python scripts/sync_api_vendored.py --check  # check for drift
 ```
 
-`TG_MODEL_MODE` selects what the service loads: the base model, the adapter, or
-both at once (one copy of the weights, adapter toggled per request), so a caller
-can query either system live.
-
-### vLLM serving
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model google/translategemma-12b-it \
-  --enable-lora \
-  --lora-modules farsi-science=path/to/final_adapter \
-  --max-lora-rank 64 \
-  --host 0.0.0.0 \
-  --port 8000
-```

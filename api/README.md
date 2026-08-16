@@ -1,8 +1,11 @@
-# TranslateGemma API
+# TranslateGemma API (Reference / Migration Oracle)
+
+> **Note on Serving Architecture**: This single-process PyTorch/PEFT API serves as the **correctness oracle and reference implementation**. For production deployments with continuous batching, refer to the **vLLM + FastAPI Gateway** stack in [`serving/`](../serving/vllm/README.md), [`gateway/`](../gateway/main.py), and [`docs/INFERENCE_SERVING_RUNBOOK.md`](../docs/INFERENCE_SERVING_RUNBOOK.md).
 
 FastAPI translation service for TranslateGemma. Serves the base model, a
 LoRA-adapted model, or both at once. Endpoint shapes follow the existing NLLB
 service, so callers move over with a URL change.
+
 
 ## Standalone
 
