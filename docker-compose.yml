@@ -3,6 +3,7 @@
 # Usage on the offline host:
 #   docker compose run --rm trainer            # interactive shell in /workspace
 #   docker compose run --rm trainer python train.py --config config.yaml --dry-run
+#   docker compose run --rm quantizer /models/merged /models/merged-fp8
 #
 # `run` is preferred over `up` because these are foreground jobs, not services.
 
@@ -79,6 +80,51 @@ services:
       # expandable allocator on long runs with variable sequence lengths.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # FP8 quantisation of a merged checkpoint, for serving two models on one GPU.
+  # Its own image: llm-compressor must not be installed into the trainer's
+  # locked environment, and the quantiser is better matched to the torch/CUDA
+  # build that will serve the result. See scripts/quantize.Dockerfile.
+  #
+  #   docker compose build quantizer      # once, with network access
+  #   docker compose run --rm quantizer \
+  #     /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
+  #
+  # Arguments after the service name go straight to scripts/quantize_fp8.py
+  # (--help lists them). Defaults to --device cpu, so it does not compete with
+  # anything serving on the GPU; pass --device cuda:0 when the card is free.
+  quantizer:
+    profiles: ["tools"]
+    image: ${QUANTIZER_IMAGE_NAME:-translategemma-quantizer}:${QUANTIZER_IMAGE_TAG:-vllm0.13.0}
+    build:
+      context: .
+      dockerfile: scripts/quantize.Dockerfile
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    ipc: host
+    volumes:
+      - .:/workspace
+      # Not read-only: the quantised checkpoint is written next to the merge.
+      - ${MODELS_DIR:-./offline_assets/models}:/models
+      - ${HF_CACHE_DIR:-./offline_assets/hf_cache}:/hf_cache
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HOME: /models
+      HUGGINGFACE_HUB_CACHE: /models/hub
+      HOME: /hf_cache
+      XDG_CACHE_HOME: /hf_cache
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: ${GPUS:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     deploy:
       resources:
         reservations:
