@@ -99,9 +99,23 @@ services:
     # --generation-config defaults to auto; do NOT pass
     # `--generation-config vllm`, which discards the file.
     #
-    # No --max-model-len: the context length comes from the checkpoint's
-    # config.json. Add `--max-model-len 8192` only if vLLM refuses to start
-    # because the KV cache for the full context does not fit its memory share.
+    # No --max-model-len: vLLM derives the context length from the checkpoint's
+    # config.json, which for Gemma 3 is 131072. That is a KV-cache budget
+    # decision, not a request-size one. Gemma 3 12B costs ~64 KB/token across
+    # its 8 global-attention layers (the 40 sliding-window layers are capped at
+    # 1024 tokens each), so one full-length sequence needs ~9 GB of cache and
+    # vLLM refuses to start when the budget is smaller than that. On a card
+    # shared with another model, set --max-model-len to what a translation
+    # segment actually needs (8192 is already generous) and spend the rest of
+    # the cache on concurrency: KV budget is what decides how many requests
+    # batch together, and batching is where the throughput is.
+    #
+    # No --chat-template-content-format below: nothing here uses
+    # /v1/chat/completions. The gateway renders prompts itself and posts token
+    # ids to /v1/completions, which is the only way to reproduce the SFT
+    # rendering -- and TranslateGemma's message content (per-part
+    # source_lang_code/target_lang_code) is not a shape vLLM's chat parser can
+    # accept anyway.
     #
     # The image's own ENTRYPOINT is already `vllm serve`, but it is restated
     # here (as the dots service does): a command that starts with `serve` would
@@ -115,7 +129,6 @@ services:
       --tensor-parallel-size 1
       --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.45}
       --dtype ${TG_DTYPE:-bfloat16}
-      --chat-template-content-format string
       --trust-remote-code
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
