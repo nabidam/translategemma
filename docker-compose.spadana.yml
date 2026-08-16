@@ -102,8 +102,13 @@ services:
     # No --max-model-len: the context length comes from the checkpoint's
     # config.json. Add `--max-model-len 8192` only if vLLM refuses to start
     # because the KV cache for the full context does not fit its memory share.
+    #
+    # The image's own ENTRYPOINT is already `vllm serve`, but it is restated
+    # here (as the dots service does): a command that starts with `serve` would
+    # be appended to it and ask vLLM to load a model named "serve".
+    entrypoint: ["vllm", "serve"]
     command: >
-      serve /merged
+      /merged
       --host 0.0.0.0
       --port 8000
       --served-model-name ${SERVED_TG_MODEL_NAME:-translategemma}
