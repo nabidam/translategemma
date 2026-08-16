@@ -87,6 +87,27 @@ RUN case "$PYTORCH_CUDA" in \
 # cu128. Older versions lack sm_120 (Blackwell) kernels and fail QLoRA with
 # "no kernel image is available for execution on the device".
 
+# llm-compressor, for scripts/quantize_fp8.py. Optional and off by default: it
+# is a deployment tool, not part of training, and every package in the image is
+# a package that can break training.
+#
+#     IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
+#
+# Installed *after* the sync and under a constraints file pinning everything the
+# lock already resolved, rather than added to pyproject.toml. Two reasons: the
+# lock stays authoritative for the training environment, and llm-compressor's
+# own transformers/torch ranges cannot quietly upgrade the versions the
+# evaluation harness was validated against. An incompatible release fails this
+# layer loudly instead of shipping a subtly different training stack.
+ARG INSTALL_LLMCOMPRESSOR=0
+RUN if [ "$INSTALL_LLMCOMPRESSOR" = "1" ]; then \
+        uv pip freeze > /tmp/locked-constraints.txt \
+        && uv pip install --constraint /tmp/locked-constraints.txt "llmcompressor>=0.8,<1.0" \
+        && python -c 'import torch, transformers; assert torch.__version__.split("+")[0] == "2.8.0", torch.__version__; assert transformers.__version__ == "4.57.6", transformers.__version__' \
+        && python -c 'from llmcompressor.modifiers.quantization import QuantizationModifier'; \
+    fi \
+    && rm -f /tmp/locked-constraints.txt
+
 # FlashAttention 3, installed from a wheel that was fetched or compiled
 # *outside* this build by scripts/fetch_flash_attn3_wheel.sh or
 # scripts/build_flash_attn3_wheel.sh.

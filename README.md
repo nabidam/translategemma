@@ -377,10 +377,27 @@ vLLM serves the **merged** checkpoint that `scripts/merge_lora_adapter.py`
 writes, so no `--enable-lora` and no adapter loading at serve time:
 
 ```bash
-uv run python scripts/merge_lora_adapter.py \
-  --adapter-path outputs/sft_final \
-  --output-dir offline_assets/models/translategemma-12b-merged
+docker compose run --rm trainer python scripts/merge_lora_adapter.py \
+  outputs/sft_final /models/translategemma-12b-merged
 ```
+
+A 12B merge is ~24 GB in bf16. When it has to share a GPU with another model,
+quantise it to FP8 **after** the merge — merging into quantised weights rounds
+the adapter delta away:
+
+```bash
+IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
+IMAGE_TAG=cu128-quant-py312 docker compose run --rm trainer \
+  python scripts/quantize_fp8.py \
+  /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
+```
+
+FP8_DYNAMIC needs no calibration corpus, which is why it is preferred here over
+4-bit AWQ/GPTQ: a general-purpose calibration set biases a domain-fine-tuned
+model away from its domain. The script refuses an adapter directory or an
+already-quantised input, and fails rather than write an output whose stop set
+has lost `<end_of_turn>` (106). llm-compressor is a build-arg opt-in so it stays
+out of the training image by default.
 
 The gateway reproduces the generation contract of `evaluate_translations.py`
 exactly — it renders prompts locally and sends **token ids** to vLLM's

@@ -29,13 +29,18 @@ Two things the output directory needs beyond the weights, both handled here:
     returning fluent text. See docs/2026-08-10_adapter_degeneration_analysis.md.
     The final check below refuses to leave a directory without it.
 
-Run it inside the quantiser image, which carries llm-compressor:
+Run it in the trainer image, built with llm-compressor:
 
-    docker compose run --rm quantizer \\
+    IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 docker compose build trainer
+    IMAGE_TAG=cu128-quant-py312 docker compose run --rm trainer \\
+      python scripts/quantize_fp8.py \\
       /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
 
-The quantisation itself is a weight transform, not a forward pass, so --device
-cpu (the default) is enough and leaves the GPU to whatever is serving.
+The quantisation is a weight transform, not a forward pass, so --device cpu (the
+default) is enough and leaves the GPU to whatever is serving. It also means the
+torch build here need not match the one that serves the result: what is written
+is a compressed-tensors checkpoint -- safetensors plus scales plus a config
+entry -- and the FP8 *kernels* are a serving-time concern.
 """
 
 from __future__ import annotations
@@ -59,10 +64,8 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 
 from logging_utils import console, logger
 
-# The chat turn ender. Duplicated from prompting.CHAT_TURN_END_TOKEN as a bare
-# id because this script runs in an image that has llm-compressor but not
-# necessarily the training stack, and the check it guards is too important to
-# skip on an ImportError.
+# The chat turn ender, as a bare id: the check it guards runs after the model is
+# already saved, so it must not depend on anything that could fail to import.
 CHAT_TURN_END_TOKEN_ID = 106
 
 # Modules left in full precision. lm_head is the standard exclusion: it is
@@ -147,8 +150,9 @@ def load_oneshot():
             from llmcompressor.transformers import oneshot
         except ImportError as error:
             raise SystemExit(
-                "llm-compressor is not installed in this environment. Run this script "
-                "through the quantiser image: docker compose run --rm quantizer ..."
+                "llm-compressor is not installed in this image. Rebuild the trainer "
+                "image with it: IMAGE_TAG=cu128-quant-py312 INSTALL_LLMCOMPRESSOR=1 "
+                "docker compose build trainer"
             ) from error
     return oneshot
 
