@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Put two benchmark_speed.py reports side by side and state which arm won.
 
 Written for the vLLM-vs-transformers A/B (docs/SERVING_BENCHMARK_AB.md), but it
@@ -81,6 +82,21 @@ def speedup(baseline: float | None, candidate: float | None) -> str:
     return f"{candidate / baseline:.2f}x"
 
 
+def ratio_phrase(baseline: float | None, candidate: float | None, higher_is_better: bool) -> str:
+    """"3.20x faster" / "7.75x slower", never "0.13x faster".
+
+    A bare multiple below 1 is read as an improvement about as often as not, so
+    the direction is stated in words and the number is always >= 1.
+    """
+    if not baseline or not candidate:
+        return "-"
+    better = (candidate > baseline) if higher_is_better else (candidate < baseline)
+    factor = candidate / baseline if higher_is_better else baseline / candidate
+    if factor < 1:
+        factor = 1 / factor
+    return f"{factor:.2f}x {'faster' if better else 'slower'}"
+
+
 def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> int:
     b_label, c_label = baseline["_label"], candidate["_label"]
     print(f"\nBaseline : {b_label}  ({baseline['_path'].name})")
@@ -91,7 +107,14 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> int:
     b_host = baseline.get("context", {}).get("hostname")
     c_host = candidate.get("context", {}).get("hostname")
     if b_host != c_host:
-        print(f"\n!! Different hosts ({b_host} vs {c_host}). These are not comparable.")
+        # Informational, NOT a comparability warning. The benchmark records
+        # platform.node(), which inside `docker compose run --rm` is the
+        # ephemeral container id -- so two arms benchmarked on one physical
+        # machine always report different "hosts". There is nothing in the
+        # report that identifies the real host, so this cannot be checked here;
+        # keeping the arms on one machine is the runbook's job.
+        print(f"\n(reported by containers {b_host} and {c_host}; both arms must be run "
+              "on the same physical host -- the report cannot verify that)")
 
     warnings: list[str] = []
     b_sweep, c_sweep = sweep_index(baseline), sweep_index(candidate)
@@ -141,12 +164,12 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> int:
         print(
             f"  latency  @ batch {low:<3} : "
             f"{fmt(b_low.get('wall_s'), 2)} s -> {fmt(c_low.get('wall_s'), 2)} s "
-            f"({speedup(c_low.get('wall_s'), b_low.get('wall_s'))} faster)"
+            f"({ratio_phrase(b_low.get('wall_s'), c_low.get('wall_s'), higher_is_better=False)})"
         )
         print(
             f"  through. @ batch {high:<3} : "
             f"{fmt(b_high.get('total_tok_s'))} -> {fmt(c_high.get('total_tok_s'))} tok/s "
-            f"({speedup(b_high.get('total_tok_s'), c_high.get('total_tok_s'))})"
+            f"({ratio_phrase(b_high.get('total_tok_s'), c_high.get('total_tok_s'), higher_is_better=True)})"
         )
         step_b, step_c = b_high.get("step_ms"), c_high.get("step_ms")
         print(f"  ms/decode step      : {fmt(step_b, 2)} -> {fmt(step_c, 2)}")
@@ -169,6 +192,28 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> int:
                 f"{fmt(b_row.get('wall_s'), 2):>18} {fmt(c_row.get('wall_s'), 2):>18} "
                 f"{speedup(c_row.get('wall_s'), b_row.get('wall_s')):>8}"
             )
+
+    # The arms serve the same fine-tune and decode greedily, so they should
+    # return the same text. This is the only check in the report that looks at
+    # WHAT was generated rather than how fast: a serving-side numerical
+    # difference (a patched RoPE block, a dtype mismatch, a different prompt
+    # rendering) produces fluent output that is quietly not the same model.
+    print("\n--- sample output (same segment, both arms) -------------------------")
+    shown = 0
+    for system, batch in shared:
+        if batch != min(b for s, b in shared if s == system):
+            continue
+        b_text = (b_sweep[(system, batch)].get("sample_output") or "").strip()
+        c_text = (c_sweep[(system, batch)].get("sample_output") or "").strip()
+        if not b_text and not c_text:
+            continue
+        verdict = "identical" if b_text == c_text else "DIFFERENT"
+        print(f"\n[{system}] {verdict}")
+        print(f"  {b_label}: {b_text[:300]}")
+        print(f"  {c_label}: {c_text[:300]}")
+        shown += 1
+    if not shown:
+        print("  (no sample outputs recorded)")
 
     # Settings that change what was measured. A difference here does not
     # invalidate the run, but it does change what the run is evidence of.

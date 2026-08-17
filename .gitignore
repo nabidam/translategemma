@@ -42,3 +42,8 @@ docs/EVALUATION_METRICS_EXPLAINED.md
 
 # Speed-benchmark reports, produced per host by api/scripts/benchmark_speed.py.
 api/benchmarks/
+
+# A/B serving benchmark: host-specific paths, and reports produced per host by
+# scripts/bench_ab.sh. .env.bench.example is the tracked template.
+.env.bench
+benchmark_ab/
