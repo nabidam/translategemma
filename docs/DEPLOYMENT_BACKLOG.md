@@ -62,6 +62,34 @@ attribute 'rope_parameters'`).
   Consider folding the flattening into `scripts/merge_lora_adapter.py` if the
   upstream fix is slow to arrive.
 
+## Validate the FP8 serving path
+
+Deliberately left unfinished on 2026-08-17. The bf16 merge is proven — served,
+benchmarked, and byte-identical to the transformers arm — but FP8 is the
+checkpoint the shared-GPU deployment is actually sized for, and none of it has
+been exercised.
+
+Known: the FP8 checkpoint fails to load on vLLM 0.13.0 with the same
+`rope_parameters should have a 'rope_type' key` error as the bf16 merge, which is
+expected since the two configs differ only in `transformers_version`.
+
+Unknown, in the order it needs answering:
+
+- Does `scripts/vllm_rope_shim.py` accept an FP8 config? It refuses inputs whose
+  `rope_parameters` mixes layer types with other keys, and the FP8 config carries
+  a `quantization_config` block the shim has never seen. Validate in seconds with
+  `get_config('<overlay>', True)` — no GPU needed.
+- Does the shimmed FP8 checkpoint actually serve?
+- Do TranslateGemma and dots.ocr both fit at the 0.55/0.30 split in
+  `docker-compose.spadana.yml`? Those fractions are arithmetic from an estimated
+  ~13 GB of FP8 weights, never checked against `nvidia-smi`.
+- Is FP8 output good enough? The A/B says nothing about it — it compared bf16
+  against bf16 on purpose. FP8 is a different numerical path, so score it per
+  §5.6 of `docs/OFFLINE_DEPLOYMENT.md` before serving it.
+
+Until all four are answered, the only validated deployment is the bf16 merge
+alone on a dedicated GPU.
+
 ## Serve through vLLM, not in-process transformers
 
 Measured on the production GPU, same checkpoint, same greedy decoding, one arm

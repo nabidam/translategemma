@@ -16,6 +16,15 @@
 # Serving the bf16 merge instead needs ~24 GB of weights and does not fit beside
 # a second model at all. Re-measure these two numbers against `nvidia-smi` after
 # the first successful start rather than trusting them.
+#
+# STATUS (2026-08-17): this stack has never started successfully, and the FP8
+# split above is therefore arithmetic, not measurement. vLLM 0.13.0 rejects the
+# RoPE block of every Gemma 3 checkpoint written by Transformers 4.57 -- bf16 and
+# FP8 alike -- so TG_MERGED_MODEL_DIR must point at an overlay built by
+# scripts/vllm_rope_shim.py, and the shim has only been exercised on the bf16
+# merge. Only the bf16 merge has been served at all, alone on a free GPU:
+# docs/2026-08-17_serving_ab_vllm_vs_transformers.md. See §5.6 of
+# docs/OFFLINE_DEPLOYMENT.md before trusting the shared-GPU arrangement.
 
 x-gpu-device: &gpu-device
   resources:

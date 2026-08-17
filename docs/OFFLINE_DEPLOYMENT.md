@@ -782,6 +782,28 @@ nothing certain about this adapter's terminology gains. Run §5.4's evaluation
 against the FP8 directory and diff COMET/chrF against the bf16 merge on the same
 test set.
 
+#### Status: the FP8 serving path is unvalidated
+
+As of 2026-08-17, no FP8 checkpoint has been served successfully. What is known:
+
+- The FP8 checkpoint hits the **same vLLM 0.13.0 RoPE bug** as the bf16 merge and
+  fails to load with `rope_parameters should have a 'rope_type' key` (see
+  `docs/DEPLOYMENT_BACKLOG.md`). It was reproduced on both checkpoints, whose
+  configs differ only in `transformers_version`.
+- The fix is presumably the same overlay — `scripts/vllm_rope_shim.py` — but that
+  has **not** been run against an FP8 checkpoint. The shim refuses inputs whose
+  `rope_parameters` mixes layer types with other keys, and an FP8 config carries a
+  `quantization_config` block that has not been checked against it.
+- The bf16 merge is the only configuration measured
+  (`docs/2026-08-17_serving_ab_vllm_vs_transformers.md`), and it was measured
+  alone on a free GPU — not in the shared-GPU arrangement FP8 exists for.
+
+So the shared-GPU deployment in `docker-compose.spadana.yml` is sized for a
+checkpoint nobody has started. Before relying on it: shim the FP8 directory,
+confirm `get_config()` accepts it, start it beside the second model, and check
+both fit — then score the output, since FP8 is a different numerical path and the
+A/B says nothing about it.
+
 ---
 
 ## 6. Known issues to expect
