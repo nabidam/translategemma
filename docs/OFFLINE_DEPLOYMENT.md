@@ -742,12 +742,22 @@ so the vision tower's patch embedding is skipped no matter what `--ignore` says.
 Neither `--device cpu` nor quantising the vision tower avoids this: the offload
 is applied inside the save call, not inherited from how the model was loaded.
 
-`disable_pre_save_offload()` neutralises that one step before the save. It is a
-memory optimisation, not a correctness requirement, and it buys nothing here
-because the model is already materialised in host RAM. Verified against
-llmcompressor 0.10.0.3 with transformers 4.57.3 — the versions this image
-resolves to — and it degrades to a no-op if a newer release renames or fixes
-the hook.
+`disable_offload_conversion()` neutralises that step. It is a memory
+optimisation, not a correctness requirement, and it buys nothing here because
+the model is already materialised in host RAM.
+
+It patches **both** halves of the conversion. `to_accelerate` and
+`from_accelerate` are a matched pair, and skipping only the first leaves the
+second trying to offload modules that compression already offloaded:
+
+```
+ValueError: Attempted to offload a module twice.
+```
+
+The restoring half only matters to a caller that keeps using the model in
+memory after saving, which this script does not. Verified against llmcompressor
+0.10.0.3 with transformers 4.57.3 — the versions this image resolves to — and
+any hook a newer release renames is simply left unpatched.
 
 #### What the script guarantees
 

@@ -266,53 +266,69 @@ def load_model(input_dir, device_map):
     )
 
 
-def disable_pre_save_offload():
-    """Stop llm-compressor from offloading the model immediately before saving.
+def disable_offload_conversion():
+    """Stop llm-compressor from round-tripping the model through accelerate offload.
 
     Its save_pretrained wrapper does, in order:
 
         compressor.compress_model(model)
         to_accelerate(model)          # "for optimal saving with transformers"
         original_save_pretrained(...)
+        ...
+        from_accelerate(model)        # convert back
 
-    That middle step converts the model to accelerate's offloaded form, and
-    transformers then takes its offloaded save path: it builds a module map so
-    it can re-gather offloaded weights, and looks every state-dict key up in it.
-    The map only covers modules the conversion touched, so anything compression
-    never handled is missing and the lookup dies with a bare
+    The `to_accelerate` step is what breaks the save. It converts the model to
+    accelerate's offloaded form, and transformers then takes its offloaded save
+    path: it builds a module map so it can re-gather offloaded weights, and
+    looks every state-dict key up in it. Only modules the conversion touched are
+    in that map, so the save dies with a bare
 
         KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
 
     Note what that weight is: a Conv2d. QuantizationModifier targets Linear, so
     the vision tower's patch embedding is skipped whether or not --ignore
     mentions it -- quantising the vision tower does not avoid this, and neither
-    does --device cpu, because the offload is applied inside the save call
-    rather than inherited from how the model was loaded.
+    does --device cpu, because the conversion happens inside the save call
+    rather than being inherited from how the model was loaded.
 
-    The conversion is a memory optimisation, not a correctness requirement, and
-    it buys nothing on this path: the model is already materialised in host RAM.
-    Neutralising it puts transformers back on its ordinary save path.
+    Both halves are neutralised, not just the first: they are a matched pair,
+    and `from_accelerate` on a model that was never converted tries to offload
+    modules that compression already offloaded, which raises
 
-    Verified against llmcompressor 0.10.0.3 / transformers 4.57.3. If a newer
-    llm-compressor fixes this or renames the hook, this becomes a no-op rather
-    than an error.
+        ValueError: Attempted to offload a module twice.
+
+    Skipping the pair is safe here. The conversion is a memory optimisation for
+    the save, not a correctness requirement -- the model is already materialised
+    -- and the restoring half only matters to a caller that keeps using the
+    model afterwards, which this script does not.
+
+    Verified against llmcompressor 0.10.0.3 / transformers 4.57.3. Any hook that
+    a newer release renames or removes is simply not patched, and the failure it
+    was guarding against reports itself.
     """
     try:
         from llmcompressor.transformers.compression import compressed_tensors_utils
     except ImportError:
-        return False
-    if not hasattr(compressed_tensors_utils, "to_accelerate"):
-        logger.info(
-            "llm-compressor has no to_accelerate hook; leaving its save path untouched."
-        )
-        return False
+        return []
 
-    compressed_tensors_utils.to_accelerate = lambda model, *args, **kwargs: model
-    logger.info(
-        "Disabled llm-compressor's pre-save accelerate offload; saving from a "
-        "materialised model instead."
-    )
-    return True
+    patched = []
+    for name in ("to_accelerate", "from_accelerate"):
+        if hasattr(compressed_tensors_utils, name):
+            setattr(compressed_tensors_utils, name, lambda model, *args, **kwargs: model)
+            patched.append(name)
+
+    if patched:
+        logger.info(
+            "Disabled llm-compressor's save-time offload conversion (%s); saving from a "
+            "materialised model instead.",
+            ", ".join(patched),
+        )
+    else:
+        logger.info(
+            "llm-compressor exposes no offload-conversion hooks; leaving its save path "
+            "untouched."
+        )
+    return patched
 
 
 def copy_processor_files(input_dir, output_dir):
@@ -425,7 +441,7 @@ def directory_size_gb(path):
 def main():
     args = parse_args()
     oneshot = load_oneshot()
-    disable_pre_save_offload()
+    disable_offload_conversion()
 
     from llmcompressor.modifiers.quantization import QuantizationModifier
 
@@ -476,11 +492,11 @@ def main():
         except KeyError as error:
             raise SystemExit(
                 f"save_pretrained could not place {error} in its offloaded-module map, "
-                "which disable_pre_save_offload() exists to prevent. Check the log for "
-                "'Disabled llm-compressor's pre-save accelerate offload': if it is absent, "
-                "this llm-compressor no longer exposes the to_accelerate hook that patch "
-                "targets, and the workaround needs revisiting against "
-                f"llmcompressor {_package_version('llmcompressor')}."
+                "which disable_offload_conversion() exists to prevent. Check the log for "
+                "'Disabled llm-compressor's save-time offload conversion': if it is absent, "
+                "this release no longer exposes the hooks that patch targets, and the "
+                f"workaround needs revisiting against llmcompressor "
+                f"{_package_version('llmcompressor')}."
             ) from error
         progress.update(task, advance=1, description="Quantised model saved")
 
