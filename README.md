@@ -373,6 +373,21 @@ cd api && docker build -t translategemma-api .
 docker compose up -d          # vLLM, then the gateway once vLLM is healthy
 ```
 
+The production stack — MySQL, the Spring backend, two vLLM servers sharing one
+GPU and the two gateways in front of them — is `docker-compose.spadana.yml`. It
+carries no comments; its environment variables, GPU split, deliberate vLLM
+flags, ports and healthchecks are documented in §5.7 of
+[`docs/OFFLINE_DEPLOYMENT.md`](docs/OFFLINE_DEPLOYMENT.md).
+
+**vLLM 0.13.0 cannot load a Gemma 3 checkpoint written by Transformers 4.57.**
+It exits before loading weights with `rope_parameters should have a 'rope_type'
+key`. Serve a config overlay instead — it hardlinks the weights and rewrites
+`config.json` only:
+
+```bash
+python scripts/vllm_rope_shim.py <merge> <merge>-vllm
+```
+
 vLLM serves the **merged** checkpoint that `scripts/merge_lora_adapter.py`
 writes, so no `--enable-lora` and no adapter loading at serve time:
 

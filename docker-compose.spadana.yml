@@ -1,39 +1,8 @@
-# Deployment stack: MySQL + Spring backend + phpMyAdmin + two vLLM servers and
-# the two API gateways in front of them.
-#
-# Images are built elsewhere; this file only wires them together.
-#
-# GPU: both vLLM servers share one device, so their --gpu-memory-utilization
-# fractions must add up to less than 1.0 with room to spare. They are fractions
-# of TOTAL VRAM, not of what is free, which is what keeps two servers starting
-# in any order from claiming the same bytes. Sized for a 32 GB 5090 serving an
-# FP8 TranslateGemma (~13 GB of weights) beside dots.ocr:
-#
-#   translategemma  0.55 -> 17.6 GB : ~13 GB weights, ~4 GB KV cache
-#   dots.ocr        0.30 ->  9.6 GB : ~4 GB weights,  ~5 GB KV cache
-#   unclaimed       0.15 ->  4.8 GB : CUDA contexts, activations, headroom
-#
-# Serving the bf16 merge instead needs ~24 GB of weights and does not fit beside
-# a second model at all. Re-measure these two numbers against `nvidia-smi` after
-# the first successful start rather than trusting them.
-#
-# STATUS (2026-08-17): this stack has never started successfully, and the FP8
-# split above is therefore arithmetic, not measurement. vLLM 0.13.0 rejects the
-# RoPE block of every Gemma 3 checkpoint written by Transformers 4.57 -- bf16 and
-# FP8 alike -- so TG_MERGED_MODEL_DIR must point at an overlay built by
-# scripts/vllm_rope_shim.py, and the shim has only been exercised on the bf16
-# merge. Only the bf16 merge has been served at all, alone on a free GPU:
-# docs/2026-08-17_serving_ab_vllm_vs_transformers.md. See §5.6 of
-# docs/OFFLINE_DEPLOYMENT.md before trusting the shared-GPU arrangement.
-
 x-gpu-device: &gpu-device
   resources:
     reservations:
       devices:
         - driver: nvidia
-          # Pinned rather than `count: all`: two vLLM servers on one host must
-          # agree on which device they are dividing, and `count` makes that
-          # implicit.
           device_ids: ["${GPU_DEVICE_ID:-0}"]
           capabilities: [gpu]
 
@@ -45,25 +14,17 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-fundamental}
     ports:
-      # Bound to loopback: the backend and phpMyAdmin reach MySQL over the
-      # compose network, so nothing needs it published to the LAN. Drop the
-      # 127.0.0.1 prefix only if a host-external client really needs it.
       - "127.0.0.1:3306:3306"
     volumes:
       - ./mysql/config/initdb:/docker-entrypoint-initdb.d
       - mysqldb:/var/lib/mysql
     healthcheck:
-      # Gates the backend's start-up. Without it the backend races the very
-      # first boot of MySQL, which runs initdb before it accepts connections.
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 60s
     restart: unless-stopped
-  # sudo docker compose exec mysql bash
-  # mysql -u root -p  -> create database fundamental;
-  # mysql -u root -p fundamental < fundamental.sql
 
   backend:
     image: translator-server:latest
@@ -93,66 +54,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # --------------------------------------------------------------------- #
-  # TranslateGemma: vLLM holds the weights, the API is a CPU-only gateway.
-  # --------------------------------------------------------------------- #
-
   translategemma-vllm:
     image: vllm/vllm-openai:v0.13.0
     container_name: translategemma-vllm
     restart: unless-stopped
     ports:
-      # For humans and benchmarks. The gateway reaches it over the compose
-      # network on port 8000, not through this.
       - "7073:8000"
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
       - HF_HUB_OFFLINE=1
     volumes:
-      # The merged checkpoint (base + LoRA folded in) that
-      # scripts/merge_lora_adapter.py writes. Mounted at its own path rather
-      # than inside the HF cache mount, so the two mounts cannot collide.
-      #
-      # MUST be a config overlay built by scripts/vllm_rope_shim.py, NOT the
-      # merge itself. vLLM 0.13.0 cannot load a Gemma 3 config written by
-      # Transformers 4.57: patch_rope_parameters injects rope_theta into the
-      # top level of the nested per-layer rope block, which then fails its own
-      # ALLOWED_LAYER_TYPES test, and the server exits before loading weights
-      # with "rope_parameters should have a 'rope_type' key". The overlay
-      # hardlinks the weights and rewrites config.json only:
-      #
-      #   python scripts/vllm_rope_shim.py <merge> <merge>-vllm
-      #
-      # See docs/SERVING_BENCHMARK_AB.md, and re-check whether this is still
-      # needed after any vLLM upgrade.
-      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to the rope-shimmed merged checkpoint (see scripts/vllm_rope_shim.py)}:/merged:ro
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to a rope overlay built by scripts/vllm_rope_shim.py -- see section 5.7 of docs/OFFLINE_DEPLOYMENT.md}:/merged:ro
       - /mnt/d/wsl/.cache/huggingface:/root/.cache/huggingface
-    # The merged directory carries its own generation_config.json, whose stop
-    # set includes <end_of_turn> (106). vLLM reads it because
-    # --generation-config defaults to auto; do NOT pass
-    # `--generation-config vllm`, which discards the file.
-    #
-    # --max-model-len is a KV-cache budget decision, not a request-size one.
-    # Left unset, vLLM takes Gemma 3's 131072 from config.json; at ~64 KB/token
-    # across the 8 global-attention layers (the 40 sliding-window layers cap at
-    # 1024 tokens each) that reserves ~9 GB of cache for a single sequence, and
-    # vLLM refuses to start when the budget is smaller than one sequence.
-    #
-    # 8192 is already generous for a translation segment, and the cache it frees
-    # becomes concurrency: KV budget decides how many requests batch together,
-    # and batching is where vLLM's throughput comes from. Raise it only for long
-    # unsplit documents, and raise --gpu-memory-utilization with it.
-    #
-    # No --chat-template-content-format below: nothing here uses
-    # /v1/chat/completions. The gateway renders prompts itself and posts token
-    # ids to /v1/completions, which is the only way to reproduce the SFT
-    # rendering -- and TranslateGemma's message content (per-part
-    # source_lang_code/target_lang_code) is not a shape vLLM's chat parser can
-    # accept anyway.
-    #
-    # The image's own ENTRYPOINT is already `vllm serve`, but it is restated
-    # here (as the dots service does): a command that starts with `serve` would
-    # be appended to it and ask vLLM to load a model named "serve".
     entrypoint: ["vllm", "serve"]
     command: >
       /merged
@@ -169,7 +82,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      # Loading a 12B checkpoint and capturing CUDA graphs takes minutes.
       start_period: 900s
     deploy: *gpu-device
     ipc: host
@@ -183,17 +95,9 @@ services:
     ports:
       - "8888:8000"
     volumes:
-      # Read-only, and read for the tokenizer and chat template only: this
-      # container loads no weights. It must be the SAME checkpoint vLLM serves,
-      # or prompts are rendered with one tokenizer and generated by another.
-      # The rope overlay changes config.json only, so its tokenizer is the
-      # merge's tokenizer and sharing the variable is correct.
-      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to the rope-shimmed merged checkpoint (see scripts/vllm_rope_shim.py)}:/merged:ro
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to a rope overlay built by scripts/vllm_rope_shim.py -- see section 5.7 of docs/OFFLINE_DEPLOYMENT.md}:/merged:ro
       - /mnt/d/wsl/.cache/huggingface:/models:ro
     environment:
-      # These override anything in ./translategemma/.env — compose gives
-      # `environment:` precedence over `env_file:` — so the wiring lives here
-      # and the .env file carries only the translation defaults.
       TG_VLLM_BASE_URL: http://translategemma-vllm:8000/v1
       TG_VLLM_MODEL: ${SERVED_TG_MODEL_NAME:-translategemma}
       TG_BASE_MODEL_ID: /merged
@@ -202,23 +106,14 @@ services:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
     healthcheck:
-      # Runs a real translation through vLLM, so it proves the whole path.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
       interval: 30s
       timeout: 30s
       retries: 3
-      # Seconds, not minutes: the gateway loads a tokenizer, not a checkpoint.
-      # The wait for the weights is depends_on's job.
       start_period: 120s
     depends_on:
       translategemma-vllm:
         condition: service_healthy
-    # No GPU reservation and no PYTORCH_CUDA_ALLOC_CONF: there is no torch in
-    # this image.
-
-  # --------------------------------------------------------------------- #
-  # dots.ocr
-  # --------------------------------------------------------------------- #
 
   dots-ocr-vllm:
     image: vllm/vllm-openai:v0.13.0
@@ -263,9 +158,6 @@ services:
       - ./dots-ocr-api/dots_ocr:/app/dots_ocr:ro
       - ./dots-ocr-api/config.yaml:/app/config.yaml:ro
       - ./dots-ocr-api/logs:/app/logs
-    # Kept for whatever in ./dots-ocr-api/.env still points at the host. The
-    # service name http://dots-ocr-vllm:8000/v1 is the better address: it does
-    # not depend on the published port and survives a port change.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
