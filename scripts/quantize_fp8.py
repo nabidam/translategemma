@@ -451,11 +451,31 @@ def main():
         progress.update(task, advance=1, description="Saving quantised model")
 
         model = consolidate_for_save(model)
-        model.save_pretrained(
-            str(output_dir),
-            save_compressed=True,
-            max_shard_size=args.max_shard_size,
-        )
+        try:
+            model.save_pretrained(
+                str(output_dir),
+                save_compressed=True,
+                max_shard_size=args.max_shard_size,
+            )
+        except KeyError as error:
+            # llm-compressor's save wrapper offloads the model to CPU while it
+            # compresses, *inside* this call, so the layout it saves under is not
+            # the one this script hands it. transformers then rebuilds a module
+            # map from the offloaded modules and looks every state-dict key up in
+            # it; the modules --ignore left dense are absent, and the lookup
+            # raises a bare KeyError naming one of their weights.
+            raise SystemExit(
+                f"save_pretrained could not place {error} in its offloaded-module map.\n\n"
+                "llm-compressor offloads the model to CPU inside save_pretrained, and the "
+                "modules left in full precision by --ignore are missing from the map it "
+                "builds. Two ways around it, cheapest first:\n"
+                "  1. --device cpu, so nothing is dispatched to a GPU and there is no "
+                "offload for the save to undo. Slower, and the usual fix.\n"
+                "  2. --ignore lm_head, which quantises the vision tower too. It is never "
+                "exercised by translation, but check that the serving vLLM loads the result "
+                "before relying on it.\n"
+                "Neither changes the decoder weights this model translates with."
+            ) from error
         progress.update(task, advance=1, description="Quantised model saved")
 
     quantization_config = verify_quantized(output_dir)
