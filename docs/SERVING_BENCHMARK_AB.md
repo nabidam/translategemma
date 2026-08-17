@@ -113,6 +113,72 @@ tagged `vllm-bf16` and `hf-lora`. Re-comparison without re-running:
 python scripts/compare_bench_reports.py benchmark_ab/
 ```
 
+## Troubleshooting
+
+### vLLM exits immediately with "rope_parameters should have a 'rope_type' key"
+
+A bug in vLLM 0.13.0's `patch_rope_parameters`, not a problem with the
+checkpoint. It injects `rope_theta` into the top level of Gemma 3's nested
+per-layer `rope_parameters`, which then fails its own `ALLOWED_LAYER_TYPES`
+subset test. Every Gemma 3 checkpoint written by Transformers 4.57 hits it,
+merged and quantised alike.
+
+Build a config overlay (weights hardlinked, only `config.json` rewritten) and
+serve that:
+
+```bash
+python3 scripts/vllm_rope_shim.py /models/merged /models/merged-vllm
+```
+
+On a host with no Python, run it in the gateway image. Mount the checkpoint's
+PARENT read-write -- hardlinks need source and destination in one mount:
+
+```bash
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/scripts/vllm_rope_shim.py:/shim.py:ro" \
+  -v /host/path/to/merged:/work \
+  --entrypoint python3 translategemma-api-gw:latest \
+  /shim.py /work/<checkpoint> /work/<checkpoint>-vllm
+```
+
+Point `TG_MERGED_MODEL_DIR` at the overlay. `rm -rf` it to revert. Re-check
+whether the shim is still needed after any vLLM upgrade.
+
+Validate a candidate config in seconds, without a GPU or any weights, rather
+than by starting the engine:
+
+```bash
+docker run --rm -v /host/path/to/checkpoint:/merged:ro \
+  --entrypoint python3 vllm/vllm-openai:v0.13.0 -c "
+from vllm.transformers_utils.config import get_config
+c = get_config('/merged', True)
+tc = getattr(c, 'text_config', c)
+print('OK', tc.rope_parameters)
+"
+```
+
+**`--hf-overrides` does not work for this**, though it is the usual advice for
+rope problems. Tested on 0.13.0 against Gemma 3:
+
+| Override | Result |
+|---|---|
+| `{"rope_scaling": {...}}` | Applies to the outer config; the rope block is under `text_config`, so the injection still fires. Same error. |
+| `{"text_config": {"rope_scaling": {...}}}` | `hf_overrides_kw` replaces rather than merges — `text_config` becomes a bare dict. `AttributeError: 'dict' object has no attribute 'rope_parameters'` |
+
+Making it work would mean passing a complete replacement `text_config` on the
+command line. The overlay is smaller and reviewable.
+
+This affects production too: `docker-compose.spadana.yml` mounts the raw
+checkpoint and cannot start against it on vLLM 0.13.0. It needs the overlay path
+as well.
+
+### No Python on the host
+
+Only `scripts/compare_bench_reports.py` needs one, and `bench_ab.sh` falls back
+to running it in the gateway image automatically. Everything else is bash and
+Docker.
+
 ## What makes the comparison valid
 
 These are enforced by `docker-compose.bench.yml`, and are the things to re-check

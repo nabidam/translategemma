@@ -1,5 +1,80 @@
 # Deployment backlog
 
+## Retire the vLLM RoPE overlay once vLLM is upgraded
+
+vLLM 0.13.0 cannot load any Gemma 3 checkpoint whose config was written by
+Transformers 4.57 — merged, quantised, or the stock upstream model. The server
+exits before loading a single weight:
+
+```
+ValueError: rope_parameters should have a 'rope_type' key
+```
+
+The cause is in `vllm/transformers_utils/config.py`. Under Transformers v4,
+`patch_rope_parameters` does:
+
+```python
+if rope_theta is not None:
+    config.rope_parameters["rope_theta"] = rope_theta        # line ~326
+...
+if set(config.rope_parameters.keys()).issubset(ALLOWED_LAYER_TYPES):
+    for layer_params in config.rope_parameters.values():     # line ~349
+        patch_rope_parameters_dict(layer_params)
+else:
+    patch_rope_parameters_dict(config.rope_parameters)
+```
+
+Transformers 4.57 writes Gemma 3's RoPE per layer type (`full_attention` /
+`sliding_attention`). The injection on line 326 adds `rope_theta` to the *top*
+level of that nested dict, so the subset test on line 349 fails, the whole
+nested dict is treated as one flat block, and validation finds no `rope_type`.
+The nested branch is therefore unreachable for Gemma 3 under Transformers v4.
+
+Deleting `rope_theta` from `config.json` does not help: it is a class default on
+`Gemma3TextConfig`, so `getattr` finds 1e6 regardless and re-injects.
+
+**Workaround in use**: `scripts/vllm_rope_shim.py` builds an overlay directory
+that hardlinks the weights and rewrites `config.json` into the pre-4.57 flat
+shape (`{"rope_type": "linear", "factor": 8.0}` in both `rope_parameters` and
+`rope_scaling`). The sliding layers are unaffected — their frequency comes from
+`rope_local_base_freq`, which is a separate field. `docker-compose.spadana.yml`
+and `docker-compose.bench.yml` both expect `TG_MERGED_MODEL_DIR` to point at an
+overlay.
+
+Verified not to change generation: the A/B benchmark
+(`docs/2026-08-17_serving_ab_vllm_vs_transformers.md`) reports byte-identical
+translations from the shimmed vLLM arm and the transformers arm serving the
+unshimmed base plus adapter.
+
+`--hf-overrides` is the usual advice for RoPE problems and does **not** work
+here. `{"rope_scaling": {...}}` applies to the outer config while the rope block
+is under `text_config`; `{"text_config": {...}}` replaces rather than merges, so
+`text_config` becomes a bare dict (`AttributeError: 'dict' object has no
+attribute 'rope_parameters'`).
+
+- On the next vLLM upgrade, serve an unshimmed merge directly and check whether
+  the overlay is still needed. Validate in seconds without a GPU:
+  `get_config('/merged', True)` from `vllm.transformers_utils.config`.
+- If it is fixed upstream, drop `scripts/vllm_rope_shim.py`, revert the
+  `TG_MERGED_MODEL_DIR` comments in both compose files, and delete the overlay
+  directories on the deployment hosts.
+- Until then, every new merge needs an overlay built before it can be served.
+  Consider folding the flattening into `scripts/merge_lora_adapter.py` if the
+  upstream fix is slow to arrive.
+
+## Serve through vLLM, not in-process transformers
+
+Measured on the production GPU, same checkpoint, same greedy decoding, one arm
+at a time: vLLM is **~7x faster than FastAPI + transformers + LoRA at every
+batch size** — 7.8x lower latency at batch 1, 7.1x higher throughput at batch
+32, 6.6x faster on a whole page. Full numbers, method, and confounds in
+`docs/2026-08-17_serving_ab_vllm_vs_transformers.md`; reproduce with
+`./scripts/bench_ab.sh`.
+
+The advantage is per-token efficiency, not scheduling: both arms scale with
+batch size similarly. No action beyond keeping the current architecture — this
+entry exists so the decision is not revisited from intuition.
+
 ## Commit `uv.lock`
 
 `uv.lock` is currently **untracked**. The default `cu128` image builds with
