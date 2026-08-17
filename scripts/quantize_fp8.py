@@ -62,7 +62,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from logging_utils import console, logger
 
@@ -148,8 +148,10 @@ def parse_args():
         default="cpu",
         help=(
             "Where the weights are placed for the transform: cpu (default, needs no "
-            "free VRAM and leaves the GPU to whatever is serving), a single device "
-            "such as cuda:0, or auto to shard across every visible GPU."
+            "free VRAM and leaves the GPU to whatever is serving), or a single device "
+            "such as cuda:0. 'auto' shards across every visible GPU and is only worth "
+            "it when no single device holds the model; the save consolidates back to "
+            "one device either way."
         ),
     )
     parser.add_argument(
@@ -218,6 +220,78 @@ def resolve_device_map(device):
     if device == "auto":
         return "auto"
     return {"": device}
+
+
+def load_model(input_dir, device_map):
+    """Load the checkpoint under the class its own config.json declares.
+
+    AutoModelForCausalLM is ambiguous for a multimodal Gemma 3 config: it
+    resolves to the text-only class on some transformers versions and to the
+    conditional-generation wrapper on others, and this image deliberately runs a
+    different transformers than the rest of the repository. Naming the
+    architecture removes the ambiguity and loads what vLLM will load.
+
+    dtype="auto" keeps the merged checkpoint's own precision; this script must
+    not be the place a bf16 merge silently becomes fp16.
+    """
+    import transformers
+
+    config = AutoConfig.from_pretrained(str(input_dir))
+    for name in getattr(config, "architectures", None) or []:
+        model_class = getattr(transformers, name, None)
+        if model_class is not None:
+            break
+    else:
+        model_class = AutoModelForCausalLM
+        logger.warning(
+            "config.json declares %s, which this transformers does not expose; "
+            "falling back to AutoModelForCausalLM.",
+            getattr(config, "architectures", None),
+        )
+    logger.info("Loading %s from %s", model_class.__name__, input_dir)
+    return model_class.from_pretrained(
+        str(input_dir),
+        dtype="auto",
+        device_map=device_map,
+        low_cpu_mem_usage=True,
+    )
+
+
+def consolidate_for_save(model):
+    """Bring every weight onto one device before save_pretrained.
+
+    transformers takes a different save path for a model dispatched across
+    devices with CPU or disk offload: it rebuilds a module map from
+    named_modules() so it can re-gather the offloaded tensors, then looks up
+    every key of the state dict in it. A key that is in the state dict but not
+    in that map raises a bare KeyError, e.g.
+
+        KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
+
+    The modules the ignore list leaves dense are the ones that hit it: the
+    quantisation pipeline never onloads them, so they do not come back the way
+    the save path expects. Detaching accelerate's hooks writes the offloaded
+    weights back to real tensors, after which the ordinary save path applies and
+    the layout the model was quantised under stops mattering.
+    """
+    device_map = getattr(model, "hf_device_map", None) or {}
+    if len(set(device_map.values())) <= 1:
+        return model
+
+    logger.warning(
+        "Model is dispatched across %s; consolidating onto CPU before saving.",
+        sorted({str(device) for device in device_map.values()}),
+    )
+    from accelerate.hooks import remove_hook_from_module
+
+    remove_hook_from_module(model, recurse=True)
+    model = model.to("cpu")
+    # transformers keys the offloaded save path off this attribute alone.
+    try:
+        del model.hf_device_map
+    except AttributeError:
+        model.hf_device_map = {"": "cpu"}
+    return model
 
 
 def copy_processor_files(input_dir, output_dir):
@@ -361,15 +435,7 @@ def main():
     with progress:
         task = progress.add_task("Loading merged model", total=3)
 
-        # dtype="auto" keeps the merged checkpoint's own precision; this script
-        # must not be the place a bf16 merge silently becomes fp16.
-
-        model = AutoModelForCausalLM.from_pretrained(
-            str(input_dir),
-            dtype="auto",
-            device_map=resolve_device_map(args.device),
-            low_cpu_mem_usage=True,
-        )
+        model = load_model(input_dir, resolve_device_map(args.device))
         progress.update(task, advance=1, description=f"Quantising to {args.scheme}")
 
         # No dataset argument: FP8_DYNAMIC derives weight scales from the
@@ -379,6 +445,7 @@ def main():
         oneshot(model=model, recipe=recipe)
         progress.update(task, advance=1, description="Saving quantised model")
 
+        model = consolidate_for_save(model)
         model.save_pretrained(
             str(output_dir),
             save_compressed=True,

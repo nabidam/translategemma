@@ -626,6 +626,141 @@ the same evaluation path as the base model, so a quick benchmark candidate with
 no `adapter` set is the cheapest end-to-end proof that the deltas actually
 landed.
 
+### 5.6 Quantise the merged checkpoint to FP8 (optional)
+
+Only needed when the serving GPU has to hold something else as well. A 12B merge
+is ~24 GB in bf16; FP8 halves that, which is the difference between fitting
+beside a second model on a 32 GB card and not fitting at all.
+`scripts/quantize_fp8.py` writes a compressed-tensors checkpoint vLLM detects
+from its `config.json` — no serving flag to set.
+
+**Order matters: merge first, quantise second.** Merging a LoRA adapter into
+already-quantised weights rounds the delta away — a LoRA update is small enough
+per channel to disappear into the quantisation step — so it would cost exactly
+the fine-tune the merge exists to preserve. The script refuses an adapter
+directory or an already-quantised input for this reason.
+
+The scheme is `FP8_DYNAMIC`, which needs **no calibration corpus**. That is the
+main reason to prefer it over 4-bit AWQ/GPTQ here: those pick their scales from
+sample activations, and a general-purpose calibration set biases a
+domain-fine-tuned model away from its domain.
+
+#### The quantiser is a separate image
+
+It cannot go in the training image. Measured against this repository's lock
+(`torch==2.8.0`, `transformers==4.57.6`), no llm-compressor release installs:
+
+| llmcompressor | requires |
+| --- | --- |
+| 0.8.x | `transformers <=4.56.2` |
+| 0.9.x | `transformers <=4.57.3` |
+| 0.10.x | `torch >=2.9.0` |
+| 0.11.0 | `torch >=2.10.0` |
+| 0.12+ | `transformers >=5.9.0` |
+
+That is not bad luck on either side: llm-compressor tracks vLLM's release
+cadence, while the training stack is frozen on the versions the evaluation
+harness was validated against and pinned below transformers v5 (§6.9). Forcing
+them together would mean moving `torch` or `transformers` under the trainer,
+which is what `uv.lock` exists to prevent.
+
+`scripts/quantize.Dockerfile` builds from the vLLM image instead, which already
+carries the torch llm-compressor 0.10.x wants — it is the torch vLLM itself was
+built against.
+
+#### Staging it (online machine)
+
+`docker compose build quantizer` needs network for the `pip install`, so it
+belongs in Phase A alongside §3.2, and the image travels with the others:
+
+```bash
+docker compose build quantizer
+docker save translategemma-quantizer:vllm0.13.0 | zstd -T0 -19 -o quantizer-image.tar.zst
+```
+
+Load it on the offline host exactly as §5.2 loads the trainer image. Nothing
+resolves at run time.
+
+#### Running it (offline GPU host)
+
+```bash
+docker compose run --rm quantizer --device cuda:0 \
+    /models/translategemma-12b-merged \
+    /models/translategemma-12b-merged-fp8
+```
+
+`--device` defaults to `cpu` so the quantiser never competes with a GPU that is
+serving; pass `cuda:0` when the card is free. The transform is a weight
+operation, not a forward pass, so CPU is a real option rather than a fallback.
+
+Two environment settings the compose file already supplies, both worth knowing
+because the failures are opaque:
+
+- **`USER` / `LOGNAME`.** compressed-tensors decorates a class *body* with
+  `@torch.compile`, so torch's inductor initialises during import and calls
+  `getpass.getuser()`. The container runs as a bare numeric uid (§5.2) and the
+  vLLM image has no `/etc/passwd` entry for it, so the `pwd` lookup raises
+  `KeyError: getpwuid(): uid not found: 1000` before the script reaches its
+  first line of work. `getpass` reads these two variables before consulting
+  `pwd`.
+- **`TORCHINDUCTOR_CACHE_DIR` / `TRITON_CACHE_DIR`.** The same failure from the
+  other side — `getuser()` is only called to *build* a default cache path — and
+  they keep the compile caches on the `/hf_cache` scratch mount.
+
+If the compose file on the offline host predates those settings, override them
+for one run without editing anything:
+
+```bash
+docker compose run --rm \
+    -e USER=quantizer -e LOGNAME=quantizer \
+    -e TORCHINDUCTOR_CACHE_DIR=/hf_cache/torchinductor \
+    -e TRITON_CACHE_DIR=/hf_cache/triton \
+    quantizer --device cuda:0 \
+    /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
+```
+
+`/hf_cache` now gets written where it may not have been before, so re-check the
+ownership rule from §5.2: both bind targets must be owned by `HOST_UID`.
+
+One more failure worth naming, because the message points at the wrong thing.
+Saving a model that llm-compressor dispatched across devices with CPU offload
+raises a bare
+
+```
+KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
+```
+
+from inside `transformers.save_pretrained`. That path rebuilds a module map to
+re-gather offloaded tensors and looks up every state-dict key in it; the modules
+the ignore list leaves dense are the ones missing, because the pipeline never
+onloads them. `consolidate_for_save` detaches accelerate's hooks and moves the
+model to CPU before saving, so the ordinary save path runs regardless of the
+layout the quantisation used. Budget host RAM for the consolidated model — about
+half the bf16 size, since the weights are FP8 by then.
+
+#### What the script guarantees
+
+The stop-token contract from `docs/2026-08-10_adapter_degeneration_analysis.md`
+survives quantisation, and the script fails rather than let it not:
+
+- the tokenizer, chat template and preprocessor configs are **copied byte for
+  byte** from the merged directory, never re-saved. This image runs a different
+  `transformers` than the API and the harness do, and a chat template
+  re-serialised by another version — one space different in the assistant-turn
+  prefix — still returns fluent Farsi;
+- `generation_config.json` is copied if the save did not write one, and the run
+  **fails** if its `eos_token_id` does not contain `<end_of_turn>` (106);
+- the saved `config.json` is re-read and the run fails if it carries no
+  `quantization_config`, since vLLM would then load the weights as dense;
+- `lm_head`, the vision tower and the multimodal projector are left in full
+  precision (`--ignore` to change), and `quantization_metadata.json` records the
+  scheme, the ignore list and the source directory.
+
+**Score it before serving it.** FP8 is near-lossless in general, which says
+nothing certain about this adapter's terminology gains. Run §5.4's evaluation
+against the FP8 directory and diff COMET/chrF against the bf16 merge on the same
+test set.
+
 ---
 
 ## 6. Known issues to expect
