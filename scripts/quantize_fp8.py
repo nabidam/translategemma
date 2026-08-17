@@ -258,39 +258,44 @@ def load_model(input_dir, device_map):
 
 
 def consolidate_for_save(model):
-    """Bring every weight onto one device before save_pretrained.
+    """Detach every offload hook before save_pretrained.
 
-    transformers takes a different save path for a model dispatched across
-    devices with CPU or disk offload: it rebuilds a module map from
-    named_modules() so it can re-gather the offloaded tensors, then looks up
-    every key of the state dict in it. A key that is in the state dict but not
-    in that map raises a bare KeyError, e.g.
+    transformers has a second save path for models with offloaded parameters:
+    it builds a module map from the modules that carry an accelerate hook, so it
+    can re-gather their weights, then looks up every key of the state dict in
+    that map. Keys belonging to modules *without* a hook are simply absent, and
+    the lookup raises a bare KeyError, e.g.
 
         KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
 
-    The modules the ignore list leaves dense are the ones that hit it: the
-    quantisation pipeline never onloads them, so they do not come back the way
-    the save path expects. Detaching accelerate's hooks writes the offloaded
-    weights back to real tensors, after which the ordinary save path applies and
-    the layout the model was quantised under stops mattering.
-    """
-    device_map = getattr(model, "hf_device_map", None) or {}
-    if len(set(device_map.values())) <= 1:
-        return model
+    The modules the ignore list leaves dense are exactly the ones that hit it:
+    compression never touches them, so they never get a hook, while every
+    quantised Linear does.
 
-    logger.warning(
-        "Model is dispatched across %s; consolidating onto CPU before saving.",
-        sorted({str(device) for device in device_map.values()}),
-    )
+    The hooks come from compressed-tensors, which onloads and offloads each
+    module as it compresses it. They are attached per module and do NOT show up
+    in `hf_device_map` -- an earlier version of this function gated on that
+    attribute and therefore never ran. Detaching writes the offloaded weights
+    back to real tensors, which leaves nothing for transformers to re-gather and
+    puts the ordinary save path back in play.
+    """
     from accelerate.hooks import remove_hook_from_module
 
+    hooked = sum(1 for _, module in model.named_modules() if hasattr(module, "_hf_hook"))
+    if not hooked:
+        return model
+
+    logger.info("Detaching offload hooks from %d module(s) before saving.", hooked)
     remove_hook_from_module(model, recurse=True)
+    # One device for the save, whatever devices the hooks restored to. The
+    # weights are FP8 by this point, so this is about half the size of the
+    # merge it started from.
     model = model.to("cpu")
-    # transformers keys the offloaded save path off this attribute alone.
+    # Harmless when absent; transformers also consults this attribute.
     try:
         del model.hf_device_map
     except AttributeError:
-        model.hf_device_map = {"": "cpu"}
+        pass
     return model
 
 

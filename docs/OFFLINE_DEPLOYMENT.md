@@ -730,13 +730,18 @@ raises a bare
 KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
 ```
 
-from inside `transformers.save_pretrained`. That path rebuilds a module map to
-re-gather offloaded tensors and looks up every state-dict key in it; the modules
-the ignore list leaves dense are the ones missing, because the pipeline never
-onloads them. `consolidate_for_save` detaches accelerate's hooks and moves the
-model to CPU before saving, so the ordinary save path runs regardless of the
-layout the quantisation used. Budget host RAM for the consolidated model — about
-half the bf16 size, since the weights are FP8 by then.
+from inside `transformers.save_pretrained`. That path builds a module map from
+the modules carrying an accelerate hook so it can re-gather their weights, then
+looks up every state-dict key in it; keys from modules without a hook are
+absent. The modules the ignore list leaves dense are exactly those, since
+compression never touches them.
+
+The hooks come from compressed-tensors, which onloads and offloads each module
+as it compresses it — they are attached per module and do **not** appear in
+`hf_device_map`, so `--device cuda:0` does not avoid them.
+`consolidate_for_save` detaches them, which writes the offloaded weights back,
+and moves the model to CPU before saving. Budget host RAM for that: about half
+the bf16 size, since the weights are FP8 by then.
 
 #### What the script guarantees
 
