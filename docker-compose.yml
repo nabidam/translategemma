@@ -125,6 +125,20 @@ services:
       XDG_CACHE_HOME: /hf_cache
       TOKENIZERS_PARALLELISM: "false"
       PYTHONUNBUFFERED: "1"
+      # compressed-tensors decorates a class *body* with @torch.compile, so
+      # torch's inductor initialises at import time and calls
+      # getpass.getuser(). This container runs as a bare numeric uid with no
+      # /etc/passwd entry, where the pwd lookup raises
+      # "KeyError: getpwuid(): uid not found". getpass checks these environment
+      # variables first, so setting them skips the lookup entirely.
+      USER: quantizer
+      LOGNAME: quantizer
+      # Belt and braces on the same failure, and it keeps the compile caches on
+      # the scratch mount rather than somewhere unwritable: torch only calls
+      # getuser() to *build* a default cache path, and skips that when the path
+      # is already given.
+      TORCHINDUCTOR_CACHE_DIR: /hf_cache/torchinductor
+      TRITON_CACHE_DIR: /hf_cache/triton
       NVIDIA_VISIBLE_DEVICES: ${GPUS:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     deploy:
