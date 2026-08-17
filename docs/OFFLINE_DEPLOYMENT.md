@@ -730,18 +730,24 @@ raises a bare
 KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
 ```
 
-from inside `transformers.save_pretrained`. That path builds a module map from
-the modules carrying an accelerate hook so it can re-gather their weights, then
-looks up every state-dict key in it; keys from modules without a hook are
-absent. The modules the ignore list leaves dense are exactly those, since
-compression never touches them.
+from inside `transformers.save_pretrained`. llm-compressor's save wrapper runs
+`to_accelerate(model)` — "for optimal saving with transformers" — immediately
+before delegating, which converts the model to accelerate's offloaded form.
+transformers then takes its offloaded save path: it builds a module map so it
+can re-gather offloaded weights, and looks every state-dict key up in it. Only
+the modules the conversion touched are in that map.
 
-The hooks come from compressed-tensors, which onloads and offloads each module
-as it compresses it — they are attached per module and do **not** appear in
-`hf_device_map`, so `--device cuda:0` does not avoid them.
-`consolidate_for_save` detaches them, which writes the offloaded weights back,
-and moves the model to CPU before saving. Budget host RAM for that: about half
-the bf16 size, since the weights are FP8 by then.
+The failing weight is a **Conv2d**, and `QuantizationModifier` targets Linear,
+so the vision tower's patch embedding is skipped no matter what `--ignore` says.
+Neither `--device cpu` nor quantising the vision tower avoids this: the offload
+is applied inside the save call, not inherited from how the model was loaded.
+
+`disable_pre_save_offload()` neutralises that one step before the save. It is a
+memory optimisation, not a correctness requirement, and it buys nothing here
+because the model is already materialised in host RAM. Verified against
+llmcompressor 0.10.0.3 with transformers 4.57.3 — the versions this image
+resolves to — and it degrades to a no-op if a newer release renames or fixes
+the hook.
 
 #### What the script guarantees
 

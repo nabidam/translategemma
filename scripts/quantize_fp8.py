@@ -167,6 +167,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def _package_version(name):
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def load_oneshot():
     """Import llm-compressor's oneshot entry point across its two layouts."""
     try:
@@ -257,46 +266,53 @@ def load_model(input_dir, device_map):
     )
 
 
-def consolidate_for_save(model):
-    """Detach every offload hook before save_pretrained.
+def disable_pre_save_offload():
+    """Stop llm-compressor from offloading the model immediately before saving.
 
-    transformers has a second save path for models with offloaded parameters:
-    it builds a module map from the modules that carry an accelerate hook, so it
-    can re-gather their weights, then looks up every key of the state dict in
-    that map. Keys belonging to modules *without* a hook are simply absent, and
-    the lookup raises a bare KeyError, e.g.
+    Its save_pretrained wrapper does, in order:
+
+        compressor.compress_model(model)
+        to_accelerate(model)          # "for optimal saving with transformers"
+        original_save_pretrained(...)
+
+    That middle step converts the model to accelerate's offloaded form, and
+    transformers then takes its offloaded save path: it builds a module map so
+    it can re-gather offloaded weights, and looks every state-dict key up in it.
+    The map only covers modules the conversion touched, so anything compression
+    never handled is missing and the lookup dies with a bare
 
         KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
 
-    The modules the ignore list leaves dense are exactly the ones that hit it:
-    compression never touches them, so they never get a hook, while every
-    quantised Linear does.
+    Note what that weight is: a Conv2d. QuantizationModifier targets Linear, so
+    the vision tower's patch embedding is skipped whether or not --ignore
+    mentions it -- quantising the vision tower does not avoid this, and neither
+    does --device cpu, because the offload is applied inside the save call
+    rather than inherited from how the model was loaded.
 
-    The hooks come from compressed-tensors, which onloads and offloads each
-    module as it compresses it. They are attached per module and do NOT show up
-    in `hf_device_map` -- an earlier version of this function gated on that
-    attribute and therefore never ran. Detaching writes the offloaded weights
-    back to real tensors, which leaves nothing for transformers to re-gather and
-    puts the ordinary save path back in play.
+    The conversion is a memory optimisation, not a correctness requirement, and
+    it buys nothing on this path: the model is already materialised in host RAM.
+    Neutralising it puts transformers back on its ordinary save path.
+
+    Verified against llmcompressor 0.10.0.3 / transformers 4.57.3. If a newer
+    llm-compressor fixes this or renames the hook, this becomes a no-op rather
+    than an error.
     """
-    from accelerate.hooks import remove_hook_from_module
-
-    hooked = sum(1 for _, module in model.named_modules() if hasattr(module, "_hf_hook"))
-    if not hooked:
-        return model
-
-    logger.info("Detaching offload hooks from %d module(s) before saving.", hooked)
-    remove_hook_from_module(model, recurse=True)
-    # One device for the save, whatever devices the hooks restored to. The
-    # weights are FP8 by this point, so this is about half the size of the
-    # merge it started from.
-    model = model.to("cpu")
-    # Harmless when absent; transformers also consults this attribute.
     try:
-        del model.hf_device_map
-    except AttributeError:
-        pass
-    return model
+        from llmcompressor.transformers.compression import compressed_tensors_utils
+    except ImportError:
+        return False
+    if not hasattr(compressed_tensors_utils, "to_accelerate"):
+        logger.info(
+            "llm-compressor has no to_accelerate hook; leaving its save path untouched."
+        )
+        return False
+
+    compressed_tensors_utils.to_accelerate = lambda model, *args, **kwargs: model
+    logger.info(
+        "Disabled llm-compressor's pre-save accelerate offload; saving from a "
+        "materialised model instead."
+    )
+    return True
 
 
 def copy_processor_files(input_dir, output_dir):
@@ -409,6 +425,7 @@ def directory_size_gb(path):
 def main():
     args = parse_args()
     oneshot = load_oneshot()
+    disable_pre_save_offload()
 
     from llmcompressor.modifiers.quantization import QuantizationModifier
 
@@ -450,7 +467,6 @@ def main():
         oneshot(model=model, recipe=recipe)
         progress.update(task, advance=1, description="Saving quantised model")
 
-        model = consolidate_for_save(model)
         try:
             model.save_pretrained(
                 str(output_dir),
@@ -458,23 +474,13 @@ def main():
                 max_shard_size=args.max_shard_size,
             )
         except KeyError as error:
-            # llm-compressor's save wrapper offloads the model to CPU while it
-            # compresses, *inside* this call, so the layout it saves under is not
-            # the one this script hands it. transformers then rebuilds a module
-            # map from the offloaded modules and looks every state-dict key up in
-            # it; the modules --ignore left dense are absent, and the lookup
-            # raises a bare KeyError naming one of their weights.
             raise SystemExit(
-                f"save_pretrained could not place {error} in its offloaded-module map.\n\n"
-                "llm-compressor offloads the model to CPU inside save_pretrained, and the "
-                "modules left in full precision by --ignore are missing from the map it "
-                "builds. Two ways around it, cheapest first:\n"
-                "  1. --device cpu, so nothing is dispatched to a GPU and there is no "
-                "offload for the save to undo. Slower, and the usual fix.\n"
-                "  2. --ignore lm_head, which quantises the vision tower too. It is never "
-                "exercised by translation, but check that the serving vLLM loads the result "
-                "before relying on it.\n"
-                "Neither changes the decoder weights this model translates with."
+                f"save_pretrained could not place {error} in its offloaded-module map, "
+                "which disable_pre_save_offload() exists to prevent. Check the log for "
+                "'Disabled llm-compressor's pre-save accelerate offload': if it is absent, "
+                "this llm-compressor no longer exposes the to_accelerate hook that patch "
+                "targets, and the workaround needs revisiting against "
+                f"llmcompressor {_package_version('llmcompressor')}."
             ) from error
         progress.update(task, advance=1, description="Quantised model saved")
 
