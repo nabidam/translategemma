@@ -1,8 +1,14 @@
 """Runtime configuration for the TranslateGemma serving API.
 
 Everything is settable from the environment (or an api/.env file) so the same
-image serves a base checkpoint, a base + LoRA adapter, or both side by side
-without a rebuild. See api/.env.example.
+image fronts any vLLM deployment without a rebuild. See api/.env.example.
+
+Generation no longer happens in this process: vLLM owns the weights and this
+service is a gateway (see translator.py). The model-shaped settings below
+(dtype, attention implementation, 4-bit) therefore describe how the *upstream*
+was launched and are reported by /model-info unchanged; they are not applied
+here. Everything under "Decoding" is still applied, translated into the
+sampling parameters of the vLLM request.
 """
 
 import json
@@ -49,7 +55,30 @@ class Settings(BaseSettings):
         protected_namespaces=(),
     )
 
-    # --- What to load -----------------------------------------------------
+    # --- Upstream vLLM ----------------------------------------------------
+    # OpenAI-compatible base URL of the vLLM server holding the weights. The
+    # gateway talks to /completions under it (never /chat/completions: the chat
+    # endpoint renders add_generation_prompt=True, which is the off-distribution
+    # prefix docs/2026-08-10_adapter_degeneration_analysis.md is about).
+    vllm_base_url: str = "http://translategemma-vllm:8000/v1"
+    # Must match vLLM's --served-model-name.
+    vllm_model: str = "model"
+    vllm_api_key: str | None = None
+    # Seconds. A cold vLLM still compiling CUDA graphs, or a 512-token
+    # generation on a busy server, both live well inside this.
+    vllm_timeout: float = Field(default=300.0, gt=0)
+    # Retries for connection errors and 5xx, which is what a restarting or
+    # briefly overloaded upstream looks like. Generation is greedy by default,
+    # so a retried request returns the same text.
+    vllm_max_retries: int = Field(default=2, ge=0)
+    # In-flight /completions requests across all callers. vLLM does its own
+    # continuous batching, so this is a politeness cap on queue depth, not the
+    # thing that creates batches.
+    max_concurrent_requests: int = Field(default=32, gt=0)
+
+    # --- What is served ---------------------------------------------------
+    # The checkpoint vLLM serves. Read locally for the tokenizer and chat
+    # template only (no weights are loaded), and reported by /model-info.
     base_model_id: str = "google/translategemma-12b-it"
     # base    : untouched checkpoint only.
     # adapter : base + LoRA adapter, the fine-tuned system only.
@@ -57,13 +86,19 @@ class Settings(BaseSettings):
     #           can answer as either system. This is the baseline-vs-adapter
     #           comparison evaluate_translations.py makes, served live.
     model_mode: ModelMode = ModelMode.ADAPTER
-    # Directory holding adapter_config.json, or a hub id. Required unless
-    # model_mode is "base".
+    # Provenance only, reported by /model-info: with a merged checkpoint the
+    # adapter is already folded into the weights vLLM serves, and nothing is
+    # loaded from this path. Left settable so a served translation can still be
+    # attributed to the adapter it came from.
     adapter_path: str | None = None
+    # Where the tokenizer and chat template are read from. Defaults to
+    # base_model_id; override when the merged checkpoint vLLM serves is not the
+    # directory this container has mounted.
+    tokenizer_path: str | None = None
     # Which system answers a request that does not name one. Must be loaded.
     default_system: System | None = None
 
-    # --- How to load ------------------------------------------------------
+    # --- How the upstream was loaded (reported, not applied) --------------
     dtype: str = "bfloat16"
     # "sdpa" is the portable default. "flash_attention_3" requires the image to
     # carry the FA3 wheel and a Hopper (sm_90) GPU.
@@ -73,7 +108,8 @@ class Settings(BaseSettings):
     load_in_4bit: bool = False
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_use_double_quant: bool = True
-    device: str | None = None  # None -> cuda if available, else cpu.
+    # Where vLLM was told to place the model. Reported, never applied.
+    device: str | None = None
 
     # --- Prompt rendering -------------------------------------------------
     # Each system is queried the way it was trained: the SFT adapter after the
@@ -102,7 +138,11 @@ class Settings(BaseSettings):
     num_beams: int = Field(default=1, ge=1)
 
     # --- Batching ---------------------------------------------------------
-    # Segments per generate() call.
+    # Segments per /completions request. vLLM accepts a list of prompts in one
+    # request and schedules them itself, so this controls HTTP round-trips (and
+    # how far a single slow segment can hold up its neighbours), not GPU
+    # batching. Chunks are dispatched concurrently up to
+    # max_concurrent_requests.
     batch_size: int = Field(default=8, gt=0)
     # Hard cap on inputs per /translate/batch request, so one caller cannot
     # occupy the single GPU worker indefinitely.
@@ -122,7 +162,9 @@ class Settings(BaseSettings):
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]
 
-    @field_validator("adapter_path", "default_system", "device", mode="before")
+    @field_validator(
+        "adapter_path", "tokenizer_path", "default_system", "device", "vllm_api_key", mode="before"
+    )
     @classmethod
     def _convert_empty_str_to_none(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
@@ -148,10 +190,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_and_resolve(self):
         self.base_model_id = _resolve_base_model_path(self.base_model_id)
-        if self.model_mode is not ModelMode.BASE:
-            if not self.adapter_path:
-                raise ValueError(f"TG_MODEL_MODE={self.model_mode} requires TG_ADAPTER_PATH.")
-            self.adapter_path = _resolve_adapter_path(self.adapter_path)
+        # Not validated as a directory: with a merged checkpoint the adapter is
+        # already in vLLM's weights and this is a label, which may well name a
+        # path that only the machine that ran the merge ever had.
+        self.vllm_base_url = self.vllm_base_url.rstrip("/")
 
         if self.default_system is None:
             self.default_system = (
@@ -163,6 +205,10 @@ class Settings(BaseSettings):
                 f"TG_MODEL_MODE={self.model_mode}."
             )
         return self
+
+    @property
+    def resolved_tokenizer_path(self) -> str:
+        return self.tokenizer_path or self.base_model_id
 
     @property
     def loaded_systems(self) -> tuple[System, ...]:
@@ -198,29 +244,6 @@ def _resolve_base_model_path(base_model_id: str) -> str:
         )
         hint = f" Models found below it: {available[:10]}" if available else ""
         raise ValueError(f"No config.json in {path}.{hint}")
-    return str(path)
-
-
-def _resolve_adapter_path(adapter_path: str) -> str:
-    """Return an absolute local adapter directory, or a hub id unchanged.
-
-    Mirrors evaluate_translations.resolve_adapter_path. PeftModel.from_pretrained
-    treats any local path without adapter_config.json as a Hub repo id, so a
-    wrong directory surfaces as an opaque HFValidationError minutes into startup
-    instead of as a path problem.
-    """
-    if _looks_like_hub_id(adapter_path):
-        return adapter_path
-    path = Path(adapter_path).expanduser().resolve()
-    if not path.is_dir():
-        raise ValueError(f"Adapter path does not exist: {path} (from {adapter_path!r})")
-    if not (path / "adapter_config.json").is_file():
-        available = sorted(
-            child.parent.relative_to(path).as_posix()
-            for child in path.rglob("adapter_config.json")
-        )
-        hint = f" Adapters found below it: {available[:10]}" if available else ""
-        raise ValueError(f"No adapter_config.json in {path}.{hint}")
     return str(path)
 
 

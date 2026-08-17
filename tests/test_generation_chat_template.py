@@ -29,11 +29,13 @@ GENERATION_ENTRY_POINTS = (
     Path("evaluate_translations.py"),
     Path("inference.py"),
     Path("translation_benchmark/generation.py"),
-    # The serving API. It imports its own byte-identical copy of prompting.py
-    # (see tests/test_api_vendored_modules.py) because api/ is deployed without
-    # the repository, but it is held to the same contract: a server that renders
-    # its own prompts would answer differently from the evaluated system without
-    # any visible failure.
+    # The serving gateway. It generates through vLLM rather than in-process,
+    # which changes nothing here: it still renders the prompts and still owns
+    # the stop set, and a gateway that rendered its own prompts would answer
+    # differently from the evaluated system without any visible failure. It
+    # imports its own byte-identical copy of prompting.py (see
+    # tests/test_api_vendored_modules.py) because api/ is deployed without the
+    # repository.
     Path("api/translator.py"),
 )
 
@@ -63,13 +65,20 @@ def test_entry_points_do_not_render_prompts_themselves(path):
     )
 
 
+# How each generation backend names the stop set it is handed explicitly:
+# transformers' generate() takes eos_token_id, vLLM's completions API takes
+# stop_token_ids.
+EXPLICIT_STOP_SET_PARAMETERS = ("eos_token_id", "stop_token_ids")
+
+
 @pytest.mark.parametrize("path", GENERATION_ENTRY_POINTS, ids=str)
 def test_entry_points_pass_an_explicit_stop_set(path):
-    """generate() must receive eos_token_id, not inherit a partial stop set."""
+    """The decoder must be handed a stop set, not inherit a partial one."""
     source = Path(path).read_text(encoding="utf-8")
-    assert "eos_token_id" in source, (
-        f"{path} does not pass an explicit eos_token_id to generate(). A model "
-        "config's stop set can omit <end_of_turn>, which every SFT target ends with."
+    assert any(name in source for name in EXPLICIT_STOP_SET_PARAMETERS), (
+        f"{path} does not pass an explicit stop set to the decoder (one of "
+        f"{list(EXPLICIT_STOP_SET_PARAMETERS)}). A model config's stop set can omit "
+        "<end_of_turn>, which every SFT target ends with."
     )
 
 

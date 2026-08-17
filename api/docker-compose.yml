@@ -1,14 +1,26 @@
-# The server and the speed benchmark run from one image and one configuration
-# block, so a benchmark measures the deployment rather than something adjacent
-# to it. The benchmark sits behind a profile and is never started by
-# `docker compose up`.
+# Two services: vLLM holds the weights, the API is a CPU-only gateway in front
+# of it (prompt rendering, sentence splitting, the request/response contract).
+# The speed benchmark runs from the API image and the same configuration block,
+# so a benchmark measures the deployment rather than something adjacent to it.
+# It sits behind a profile and is never started by `docker compose up`.
 x-tg-environment: &tg-environment
-  # Model & System Selection
-  TG_BASE_MODEL_ID: ${TG_BASE_MODEL_ID:-/models/translategemma-12b-it}
+  # Upstream vLLM. The service name resolves inside the compose network, so the
+  # published VLLM_PORT below is for humans and benchmarks, not for the API.
+  TG_VLLM_BASE_URL: ${TG_VLLM_BASE_URL:-http://translategemma-vllm:8000/v1}
+  TG_VLLM_MODEL: ${SERVED_MODEL_NAME:-model}
+  TG_VLLM_TIMEOUT: ${TG_VLLM_TIMEOUT:-300}
+  TG_VLLM_MAX_RETRIES: ${TG_VLLM_MAX_RETRIES:-2}
+  TG_MAX_CONCURRENT_REQUESTS: ${TG_MAX_CONCURRENT_REQUESTS:-32}
+
+  # Model & System Selection. TG_BASE_MODEL_ID must point at the same
+  # checkpoint vLLM serves: the gateway reads its tokenizer and chat template
+  # (no weights) to render prompts. TG_ADAPTER_PATH is provenance only -- with a
+  # merged checkpoint the adapter is already in vLLM's weights.
+  TG_BASE_MODEL_ID: ${TG_BASE_MODEL_ID:-/models/translategemma-12b-merged}
   TG_MODEL_MODE: ${TG_MODEL_MODE:-adapter}
   TG_ADAPTER_PATH: ${TG_ADAPTER_PATH:-/models/adapters/sft_final}
 
-  # Loading Precision & Attention
+  # Reported by /model-info; describes how vLLM was launched, applied there.
   TG_DTYPE: ${TG_DTYPE:-bfloat16}
   TG_ATTN_IMPLEMENTATION: ${TG_ATTN_IMPLEMENTATION:-sdpa}
   TG_LOAD_IN_4BIT: ${TG_LOAD_IN_4BIT:-false}
@@ -22,7 +34,8 @@ x-tg-environment: &tg-environment
   TG_TOP_P: ${TG_TOP_P:-1.0}
   TG_NUM_BEAMS: ${TG_NUM_BEAMS:-1}
 
-  # Batching & Performance Settings
+  # Batching & Performance Settings. TG_BATCH_SIZE is now prompts per upstream
+  # request; vLLM does the GPU batching itself.
   TG_BATCH_SIZE: ${TG_BATCH_SIZE:-8}
   TG_MAX_BATCH_ITEMS: ${TG_MAX_BATCH_ITEMS:-128}
   TG_SPLIT_SENTENCES: ${TG_SPLIT_SENTENCES:-false}
@@ -38,17 +51,83 @@ x-tg-environment: &tg-environment
   HUGGINGFACE_HUB_CACHE: ${HUGGINGFACE_HUB_CACHE:-/models/hub}
   HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
   TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
-  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-
-x-gpu-reservation: &gpu-reservation
-  resources:
-    reservations:
-      devices:
-        - driver: nvidia
-          count: ${GPU_COUNT:-1}
-          capabilities: [gpu]
 
 services:
+  translategemma-vllm:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-server
+    restart: unless-stopped
+    ports:
+      # Not 8000 on the host: that is the API's port, and the API reaches vLLM
+      # over the compose network regardless of what is published here.
+      - "${VLLM_PORT:-8001}:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+    volumes:
+      # The same staged model tree the API mounts, so TG_BASE_MODEL_ID and
+      # MODEL_PATH can name one path and mean one checkpoint.
+      - ${MODELS_DIR:-./offline_assets/models}:/models:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    # The merged checkpoint carries its own generation_config.json, written by
+    # scripts/merge_lora_adapter.py through
+    # model_loading.make_deterministic_generation_config, so its stop set
+    # includes <end_of_turn> (106). vLLM reads it (--generation-config defaults
+    # to auto) and uses it for sampling defaults; do not set that flag to
+    # "vllm", which would discard the file. The gateway also sends the stop set
+    # and every sampling parameter on each request, so neither side alone can
+    # reintroduce the 2026-08-10 unstopped decoder.
+    #
+    # --max-model-len is a KV-cache budget decision, not a request-size one.
+    # Left unset, vLLM takes Gemma 3's 131072 from config.json; at ~64 KB/token
+    # across the 8 global-attention layers (the 40 sliding-window layers cap at
+    # 1024 tokens each) that reserves ~9 GB of cache for a single sequence, and
+    # vLLM refuses to start when the budget is smaller than one sequence.
+    #
+    # 8192 is already generous for a translation segment, and the cache it frees
+    # becomes concurrency: KV budget decides how many requests batch together,
+    # and batching is where vLLM's throughput comes from. Raise it only for long
+    # unsplit documents, and raise --gpu-memory-utilization with it.
+    #
+    # No --chat-template-content-format below: nothing here uses
+    # /v1/chat/completions. The gateway renders prompts itself and posts token
+    # ids to /v1/completions, which is the only way to reproduce the SFT
+    # rendering -- and TranslateGemma's message content (per-part
+    # source_lang_code/target_lang_code) is not a shape vLLM's chat parser can
+    # accept anyway.
+    #
+    # The image's own ENTRYPOINT is already `vllm serve`, but it is restated
+    # here: a command that starts with `serve` would be appended to it and ask
+    # vLLM to load a model named "serve".
+    entrypoint: ["vllm", "serve"]
+    command: >
+      ${MODEL_PATH:-/models/translategemma-12b-merged}
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size ${TENSOR_PARALLEL_SIZE:-1}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.9}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+      --dtype ${TG_DTYPE:-bfloat16}
+      --served-model-name ${SERVED_MODEL_NAME:-model}
+      --trust-remote-code
+    healthcheck:
+      # Gates the API's start-up: loading a 12B checkpoint and capturing CUDA
+      # graphs takes minutes, and until it is done every forwarded request 503s.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+
   translategemma-api:
     image: ${IMAGE_NAME:-translategemma-api}
     build:
@@ -56,34 +135,31 @@ services:
     ports:
       - "${HOST_PORT:-8000}:${CONTAINER_PORT:-8000}"
     volumes:
-      # Staged model tree plus the adapter directory. Read-only is fine: unlike
-      # the trainer, this service takes no huggingface_hub download locks when
-      # the model id is a local path.
+      # Read for the tokenizer and chat template only. No weights are loaded in
+      # this container, so no GPU is reserved for it.
       - ${MODELS_DIR:-./offline_assets/models}:/models:ro
     environment: *tg-environment
     healthcheck:
-      # Generous start_period: loading a 12B checkpoint takes minutes, and the
-      # check itself runs a real translation.
+      # Runs a real translation through vLLM, so it proves the whole path, not
+      # just that the gateway process is up. The gateway itself starts in
+      # seconds; the wait is for the upstream, which depends_on already gates.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
       interval: 30s
       timeout: 30s
       retries: 3
-      start_period: 600s
-    deploy: *gpu-reservation
+      start_period: 120s
+    depends_on:
+      translategemma-vllm:
+        condition: service_healthy
 
   # Speed benchmark. Same image, same settings, no ports, never started by
   # `docker compose up` (it is behind a profile and has no depends_on).
   #
-  #   docker compose run --rm benchmark                       # engine, server down
-  #   docker compose run --rm benchmark --mode http \
-  #       --api-url http://translategemma-api:8000            # server up
+  #   docker compose run --rm benchmark --api-url http://translategemma-api:8000
   #
   # Arguments after the service name go straight to the script (--help lists
-  # them). Reports land in ./benchmarks on the host.
-  #
-  # The engine transport loads its own copy of the weights, so run it with the
-  # server stopped on a single-GPU host; the http transport needs the server up
-  # and loads nothing itself.
+  # them). Reports land in ./benchmarks on the host. The server must be up: the
+  # benchmark loads no weights of its own.
   benchmark:
     profiles: ["benchmark"]
     image: ${IMAGE_NAME:-translategemma-api}
@@ -97,4 +173,3 @@ services:
       <<: *tg-environment
       TG_BENCHMARK_API_URL: ${TG_BENCHMARK_API_URL:-http://translategemma-api:8000}
       TG_BENCHMARK_OUTPUT_DIR: /app/benchmarks
-    deploy: *gpu-reservation

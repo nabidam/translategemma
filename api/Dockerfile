@@ -1,4 +1,4 @@
-# TranslateGemma serving image.
+# TranslateGemma API gateway image.
 #
 # This directory is self-contained and is deployed without the rest of the
 # repository: copy api/ to the target machine and build from inside it, with
@@ -7,52 +7,30 @@
 #     cd api && docker build -t translategemma-api .
 #
 # Design notes (why it looks like this):
-#   * Base is python:3.12-slim-bookworm with torch installed from the cu128
-#     wheel index, the same combination the trainer image uses. The torch CUDA
-#     wheels vendor their own CUDA runtime, so a CUDA base image would add a
-#     second, conflicting toolkit and several GB. The host contributes the
-#     driver via nvidia-container-toolkit; nothing else.
+#   * CPU only. The weights are served by the vLLM container; this image holds
+#     a tokenizer and an HTTP client, so there is no torch, no CUDA, and no GPU
+#     reservation on the service in docker-compose.yml.
 #   * Dependencies are installed from requirements.txt in a layer that only
 #     mentions requirements.txt, so editing the API source never re-resolves or
 #     re-downloads them. The uv cache is additionally kept in a BuildKit cache
 #     mount, so even a *changed* requirements.txt reuses every wheel it already
-#     has -- the ~3 GB torch download happens once per machine, not once per
-#     rebuild. Both require BuildKit (default in Docker 23+).
-#   * prompting.py and model_loading.py here are copies of the modules of the
-#     same name at the root of the source repository (which is NOT shipped with
-#     this directory). They carry the prompt rendering and stop-token contract
-#     from that repository's docs/2026-08-10_adapter_degeneration_analysis.md,
-#     where a mismatch is silent: the model still returns fluent text. The
-#     copies are kept byte-identical there by scripts/sync_api_vendored.py and
-#     enforced by tests/test_api_vendored_modules.py; nothing needs to run on
-#     the deployment host.
+#     has. Both require BuildKit (default in Docker 23+).
+#   * prompting.py here is a copy of the module of the same name at the root of
+#     the source repository (which is NOT shipped with this directory). It
+#     carries the prompt rendering and stop-token contract from that
+#     repository's docs/2026-08-10_adapter_degeneration_analysis.md, where a
+#     mismatch is silent: the model still returns fluent text. The copy is kept
+#     byte-identical by scripts/sync_api_vendored.py and enforced by
+#     tests/test_api_vendored_modules.py; nothing needs to run on the
+#     deployment host.
 FROM python:3.12-slim-bookworm
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
-
-# Triton JIT-compiles GPU kernels at runtime and shells out to a C compiler to
-# build the launcher stubs, so gcc must be present at run time, not just at
-# build time. Same reasoning as the trainer image; apt is told to fetch
-# serially with retries because the default parallel pipeline is what draws
-# 502s from a proxy under load.
-RUN apt-get update -o Acquire::Retries=5 \
-    && apt-get install -y --no-install-recommends \
-        -o Acquire::Retries=5 \
-        -o Acquire::Queue-Mode=access \
-        -o Acquire::http::Pipeline-Depth=0 \
-        gcc \
-        libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
-    # requirements.txt names the cu128 wheel index as an extra index. uv's
-    # default first-index strategy would find `torch` on PyPI and stop there,
-    # never reaching the CUDA build; this tells it to consider both.
-    UV_INDEX_STRATEGY=unsafe-best-match \
-    # The torch wheels are ~3 GB and a slow proxy trips uv's default deadline.
     UV_HTTP_TIMEOUT=300 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -76,7 +54,8 @@ COPY . /app/
 
 EXPOSE 8000
 
-# No weights are baked in, so one image serves any checkpoint. Point
-# TG_BASE_MODEL_ID / TG_ADAPTER_PATH at a mounted model tree, and set
-# HF_HOME / HUGGINGFACE_HUB_CACHE in compose when serving offline.
+# No weights are baked in and none are loaded. Point TG_VLLM_BASE_URL at the
+# vLLM server and TG_BASE_MODEL_ID at a mounted copy of the checkpoint it
+# serves (read for the tokenizer and chat template only), and set HF_HOME /
+# HUGGINGFACE_HUB_CACHE in compose when running offline.
 CMD ["fastapi", "run", "main.py", "--host", "0.0.0.0", "--port", "8000"]

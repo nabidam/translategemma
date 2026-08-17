@@ -561,6 +561,380 @@ docker compose run --rm -d --name tg-train trainer \
 docker logs -f tg-train
 ```
 
+### 5.5 Merge the adapter into the base model (for vLLM)
+
+`scripts/merge_lora_adapter.py` folds a trained LoRA adapter into the base
+weights and writes an ordinary Hugging Face model directory. vLLM can also serve
+the adapter unmerged with `--enable-lora`, so this is a choice, not a
+requirement; merging removes the per-request LoRA path and the `--max-lora-rank`
+plumbing, at the cost of one full-size checkpoint on disk per adapter.
+
+It runs in the training image, needs no GPU, and takes two positional arguments —
+the adapter directory and the output directory:
+
+```bash
+docker compose run --rm trainer python scripts/merge_lora_adapter.py \
+    translategemma-farsi-science/sft_final \
+    merged/translategemma-farsi-sft
+```
+
+Write the output inside the project tree (or another bind mount) so it survives
+the container. Budget the full base-model size for it: ~24 GB for
+`translategemma-12b-it` in bf16, on top of the staged copy under `/models`.
+
+The base model id comes from the adapter's `adapter_config.json`; pass
+`--base-model` to override it. Everything else has a working default:
+
+| Flag | Default | When to change it |
+| --- | --- | --- |
+| `--device` | `cpu` | `cuda:0` when host RAM is tighter than VRAM; `auto` only when no single GPU can hold the model. |
+| `--dtype` | `bfloat16` | Rarely. Must be a full-precision dtype — see below. |
+| `--attn-implementation` | `eager` | Rarely. Irrelevant to the merge; the default avoids needing a FlashAttention build on the merging host. |
+| `--max-shard-size` | `5GB` | To match a serving host's preferred shard size. |
+| `--overwrite` | off | To rewrite a non-empty output directory. |
+
+**Run it as a single process, never under `accelerate launch`.** Merging is an
+elementwise weight update, so extra ranks would each repeat the whole merge and
+race to write the same directory. More GPUs do not make it faster; `--device
+auto` exists only to spread an oversized model across cards, which a 12B model
+on an H100/H200 does not need.
+
+**The merge is always done in full precision, never against 4-bit weights**, so
+a run trained with `model.use_4bit: true` still merges into a bf16 base here.
+Merging into a quantised base would dequantise, add, and re-quantise, losing part
+of the adapter delta. Quantise the merged checkpoint afterwards if the serving
+host needs it.
+
+Besides the weights, the output directory receives two things vLLM depends on:
+
+- the **processor** — tokenizer, chat template and preprocessor config — because
+  vLLM loads the tokenizer from the model directory and does not know the base
+  repository it came from;
+- a **`generation_config.json`** built by
+  `model_loading.make_deterministic_generation_config`, whose stop set includes
+  `<end_of_turn>` (106). `config.json` alone publishes only `<eos>` (1), and a
+  decoder missing 106 does not stop a fine-tuned model at all
+  (`docs/2026-08-10_adapter_degeneration_analysis.md`).
+
+It also copies the adapter's `adapter_config.json` and `run_metadata.json` under
+an `adapter_` prefix and writes `merge_metadata.json` recording the source
+adapter, base model, dtype and LoRA hyperparameters — keep those with the
+checkpoint, since a merged model is otherwise indistinguishable from the base.
+
+Sanity-check the result before shipping it. The merged directory is loadable by
+the same evaluation path as the base model, so a quick benchmark candidate with
+no `adapter` set is the cheapest end-to-end proof that the deltas actually
+landed.
+
+### 5.6 Quantise the merged checkpoint to FP8 (optional)
+
+Only needed when the serving GPU has to hold something else as well. A 12B merge
+is ~24 GB in bf16; FP8 halves that, which is the difference between fitting
+beside a second model on a 32 GB card and not fitting at all.
+`scripts/quantize_fp8.py` writes a compressed-tensors checkpoint vLLM detects
+from its `config.json` — no serving flag to set.
+
+**Order matters: merge first, quantise second.** Merging a LoRA adapter into
+already-quantised weights rounds the delta away — a LoRA update is small enough
+per channel to disappear into the quantisation step — so it would cost exactly
+the fine-tune the merge exists to preserve. The script refuses an adapter
+directory or an already-quantised input for this reason.
+
+The scheme is `FP8_DYNAMIC`, which needs **no calibration corpus**. That is the
+main reason to prefer it over 4-bit AWQ/GPTQ here: those pick their scales from
+sample activations, and a general-purpose calibration set biases a
+domain-fine-tuned model away from its domain.
+
+#### The quantiser is a separate image
+
+It cannot go in the training image. Measured against this repository's lock
+(`torch==2.8.0`, `transformers==4.57.6`), no llm-compressor release installs:
+
+| llmcompressor | requires |
+| --- | --- |
+| 0.8.x | `transformers <=4.56.2` |
+| 0.9.x | `transformers <=4.57.3` |
+| 0.10.x | `torch >=2.9.0` |
+| 0.11.0 | `torch >=2.10.0` |
+| 0.12+ | `transformers >=5.9.0` |
+
+That is not bad luck on either side: llm-compressor tracks vLLM's release
+cadence, while the training stack is frozen on the versions the evaluation
+harness was validated against and pinned below transformers v5 (§6.9). Forcing
+them together would mean moving `torch` or `transformers` under the trainer,
+which is what `uv.lock` exists to prevent.
+
+`scripts/quantize.Dockerfile` builds from the vLLM image instead, which already
+carries the torch llm-compressor 0.10.x wants — it is the torch vLLM itself was
+built against.
+
+#### Staging it (online machine)
+
+`docker compose build quantizer` needs network for the `pip install`, so it
+belongs in Phase A alongside §3.2, and the image travels with the others:
+
+```bash
+docker compose build quantizer
+docker save translategemma-quantizer:vllm0.13.0 | zstd -T0 -19 -o quantizer-image.tar.zst
+```
+
+Load it on the offline host exactly as §5.2 loads the trainer image. Nothing
+resolves at run time.
+
+#### Running it (offline GPU host)
+
+```bash
+docker compose run --rm quantizer --device cuda:0 \
+    /models/translategemma-12b-merged \
+    /models/translategemma-12b-merged-fp8
+```
+
+`--device` defaults to `cpu` so the quantiser never competes with a GPU that is
+serving; pass `cuda:0` when the card is free. The transform is a weight
+operation, not a forward pass, so CPU is a real option rather than a fallback.
+
+Two environment settings the compose file already supplies, both worth knowing
+because the failures are opaque:
+
+- **`USER` / `LOGNAME`.** compressed-tensors decorates a class *body* with
+  `@torch.compile`, so torch's inductor initialises during import and calls
+  `getpass.getuser()`. The container runs as a bare numeric uid (§5.2) and the
+  vLLM image has no `/etc/passwd` entry for it, so the `pwd` lookup raises
+  `KeyError: getpwuid(): uid not found: 1000` before the script reaches its
+  first line of work. `getpass` reads these two variables before consulting
+  `pwd`.
+- **`TORCHINDUCTOR_CACHE_DIR` / `TRITON_CACHE_DIR`.** The same failure from the
+  other side — `getuser()` is only called to *build* a default cache path — and
+  they keep the compile caches on the `/hf_cache` scratch mount.
+
+If the compose file on the offline host predates those settings, override them
+for one run without editing anything:
+
+```bash
+docker compose run --rm \
+    -e USER=quantizer -e LOGNAME=quantizer \
+    -e TORCHINDUCTOR_CACHE_DIR=/hf_cache/torchinductor \
+    -e TRITON_CACHE_DIR=/hf_cache/triton \
+    quantizer --device cuda:0 \
+    /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
+```
+
+`/hf_cache` now gets written where it may not have been before, so re-check the
+ownership rule from §5.2: both bind targets must be owned by `HOST_UID`.
+
+One more failure worth naming, because the message points at the wrong thing.
+Saving a model that llm-compressor dispatched across devices with CPU offload
+raises a bare
+
+```
+KeyError: 'vision_tower.vision_model.embeddings.patch_embedding.weight'
+```
+
+from inside `transformers.save_pretrained`. llm-compressor's save wrapper runs
+`to_accelerate(model)` — "for optimal saving with transformers" — immediately
+before delegating, which converts the model to accelerate's offloaded form.
+transformers then takes its offloaded save path: it builds a module map so it
+can re-gather offloaded weights, and looks every state-dict key up in it. Only
+the modules the conversion touched are in that map.
+
+The failing weight is a **Conv2d**, and `QuantizationModifier` targets Linear,
+so the vision tower's patch embedding is skipped no matter what `--ignore` says.
+Neither `--device cpu` nor quantising the vision tower avoids this: the offload
+is applied inside the save call, not inherited from how the model was loaded.
+
+`disable_offload_conversion()` neutralises that step. It is a memory
+optimisation, not a correctness requirement, and it buys nothing here because
+the model is already materialised in host RAM.
+
+It patches **both** halves of the conversion. `to_accelerate` and
+`from_accelerate` are a matched pair, and skipping only the first leaves the
+second trying to offload modules that compression already offloaded:
+
+```
+ValueError: Attempted to offload a module twice.
+```
+
+The restoring half only matters to a caller that keeps using the model in
+memory after saving, which this script does not. Verified against llmcompressor
+0.10.0.3 with transformers 4.57.3 — the versions this image resolves to — and
+any hook a newer release renames is simply left unpatched.
+
+#### What the script guarantees
+
+The stop-token contract from `docs/2026-08-10_adapter_degeneration_analysis.md`
+survives quantisation, and the script fails rather than let it not:
+
+- the tokenizer, chat template and preprocessor configs are **copied byte for
+  byte** from the merged directory, never re-saved. This image runs a different
+  `transformers` than the API and the harness do, and a chat template
+  re-serialised by another version — one space different in the assistant-turn
+  prefix — still returns fluent Farsi;
+- `generation_config.json` is copied if the save did not write one, and the run
+  **fails** if its `eos_token_id` does not contain `<end_of_turn>` (106);
+- the saved `config.json` is re-read and the run fails if it carries no
+  `quantization_config`, since vLLM would then load the weights as dense;
+- `lm_head`, the vision tower and the multimodal projector are left in full
+  precision (`--ignore` to change), and `quantization_metadata.json` records the
+  scheme, the ignore list and the source directory.
+
+**Score it before serving it.** FP8 is near-lossless in general, which says
+nothing certain about this adapter's terminology gains. Run §5.4's evaluation
+against the FP8 directory and diff COMET/chrF against the bf16 merge on the same
+test set.
+
+#### Status: the FP8 serving path is unvalidated
+
+As of 2026-08-17, no FP8 checkpoint has been served successfully. What is known:
+
+- The FP8 checkpoint hits the **same vLLM 0.13.0 RoPE bug** as the bf16 merge and
+  fails to load with `rope_parameters should have a 'rope_type' key` (see
+  `docs/DEPLOYMENT_BACKLOG.md`). It was reproduced on both checkpoints, whose
+  configs differ only in `transformers_version`.
+- The fix is presumably the same overlay — `scripts/vllm_rope_shim.py` — but that
+  has **not** been run against an FP8 checkpoint. The shim refuses inputs whose
+  `rope_parameters` mixes layer types with other keys, and an FP8 config carries a
+  `quantization_config` block that has not been checked against it.
+- The bf16 merge is the only configuration measured
+  (`docs/2026-08-17_serving_ab_vllm_vs_transformers.md`), and it was measured
+  alone on a free GPU — not in the shared-GPU arrangement FP8 exists for.
+
+So the shared-GPU deployment in `docker-compose.spadana.yml` is sized for a
+checkpoint nobody has started. Before relying on it: shim the FP8 directory,
+confirm `get_config()` accepts it, start it beside the second model, and check
+both fit — then score the output, since FP8 is a different numerical path and the
+A/B says nothing about it.
+
+---
+
+### 5.7 The serving stack (`docker-compose.spadana.yml`)
+
+MySQL, a Spring backend, phpMyAdmin, two vLLM servers and the two API gateways
+in front of them. Images are built elsewhere; that file only wires them
+together. It carries no comments by design — everything explaining it is here.
+
+#### Required environment
+
+| Variable | Meaning |
+| --- | --- |
+| `TG_MERGED_MODEL_DIR` | **A rope overlay built by `scripts/vllm_rope_shim.py`**, not the merge itself. See below. |
+| `GPU_DEVICE_ID` | Which physical device both vLLM servers divide. Default `0`. |
+| `TG_GPU_MEMORY_UTILIZATION` / `DOTS_GPU_MEMORY_UTILIZATION` | Fractions of **total** VRAM. Default `0.55` / `0.30`. |
+| `TG_MAX_MODEL_LEN` | KV-cache budget. Default `8192`. |
+| `TG_DTYPE` | Default `bfloat16`. |
+| `SERVED_TG_MODEL_NAME` / `SERVED_DOT_MODEL_NAME` | vLLM's `--served-model-name`; the gateway's `TG_VLLM_MODEL` must match. |
+| `MYSQL_ROOT_PASSWORD` / `MYSQL_DATABASE` | Default `root` / `fundamental`. |
+| `HUGGING_FACE_HUB_TOKEN` | Optional; both vLLM servers run with `HF_HUB_OFFLINE=1` anyway. |
+
+#### `TG_MERGED_MODEL_DIR` must be a rope overlay
+
+vLLM 0.13.0 cannot load a Gemma 3 config written by Transformers 4.57.
+`patch_rope_parameters` injects `rope_theta` into the top level of the nested
+per-layer rope block, which then fails its own `ALLOWED_LAYER_TYPES` test, and
+the server exits before loading weights with `rope_parameters should have a
+'rope_type' key`. Build an overlay — it hardlinks the weights and rewrites
+`config.json` only:
+
+```bash
+python scripts/vllm_rope_shim.py <merge> <merge>-vllm
+```
+
+Both TranslateGemma services mount the same variable. That is correct: the
+overlay changes `config.json` only, so its tokenizer is the merge's tokenizer,
+and the gateway must read the *same* checkpoint vLLM serves or prompts are
+rendered with one tokenizer and generated by another. The gateway loads no
+weights — it reads the tokenizer and chat template, nothing else.
+
+Full background in `docs/DEPLOYMENT_BACKLOG.md`; re-check whether the overlay is
+still needed after any vLLM upgrade.
+
+#### Sharing one GPU between two models
+
+Both vLLM servers reserve the same device, pinned by `device_ids` rather than
+`count: all` so the two agree on which card they are dividing instead of leaving
+it implicit. Their `--gpu-memory-utilization` fractions are of **total** VRAM,
+not of what is free, which is what stops two servers starting in any order from
+claiming the same bytes. They must sum to comfortably below 1.0.
+
+Sized for a 32 GB 5090 serving an FP8 TranslateGemma beside dots.ocr:
+
+| Service | Fraction | Budget | Contents |
+| --- | --- | --- | --- |
+| translategemma | 0.55 | 17.6 GB | ~13 GB weights, ~4 GB KV cache |
+| dots.ocr | 0.30 | 9.6 GB | ~4 GB weights, ~5 GB KV cache |
+| unclaimed | 0.15 | 4.8 GB | CUDA contexts, activations, headroom |
+
+**These are estimates, never measured — this stack has not been started
+successfully.** The bf16 merge needs ~24 GB of weights and does not fit beside a
+second model at all, and the FP8 path is unvalidated (§5.6). Re-measure both
+numbers against `nvidia-smi` after the first successful start.
+
+#### vLLM flags that are deliberate
+
+- **No `--generation-config vllm`.** The merged directory carries its own
+  `generation_config.json`, whose stop set includes `<end_of_turn>` (106). vLLM
+  reads it because `--generation-config` defaults to `auto`; passing `vllm`
+  discards the file and the model does not stop.
+- **`--max-model-len 8192`** is a KV-cache budget decision, not a request-size
+  one. Left unset, vLLM takes Gemma 3's 131072 from `config.json`; at ~64 KB per
+  token across the 8 global-attention layers (the 40 sliding-window layers cap at
+  1024 tokens each) that reserves ~9 GB of cache for a single sequence, and vLLM
+  refuses to start when the budget is smaller than one sequence. 8192 is already
+  generous for a translation segment, and the cache it frees becomes concurrency.
+  Raise it only for long unsplit documents, and raise
+  `--gpu-memory-utilization` with it.
+- **No `--chat-template-content-format`.** Nothing here uses
+  `/v1/chat/completions`. The gateway renders prompts itself and posts token ids
+  to `/v1/completions`, which is the only way to reproduce the SFT rendering —
+  and TranslateGemma's message content (per-part
+  `source_lang_code`/`target_lang_code`) is not a shape vLLM's chat parser can
+  accept anyway.
+- **`entrypoint: ["vllm", "serve"]` is restated** even though the image's own
+  ENTRYPOINT already is that. A command starting with `serve` would be appended
+  to it and ask vLLM to load a model named `serve`.
+
+#### Ports
+
+| Port | Service |
+| --- | --- |
+| `8080` | Spring backend |
+| `7070` | phpMyAdmin |
+| `7073` | TranslateGemma vLLM — for humans and benchmarks only; the gateway reaches it over the compose network on port 8000 |
+| `8888` | TranslateGemma gateway |
+| `7071` / `7072` | dots.ocr vLLM / API |
+| `127.0.0.1:3306` | MySQL, bound to loopback — the backend and phpMyAdmin reach it over the compose network, so nothing needs it published to the LAN |
+
+#### Healthchecks and start-up order
+
+- MySQL's healthcheck gates the backend. Without it the backend races the very
+  first boot of MySQL, which runs `initdb` before it accepts connections.
+- The vLLM services allow a 900 s (600 s for dots.ocr) `start_period`: loading a
+  12B checkpoint and capturing CUDA graphs takes minutes.
+- The gateway's healthcheck runs a real translation through vLLM, so it proves
+  the whole path rather than just the process. Its `start_period` is 120 s — it
+  loads a tokenizer, not a checkpoint; waiting for the weights is `depends_on`'s
+  job.
+- The gateway has no GPU reservation and no `PYTORCH_CUDA_ALLOC_CONF`: there is
+  no torch in that image.
+
+#### Gateway configuration precedence
+
+The gateway reads `./translategemma/.env` through `env_file`, but every wiring
+variable is also set under `environment:`, which Compose gives precedence. So the
+wiring lives in the compose file and the `.env` file carries only translation
+defaults.
+
+`dots-ocr-api` keeps an `extra_hosts` entry for whatever in its own `.env` still
+points at the host. The service name `http://dots-ocr-vllm:8000/v1` is the better
+address: it does not depend on a published port and survives a port change.
+
+#### First-run database bootstrap
+
+```bash
+sudo docker compose exec mysql bash
+mysql -u root -p                       # then: create database fundamental;
+mysql -u root -p fundamental < fundamental.sql
+```
+
 ---
 
 ## 6. Known issues to expect
@@ -926,6 +1300,41 @@ route above, never through `uv sync --extra speed`.
 
 The vLLM command in `README.md` is not part of this image — `vllm` is not in
 `pyproject.toml`. Serving offline needs its own image, staged the same way.
+
+Two model layouts work there. The unmerged one is what `README.md` shows: the
+staged base repository plus `--enable-lora --lora-modules <alias>=<adapter dir>`,
+which keeps adapters swappable and costs one LoRA application per request. The
+merged one comes from §5.5 and is a self-contained directory that needs no LoRA
+flags:
+
+```bash
+vllm serve /models/merged/translategemma-farsi-sft \
+    --served-model-name farsi-science \
+    --max-model-len 2048 \
+    --limit-mm-per-prompt '{"image": 0}'
+```
+
+The merged directory needs no conversion step, but three things about this model
+are worth setting deliberately:
+
+- **Leave the generation config alone.** vLLM reads `generation_config.json` from
+  the model directory by default, which is how `<end_of_turn>` (106) reaches the
+  stop set. Passing `--generation-config vllm` discards it and the model will not
+  stop generating. If a client bypasses the defaults, have it send
+  `stop_token_ids: [1, 106]` explicitly.
+- **It is still a multimodal Gemma 3 checkpoint.** LoRA excluded `vision_tower`
+  (§`README.md`), and merging leaves the image encoder in place, so the merged
+  model carries it too. This pipeline sends text only, so
+  `--limit-mm-per-prompt '{"image": 0}'` avoids reserving memory for image
+  inputs that never arrive.
+- **Prompts must keep the trained format.** The `<<<source>>>…<<<target>>>…
+  <<<text>>>…` string and the chat template are what the adapter was trained on;
+  the template travels with the merged directory, so use the chat completions
+  endpoint rather than hand-assembling prompts.
+
+`--max-model-len` is worth pinning to the trained sequence length
+(`training.max_length`, 2048). The base config advertises a much longer context,
+and vLLM sizes its KV cache from that.
 
 ### 6.9 Transformers version boundary
 

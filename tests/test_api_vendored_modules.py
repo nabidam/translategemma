@@ -1,8 +1,8 @@
 """Fail when api/'s vendored copies drift from the root modules they mirror.
 
-api/ ships standalone, so it cannot import prompting.py and model_loading.py
-from the project root and carries copies instead. Those two modules encode the
-prompt rendering and stop-token resolution from
+api/ ships standalone, so it cannot import prompting.py from the project root
+and carries a copy instead. That module encodes the prompt rendering and
+stop-token resolution from
 docs/2026-08-10_adapter_degeneration_analysis.md, where a mismatch produces
 fluent output and an unstopped decoder rather than an error. A copy that quietly
 falls behind would reintroduce exactly that failure in production while every
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VENDORED_MODULES = ("prompting.py", "model_loading.py")
+VENDORED_MODULES = ("prompting.py",)
 
 
 @pytest.mark.parametrize("name", VENDORED_MODULES)

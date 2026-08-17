@@ -1,0 +1,295 @@
+# A/B serving benchmark: vLLM + merged checkpoint  vs  FastAPI + transformers + LoRA.
+#
+# Standalone on purpose. It does NOT extend docker-compose.spadana.yml: that
+# file is the production stack, and a benchmark that shares a GPU with MySQL's
+# neighbour dots.ocr measures contention rather than either serving strategy.
+# Stop the production stack before running this.
+#
+# Three services, two of them behind profiles so nothing starts by accident:
+#
+#   --profile vllm : translategemma-vllm + translategemma-api  (arm A)
+#   --profile hf   : translategemma-api-hf                     (arm B)
+#   --profile bench: the measurement client, CPU only, `run --rm` not `up`
+#
+# The two arms MUST NOT run at the same time. They share one GPU; concurrent
+# VRAM and SM contention invalidates both numbers. scripts/bench_ab.sh does the
+# stop/start sequencing; see docs/SERVING_BENCHMARK_AB.md for the runbook.
+
+# Model mounts use the long volume syntax throughout, not "src:dst:ro". Two
+# reasons, both of which have bitten this file:
+#
+#   * A relative source without a leading ./ ("merged/foo") is parsed by the
+#     short syntax as a NAMED VOLUME, and the run dies with "refers to undefined
+#     volume merged/foo". type: bind says what is meant.
+#   * create_host_path: false. The short syntax silently mkdir -p's a missing
+#     source, so a typo in a checkpoint path produces an empty directory and a
+#     confusing failure several minutes later inside vLLM. This fails at start,
+#     naming the path.
+#
+# Sources must still be ABSOLUTE paths in .env.bench.
+x-merged-mount: &merged-mount
+  type: bind
+  source: ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to the merged checkpoint directory (absolute path)}
+  target: /merged
+  read_only: true
+  bind:
+    create_host_path: false
+
+# The base checkpoint arm B loads. Two variables rather than one, because a base
+# model usually lives in the HuggingFace cache, whose snapshot directories are
+# SYMLINKS into ../../blobs/. Mounting a snapshot directory alone leaves every
+# weight file dangling inside the container.
+#
+# So TG_BASE_MODEL_DIR mounts a directory that contains the blobs too -- for a
+# cached model that is the cache root -- and TG_BASE_MODEL_PATH says where the
+# checkpoint sits inside it:
+#
+#   cached:     TG_BASE_MODEL_DIR=/host/.cache/huggingface
+#               TG_BASE_MODEL_PATH=/base/hub/models--google--translategemma-12b-it/snapshots/<sha>
+#   standalone: TG_BASE_MODEL_DIR=/host/models/translategemma-12b-it
+#               TG_BASE_MODEL_PATH=/base
+x-base-mount: &base-mount
+  type: bind
+  source: ${TG_BASE_MODEL_DIR:?set TG_BASE_MODEL_DIR to a directory containing the base checkpoint (absolute path)}
+  target: /base
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-hf-cache-mount: &hf-cache-mount
+  type: bind
+  source: ${HF_CACHE_DIR:?set HF_CACHE_DIR to the shared HuggingFace cache (absolute path)}
+  target: /models
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-gpu-device: &gpu-device
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          # Pinned rather than `count: all`: the two arms must be measured on
+          # the same physical card, and `count` makes that implicit.
+          device_ids: ["${GPU_DEVICE_ID:-0}"]
+          capabilities: [gpu]
+
+# Decoding settings that decide a translation. Identical on both arms by
+# construction -- an A/B where one arm samples and the other is greedy compares
+# nothing. Greedy also makes the two arms emit the same text, which is what
+# makes their tokens/second directly comparable.
+x-decoding-env: &decoding-env
+  TG_MODEL_MODE: adapter
+  TG_MAX_NEW_TOKENS: ${TG_MAX_NEW_TOKENS:-512}
+  TG_DO_SAMPLE: "false"
+  TG_NUM_BEAMS: "1"
+  TG_TEMPERATURE: "1.0"
+  TG_TOP_P: "1.0"
+  TG_SOURCE_LANG: ${TG_SOURCE_LANG:-en}
+  TG_TARGET_LANG: ${TG_TARGET_LANG:-fa}
+  TG_SPLIT_SENTENCES: "false"
+  # The server chunks a /translate/batch request by TG_BATCH_SIZE regardless of
+  # how many texts the client sent. Leaving it at the default 8 would silently
+  # turn the sweep's batch-16 and batch-32 rows into 2 and 4 sequential chunks
+  # on BOTH arms, so it must be at least the largest swept batch size.
+  TG_BATCH_SIZE: ${TG_BENCH_MAX_BATCH:-32}
+  TG_MAX_BATCH_ITEMS: "128"
+
+services:
+  # --------------------------------------------------------------------- #
+  # Arm A: vLLM holds the merged weights, the API is a CPU-only gateway.
+  # --------------------------------------------------------------------- #
+
+  translategemma-vllm:
+    profiles: ["vllm"]
+    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-v0.13.0}
+    container_name: bench-translategemma-vllm
+    environment:
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - *merged-mount
+      # vLLM's own HF cache path, not the /models the API containers use.
+      - type: bind
+        source: ${HF_CACHE_DIR:?set HF_CACHE_DIR to the shared HuggingFace cache (absolute path)}
+        target: /root/.cache/huggingface
+        bind:
+          create_host_path: false
+    # Restated even though the image's ENTRYPOINT is already `vllm serve`: a
+    # command starting with `serve` would be appended and ask vLLM to load a
+    # model named "serve". Same reasoning as docker-compose.spadana.yml.
+    entrypoint: ["vllm", "serve"]
+    # bf16, not the fp8 quant. The question here is runtime (vLLM's paged KV and
+    # continuous batching vs a transformers generate() loop); serving fp8 on one
+    # side would fold a quantisation effect into that answer. Benchmark fp8 as a
+    # separate third arm if you want it, with its own --tag.
+    #
+    # --gpu-memory-utilization is high because nothing else shares the card
+    # during a benchmark. KV budget is where vLLM's batching headroom comes
+    # from, so starving it here would understate arm A.
+    command: >
+      /merged
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name ${SERVED_TG_MODEL_NAME:-translategemma}
+      --tensor-parallel-size 1
+      --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.90}
+      --max-model-len ${TG_MAX_MODEL_LEN:-8192}
+      --dtype ${TG_DTYPE:-bfloat16}
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Loading a 12B checkpoint and capturing CUDA graphs takes minutes.
+      start_period: 900s
+    deploy: *gpu-device
+    ipc: host
+
+  translategemma-api:
+    profiles: ["vllm"]
+    image: ${TG_API_IMAGE:-translategemma-api-gw:latest}
+    container_name: bench-translategemma-api
+    ports:
+      - "${TG_API_PORT:-8888}:8000"
+    volumes:
+      # Read for the tokenizer and chat template only; this container loads no
+      # weights. It must be the SAME checkpoint vLLM serves, or prompts are
+      # rendered with one tokenizer and generated by another.
+      - *merged-mount
+      - *hf-cache-mount
+    environment:
+      <<: *decoding-env
+      TG_VLLM_BASE_URL: http://translategemma-vllm:8000/v1
+      TG_VLLM_MODEL: ${SERVED_TG_MODEL_NAME:-translategemma}
+      TG_BASE_MODEL_ID: /merged
+      # The merged checkpoint is served as the adapter system and still expects
+      # the SFT rendering, which is what adapter_use_training_rendering gives.
+      # Recorded for provenance only; no adapter is loaded from this path.
+      TG_ADAPTER_PATH: ${TG_ADAPTER_DIR:-}
+      # In-flight /completions requests. Must exceed the largest swept batch or
+      # the gateway, not the GPU, becomes the bottleneck being measured.
+      TG_MAX_CONCURRENT_REQUESTS: "64"
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    healthcheck:
+      # Runs a real translation through vLLM, so it proves the whole path.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    depends_on:
+      translategemma-vllm:
+        condition: service_healthy
+    # No GPU reservation: there is no torch in this image.
+
+  # --------------------------------------------------------------------- #
+  # Arm B: one FastAPI process holds the base weights and a LoRA adapter.
+  # --------------------------------------------------------------------- #
+  #
+  # Built from the tree at 21e5ab0^ -- the commit before
+  # "refactor(api): serve through vllm instead of in-process transformers"
+  # deleted api/model_loading.py and dropped torch/peft from requirements.
+  # docs/SERVING_BENCHMARK_AB.md has the worktree + build recipe.
+  #
+  # Tagged -hf, and arm A's gateway tagged -gw, because BOTH Dockerfiles name
+  # themselves translategemma-api. An image under that bare name is ambiguous;
+  # `docker run --rm <image> cat /opt/resolved-requirements.txt | grep torch`
+  # tells the two apart (torch present -> this arm).
+
+  translategemma-api-hf:
+    profiles: ["hf"]
+    image: ${TG_API_HF_IMAGE:-translategemma-api-hf:latest}
+    container_name: bench-translategemma-api-hf
+    ports:
+      - "${TG_API_HF_PORT:-8889}:8000"
+    volumes:
+      # Unmerged base checkpoint plus the LoRA adapter that was merged into
+      # /merged for arm A. Same adapter, applied at run time instead of ahead
+      # of time -- that difference IS the experiment.
+      - *base-mount
+      - type: bind
+        source: ${TG_ADAPTER_DIR:?set TG_ADAPTER_DIR to the LoRA adapter directory (absolute path)}
+        target: /adapter
+        read_only: true
+        bind:
+          create_host_path: false
+      - *hf-cache-mount
+    environment:
+      <<: *decoding-env
+      # Where the checkpoint sits inside the /base mount; see x-base-mount.
+      TG_BASE_MODEL_ID: ${TG_BASE_MODEL_PATH:-/base}
+      TG_ADAPTER_PATH: /adapter
+      # Reported by /model-info on arm A, applied for real here. Kept equal to
+      # arm A's TG_DTYPE so the comparison is bf16 against bf16.
+      TG_DTYPE: ${TG_DTYPE:-bfloat16}
+      # sdpa is the portable default. flash_attention_3 needs the FA3 wheel in
+      # the image and a Hopper card; changing it changes what is being measured,
+      # so it is a deliberate second run, not a default.
+      TG_ATTN_IMPLEMENTATION: ${TG_HF_ATTN_IMPLEMENTATION:-sdpa}
+      TG_LOAD_IN_4BIT: "false"
+      TG_DEVICE: cuda
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
+      interval: 30s
+      timeout: 60s
+      retries: 5
+      # Loads a 12B checkpoint and applies the adapter in-process, unlike the
+      # gateway, which loads a tokenizer and starts in seconds.
+      start_period: 900s
+    deploy: *gpu-device
+    ipc: host
+
+  # --------------------------------------------------------------------- #
+  # The measurement client.
+  # --------------------------------------------------------------------- #
+  #
+  # Always the HEAD gateway image, for both arms: it carries
+  # scripts/benchmark_speed.py, and one benchmark binary measuring both arms is
+  # the only way the two reports are commensurable. The script is pure HTTP and
+  # /model-info + /translate/batch are unchanged across 21e5ab0, so it drives
+  # the old server without modification.
+  #
+  # TG_BASE_MODEL_ID is set per invocation by scripts/bench_ab.sh, to whichever
+  # checkpoint the arm under test serves: the client re-encodes returned text to
+  # recover token counts, and reports a note if its tokenizer differs from the
+  # server's.
+
+  bench:
+    # Profiled, and no container_name: it is invoked with `run --rm`, never
+    # `up`. Without a profile it would start alongside whichever arm is being
+    # brought up and benchmark a server that is not ready yet.
+    profiles: ["bench"]
+    image: ${TG_API_IMAGE:-translategemma-api-gw:latest}
+    entrypoint: ["python", "scripts/benchmark_speed.py"]
+    working_dir: /app
+    volumes:
+      # Both checkpoints: the client re-encodes returned text to recover token
+      # counts, with whichever arm's tokenizer is under test.
+      - *merged-mount
+      - *base-mount
+      - *hf-cache-mount
+      # Reports land on the host, outside the images, so they survive teardown.
+      # The one mount that may be relative, and the one create_host_path is
+      # wanted for: the directory is an output, not an input.
+      - type: bind
+        source: ${BENCH_OUTPUT_DIR:-./benchmark_ab}
+        target: /out
+    environment:
+      <<: *decoding-env
+      # Overridden per arm by bench_ab.sh. The default keeps a bare
+      # `docker compose -f docker-compose.bench.yml run bench` working.
+      TG_BASE_MODEL_ID: ${TG_BENCH_TOKENIZER_DIR:-/merged}
+      # Unused by the client (it talks to the API, not to vLLM) but required by
+      # Settings validation in the gateway image.
+      TG_VLLM_BASE_URL: http://translategemma-vllm:8000/v1
+      TG_VLLM_MODEL: ${SERVED_TG_MODEL_NAME:-translategemma}
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"

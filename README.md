@@ -362,37 +362,73 @@ start fresh. Resume stages in separate invocations to avoid either ambiguity.
 
 ## Serving
 
-[`api/`](api/README.md) is a FastAPI service for a trained adapter, with the same
-endpoint shapes as the existing NLLB service plus a batch endpoint. It is a
-self-contained deployment unit: copy the directory to the serving host and build
-from inside it, with no part of this repository present.
+[`api/`](api/README.md) is a FastAPI **gateway**: vLLM holds the weights, and
+the gateway owns the prompt rendering, the stop set, sentence splitting and the
+endpoint shapes (the same ones as the existing NLLB service, plus a batch
+endpoint). It is a self-contained deployment unit: copy the directory to the
+serving host and build from inside it, with no part of this repository present.
 
 ```bash
 cd api && docker build -t translategemma-api .
+docker compose up -d          # vLLM, then the gateway once vLLM is healthy
 ```
 
-Its generation path mirrors `evaluate_translations.py` exactly, so a served
-translation is the translation the harness scored. That requires copies of
-`prompting.py` and `model_loading.py` inside `api/`, which are kept
-byte-identical from here:
+The production stack — MySQL, the Spring backend, two vLLM servers sharing one
+GPU and the two gateways in front of them — is `docker-compose.spadana.yml`. It
+carries no comments; its environment variables, GPU split, deliberate vLLM
+flags, ports and healthchecks are documented in §5.7 of
+[`docs/OFFLINE_DEPLOYMENT.md`](docs/OFFLINE_DEPLOYMENT.md).
+
+**vLLM 0.13.0 cannot load a Gemma 3 checkpoint written by Transformers 4.57.**
+It exits before loading weights with `rope_parameters should have a 'rope_type'
+key`. Serve a config overlay instead — it hardlinks the weights and rewrites
+`config.json` only:
 
 ```bash
-uv run python scripts/sync_api_vendored.py          # after editing either root module
+python scripts/vllm_rope_shim.py <merge> <merge>-vllm
+```
+
+vLLM serves the **merged** checkpoint that `scripts/merge_lora_adapter.py`
+writes, so no `--enable-lora` and no adapter loading at serve time:
+
+```bash
+docker compose run --rm trainer python scripts/merge_lora_adapter.py \
+  outputs/sft_final /models/translategemma-12b-merged
+```
+
+A 12B merge is ~24 GB in bf16. When it has to share a GPU with another model,
+quantise it to FP8 **after** the merge — merging into quantised weights rounds
+the adapter delta away:
+
+```bash
+docker compose build quantizer                      # once, needs network
+docker compose run --rm quantizer \
+  /models/translategemma-12b-merged /models/translategemma-12b-merged-fp8
+```
+
+FP8_DYNAMIC needs no calibration corpus, which is why it is preferred here over
+4-bit AWQ/GPTQ: a general-purpose calibration set biases a domain-fine-tuned
+model away from its domain. The script refuses an adapter directory or an
+already-quantised input, and fails rather than write an output whose stop set
+has lost `<end_of_turn>` (106).
+
+The quantiser is a separate image because no llm-compressor release installs
+against this repository's lock — every version needs either `transformers`
+below 4.57.6, `transformers` v5, or `torch` 2.9+. It is built from the vLLM
+image instead, which already carries the torch llm-compressor wants. The
+tokenizer and chat template are **copied** into the FP8 directory rather than
+re-saved, so the other transformers version cannot rewrite them.
+
+The gateway reproduces the generation contract of `evaluate_translations.py`
+exactly — it renders prompts locally and sends **token ids** to vLLM's
+`/v1/completions`, with the resolved stop set on every request — so a served
+translation is the translation the harness scored. That requires a copy of
+`prompting.py` inside `api/`, kept byte-identical from here:
+
+```bash
+uv run python scripts/sync_api_vendored.py          # after editing the root module
 uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift; also a test
 ```
 
-`TG_MODEL_MODE` selects what the service loads: the base model, the adapter, or
-both at once (one copy of the weights, adapter toggled per request), so a caller
-can query either system live.
-
-### vLLM serving
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model google/translategemma-12b-it \
-  --enable-lora \
-  --lora-modules farsi-science=path/to/final_adapter \
-  --max-lora-rank 64 \
-  --host 0.0.0.0 \
-  --port 8000
-```
+`TG_MODEL_MODE` names which system the upstream answers as, so `/model-info` and
+the per-request `system` field keep attributing a translation to a checkpoint.

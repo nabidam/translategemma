@@ -1,0 +1,168 @@
+x-gpu-device: &gpu-device
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["${GPU_DEVICE_ID:-0}"]
+          capabilities: [gpu]
+
+services:
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-fundamental}
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - ./mysql/config/initdb:/docker-entrypoint-initdb.d
+      - mysqldb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  backend:
+    image: translator-server:latest
+    container_name: backend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend/config/application.properties:/app/config/application.properties
+    environment:
+      - SPRING_CONFIG_LOCATION=file:/app/config/application.properties
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: root
+      PMA_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    ports:
+      - "7070:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  translategemma-vllm:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: translategemma-vllm
+    restart: unless-stopped
+    ports:
+      - "7073:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to a rope overlay built by scripts/vllm_rope_shim.py -- see section 5.7 of docs/OFFLINE_DEPLOYMENT.md}:/merged:ro
+      - /mnt/d/wsl/.cache/huggingface:/root/.cache/huggingface
+    entrypoint: ["vllm", "serve"]
+    command: >
+      /merged
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name ${SERVED_TG_MODEL_NAME:-translategemma}
+      --tensor-parallel-size 1
+      --gpu-memory-utilization ${TG_GPU_MEMORY_UTILIZATION:-0.55}
+      --max-model-len ${TG_MAX_MODEL_LEN:-8192}
+      --dtype ${TG_DTYPE:-bfloat16}
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    deploy: *gpu-device
+    ipc: host
+
+  translategemma-api:
+    image: translategemma-api:latest
+    container_name: translategemma-api
+    restart: unless-stopped
+    env_file:
+      - ./translategemma/.env
+    ports:
+      - "8888:8000"
+    volumes:
+      - ${TG_MERGED_MODEL_DIR:?set TG_MERGED_MODEL_DIR to a rope overlay built by scripts/vllm_rope_shim.py -- see section 5.7 of docs/OFFLINE_DEPLOYMENT.md}:/merged:ro
+      - /mnt/d/wsl/.cache/huggingface:/models:ro
+    environment:
+      TG_VLLM_BASE_URL: http://translategemma-vllm:8000/v1
+      TG_VLLM_MODEL: ${SERVED_TG_MODEL_NAME:-translategemma}
+      TG_BASE_MODEL_ID: /merged
+      TG_MODEL_MODE: adapter
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'OK' in urllib.request.urlopen('http://localhost:8000/health-check').read() else 1)"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    depends_on:
+      translategemma-vllm:
+        condition: service_healthy
+
+  dots-ocr-vllm:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: dots-ocr-vllm
+    restart: unless-stopped
+    ports:
+      - "7071:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - /mnt/d/wsl/.cache/huggingface:/root/.cache/huggingface
+      - /mnt/d/wsl/projects/dotsmocr/weights/DotsMOCR:/workspace/weights
+    entrypoint: ["vllm", "serve"]
+    command: >
+      /workspace/weights
+      --host 0.0.0.0
+      --port 8000
+      --served-model-name ${SERVED_DOT_MODEL_NAME:-model}
+      --tensor-parallel-size 1
+      --gpu-memory-utilization ${DOTS_GPU_MEMORY_UTILIZATION:-0.30}
+      --chat-template-content-format string
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+    deploy: *gpu-device
+    ipc: host
+
+  dots-ocr-api:
+    image: dots-ocr-api:latest
+    container_name: dots-ocr-api
+    restart: unless-stopped
+    ports:
+      - "7072:8088"
+    env_file:
+      - ./dots-ocr-api/.env
+    volumes:
+      - ./dots-ocr-api/app:/app/app:ro
+      - ./dots-ocr-api/dots_ocr:/app/dots_ocr:ro
+      - ./dots-ocr-api/config.yaml:/app/config.yaml:ro
+      - ./dots-ocr-api/logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      dots-ocr-vllm:
+        condition: service_healthy
+
+volumes:
+  mysqldb:
