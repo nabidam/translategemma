@@ -78,7 +78,14 @@ x-gpu-device: &gpu-device
 # construction -- an A/B where one arm samples and the other is greedy compares
 # nothing. Greedy also makes the two arms emit the same text, which is what
 # makes their tokens/second directly comparable.
+#
+# Both spellings of "which system is served" are set. Arm B runs the
+# pre-refactor image, which reads TG_MODEL_MODE and TG_NUM_BEAMS; arm A's
+# gateway reads TG_SERVED_SYSTEM and has no beam search to configure. Each image
+# ignores the other's names (pydantic-settings extra="ignore"), so setting both
+# keeps one decoding block shared across two arms rather than forking it.
 x-decoding-env: &decoding-env
+  TG_SERVED_SYSTEM: adapter
   TG_MODEL_MODE: adapter
   TG_MAX_NEW_TOKENS: ${TG_MAX_NEW_TOKENS:-512}
   TG_DO_SAMPLE: "false"
@@ -222,8 +229,10 @@ services:
       # Where the checkpoint sits inside the /base mount; see x-base-mount.
       TG_BASE_MODEL_ID: ${TG_BASE_MODEL_PATH:-/base}
       TG_ADAPTER_PATH: /adapter
-      # Reported by /model-info on arm A, applied for real here. Kept equal to
-      # arm A's TG_DTYPE so the comparison is bf16 against bf16.
+      # Applied for real here: arm B loads the weights in-process. Kept equal
+      # to the --dtype arm A's vLLM is launched with, so the comparison is bf16
+      # against bf16. Arm A's gateway has no dtype setting of its own -- it
+      # loads no weights.
       TG_DTYPE: ${TG_DTYPE:-bfloat16}
       # sdpa is the portable default. flash_attention_3 needs the FA3 wheel in
       # the image and a Hopper card; changing it changes what is being measured,

@@ -3,7 +3,7 @@
 Answers two questions on the machine that actually serves the model:
 
 1. **How fast does this GPU generate?** Decode tokens/second and milliseconds
-   per decode step, swept across batch sizes, per loaded system.
+   per decode step, swept across batch sizes.
 2. **How long does a page of a document take?** Measured end to end, both as one
    whole-page request and as a sentence-split request, plus a words-per-minute
    figure that a non-engineer can act on.
@@ -17,9 +17,9 @@ no in-process transport any more: the API loads no weights, so a benchmark of
 rather than measure it.
 
 What is served comes from the environment, exactly as the API takes it: the
-benchmark reads ``Settings`` and measures each system in ``loaded_systems``, and
-cross-checks ``/model-info`` so a report cannot silently describe a different
-checkpoint from the one that answered.
+benchmark reads ``Settings`` for the served system and cross-checks
+``/model-info`` so a report cannot silently describe a different checkpoint from
+the one that answered.
 
 Token counts are approximate, and labelled as such wherever they are reported:
 the response carries text, not token ids, so output tokens are recovered by
@@ -258,10 +258,9 @@ class HttpRunner:
             "max_new_tokens": max_new_tokens,
             "split_sentences": split_sentences,
         }
-        if len(self.settings.loaded_systems) > 1:
-            # Only meaningful in "both" mode; sending it otherwise would 400 on a
-            # server whose single loaded system happens to be the other one.
-            payload["system"] = str(system)
+        # Sent as an assertion, not a selector: the server 400s if it is not the
+        # system it serves, so a report can never be attributed to the wrong one.
+        payload["system"] = str(system)
 
         started = time.perf_counter()
         response = self._client.post("/translate/batch", json=payload)
@@ -779,13 +778,9 @@ def _settings_summary(settings: Settings) -> dict:
         "base_model_id": settings.base_model_id,
         "vllm_base_url": settings.vllm_base_url,
         "vllm_model": settings.vllm_model,
-        "model_mode": str(settings.model_mode),
+        "served_system": str(settings.served_system),
         "adapter_path": settings.adapter_path,
-        "dtype": settings.dtype,
-        "attn_implementation": settings.attn_implementation,
-        "load_in_4bit": settings.load_in_4bit,
         "do_sample": settings.do_sample,
-        "num_beams": settings.num_beams,
         "server_batch_size": settings.batch_size,
         "server_max_new_tokens": settings.max_new_tokens,
         "source_lang": settings.source_lang,
@@ -798,8 +793,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Which systems are benchmarked follows TG_MODEL_MODE: base, adapter, or "
-            "both. Nothing here overrides what the server is configured to load."
+            "The system benchmarked is TG_SERVED_SYSTEM, the one the upstream vLLM "
+            "holds. Nothing here overrides what the server is configured to serve."
         ),
     )
     parser.add_argument(
@@ -837,14 +832,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--no-prefill-probe",
         action="store_true",
         help="Skip the max_new_tokens=1 probe; prefill and decode are then not separated.",
-    )
-    parser.add_argument(
-        "--systems",
-        default=None,
-        help=(
-            "Comma-separated subset of the loaded systems to benchmark "
-            "(base,adapter). Default: every system TG_MODEL_MODE loads."
-        ),
     )
     parser.add_argument("--skip-sweep", action="store_true", help="Only run the page benchmark.")
     parser.add_argument("--skip-page", action="store_true", help="Only run the throughput sweep.")
@@ -908,25 +895,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def resolve_systems(settings: Settings, requested: str | None) -> list[System]:
-    loaded = list(settings.loaded_systems)
-    if not requested:
-        return loaded
-    chosen = []
-    for name in (part.strip() for part in requested.split(",") if part.strip()):
-        try:
-            system = System(name)
-        except ValueError:
-            raise SystemExit(f"--systems: {name!r} is not a system (base|adapter).")
-        if system not in loaded:
-            raise SystemExit(
-                f"--systems: {name!r} is not loaded under TG_MODEL_MODE={settings.model_mode}. "
-                f"Loaded: {[str(item) for item in loaded]}."
-            )
-        chosen.append(system)
-    return chosen or loaded
-
-
 def load_tokenizer_only(settings: Settings):
     """The tokenizer the server renders prompts with, for token counts.
 
@@ -942,7 +910,8 @@ def load_tokenizer_only(settings: Settings):
 def main(argv=None) -> int:
     args = parse_args(argv)
     settings = get_settings()
-    systems = resolve_systems(settings, args.systems)
+    # One upstream holds one set of weights, so a run measures one system.
+    systems = [settings.served_system]
     batch_sizes = [int(part) for part in args.batch_sizes.split(",") if part.strip()]
     page_modes = [part.strip() for part in args.page_modes.split(",") if part.strip()]
     sweep_max_new_tokens = args.max_new_tokens or settings.max_new_tokens
@@ -984,7 +953,7 @@ def main(argv=None) -> int:
     environment = {
         "hostname": platform.node(),
         "python": platform.python_version(),
-        "systems_benchmarked": ", ".join(str(system) for system in systems),
+        "system_benchmarked": str(settings.served_system),
         **_settings_summary(settings),
     }
     tokenizer = None

@@ -814,13 +814,16 @@ together. It carries no comments by design — everything explaining it is here.
 
 #### Required environment
 
+Copy `.env.spadana.example` to `.env` beside the compose file; it is the
+annotated form of this table and of the gateway settings below it.
+
 | Variable | Meaning |
 | --- | --- |
 | `TG_MERGED_MODEL_DIR` | **A rope overlay built by `scripts/vllm_rope_shim.py`**, not the merge itself. See below. |
 | `GPU_DEVICE_ID` | Which physical device both vLLM servers divide. Default `0`. |
 | `TG_GPU_MEMORY_UTILIZATION` / `DOTS_GPU_MEMORY_UTILIZATION` | Fractions of **total** VRAM. Default `0.55` / `0.30`. |
 | `TG_MAX_MODEL_LEN` | KV-cache budget. Default `8192`. |
-| `TG_DTYPE` | Default `bfloat16`. |
+| `VLLM_DTYPE` | vLLM's `--dtype`. Default `bfloat16`. Not a gateway setting — the gateway loads no weights. |
 | `SERVED_TG_MODEL_NAME` / `SERVED_DOT_MODEL_NAME` | vLLM's `--served-model-name`; the gateway's `TG_VLLM_MODEL` must match. |
 | `MYSQL_ROOT_PASSWORD` / `MYSQL_DATABASE` | Default `root` / `fundamental`. |
 | `HUGGING_FACE_HUB_TOKEN` | Optional; both vLLM servers run with `HF_HUB_OFFLINE=1` anyway. |
@@ -916,12 +919,32 @@ numbers against `nvidia-smi` after the first successful start.
 - The gateway has no GPU reservation and no `PYTORCH_CUDA_ALLOC_CONF`: there is
   no torch in that image.
 
-#### Gateway configuration precedence
+#### Configuration lives in one file
 
-The gateway reads `./translategemma/.env` through `env_file`, but every wiring
-variable is also set under `environment:`, which Compose gives precedence. So the
-wiring lives in the compose file and the `.env` file carries only translation
-defaults.
+Everything — host paths, GPU fractions, gateway wiring, translation defaults —
+is in the `.env` **beside the compose file**. Copy `.env.spadana.example` to
+`.env` in the directory you run `docker compose` from. That single file does two
+jobs: Compose substitutes every `${NAME}` in the compose file from it, and the
+gateway service declares `env_file: .env`, so the same keys reach that process
+as its environment. Names it does not recognise are ignored, which is why the
+MySQL and vLLM keys can share the file.
+
+There is no second `.env` under `./translategemma/`. An earlier layout had one,
+with the wiring restated under `environment:` so the compose file won on
+precedence. That is exactly the arrangement that hides a mistake: a duplicate
+key drifts unnoticed for as long as the compose line exists, and takes over
+silently the moment it is removed. One key, one home.
+
+The single exception is `TG_VLLM_MODEL`, which stays under `environment:` as
+`${SERVED_TG_MODEL_NAME:-translategemma}`. It must equal vLLM's
+`--served-model-name`, which is built from that same variable; as two literals
+in a flat file the pair could drift, and a mismatch is a 404 from the upstream
+on every request.
+
+Note that container-internal paths (`TG_BASE_MODEL_ID=/merged`,
+`HF_HOME=/models`) and host paths (`TG_MERGED_MODEL_DIR`) both live in this
+file. They are not interchangeable: the first two must match the compose file's
+mount **targets**, the last is the mount **source**.
 
 `dots-ocr-api` keeps an `extra_hosts` entry for whatever in its own `.env` still
 points at the host. The service name `http://dots-ocr-vllm:8000/v1` is the better

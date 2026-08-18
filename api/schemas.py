@@ -14,9 +14,11 @@ class TranslationOptions(BaseModel):
     system: System | None = Field(
         default=None,
         description=(
-            "Which loaded system answers: 'base' or 'adapter'. Defaults to "
-            "TG_DEFAULT_SYSTEM. Only selectable when TG_MODEL_MODE=both; asking "
-            "for a system that is not loaded returns 400."
+            "Assert which system answers: 'base' or 'adapter'. A gateway fronts "
+            "one vLLM, which holds one set of weights, so this selects nothing "
+            "-- it fails the request with 400 when it disagrees with "
+            "TG_SERVED_SYSTEM, rather than silently answering as the other "
+            "system. Omit it to accept whatever this deployment serves."
         ),
     )
     source_lang: str | None = Field(
@@ -114,24 +116,26 @@ class HealthResponse(BaseModel):
 
 
 class ModelInfoResponse(BaseModel):
-    """What is actually loaded, so a translation can be attributed to a checkpoint."""
+    """What is actually served, so a translation can be attributed to a checkpoint.
+
+    Reports only what this process knows first-hand. How the upstream was loaded
+    (dtype, attention kernel, quantization) is vLLM's business and is not
+    restated here: a gateway-side copy of those flags could disagree with the
+    server that actually generated the text.
+    """
 
     base_model_id: str
-    model_mode: str
-    loaded_systems: list[System]
-    default_system: System
+    served_system: System
     adapter_path: str | None
-    dtype: str
-    attn_implementation: str
-    load_in_4bit: bool
-    device: str
-    # Per system, because the two are prompted differently on purpose.
-    use_training_rendering: dict[str, bool]
+    # The vLLM that generated the text, as "vllm:<base url>".
+    upstream: str
+    # Which rendering served_system is queried with -- the pair is prompted
+    # differently on purpose (see prompting.py).
+    use_training_rendering: bool
     stop_token_ids: list[int]
     stop_tokens: list[str]
     default_source_lang: str
     default_target_lang: str
     max_new_tokens: int
     do_sample: bool
-    num_beams: int
     batch_size: int

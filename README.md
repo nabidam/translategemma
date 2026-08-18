@@ -430,5 +430,7 @@ uv run python scripts/sync_api_vendored.py          # after editing the root mod
 uv run python scripts/sync_api_vendored.py --check  # exit 1 on drift; also a test
 ```
 
-`TG_MODEL_MODE` names which system the upstream answers as, so `/model-info` and
-the per-request `system` field keep attributing a translation to a checkpoint.
+`TG_SERVED_SYSTEM` names which system the upstream answers as, so `/model-info`
+and the per-request `system` field keep attributing a translation to a
+checkpoint. One vLLM serves one system; comparing base against adapter means
+running a gateway and a vLLM per system.

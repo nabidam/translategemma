@@ -45,7 +45,6 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await engine.aclose()
-        engine.unload()
 
 
 app = FastAPI(
@@ -87,13 +86,18 @@ class ResolvedOptions:
 
 
 def _resolve(options, settings: Settings) -> ResolvedOptions:
-    """Apply server defaults to a request, rejecting an unavailable system."""
-    system = options.system or settings.default_system
-    if system not in settings.loaded_systems:
+    """Apply server defaults to a request, rejecting a system this upstream is not.
+
+    `system` is an assertion, not a selector: one vLLM serves one set of weights.
+    A caller that names the other one is asking for a checkpoint this deployment
+    cannot produce, and gets a 400 rather than a translation from the wrong one.
+    """
+    system = options.system or settings.served_system
+    if system is not settings.served_system:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"System {system!r} is not loaded (TG_MODEL_MODE={settings.model_mode}). "
-            f"Available: {[str(name) for name in settings.loaded_systems]}.",
+            f"System {system!r} is not served here: this gateway fronts the "
+            f"{settings.served_system!s} system (TG_SERVED_SYSTEM).",
         )
     return ResolvedOptions(
         system=system,
@@ -126,7 +130,7 @@ async def health_check(
 ):
     """Prove the decoder still produces text, not just that the process is up."""
     resolved = ResolvedOptions(
-        system=settings.default_system,
+        system=settings.served_system,
         source_lang=settings.source_lang,
         target_lang=settings.target_lang,
         max_new_tokens=16,
@@ -148,25 +152,16 @@ async def model_info(
     tokenizer = engine.processor.tokenizer
     return ModelInfoResponse(
         base_model_id=settings.base_model_id,
-        model_mode=str(settings.model_mode),
-        loaded_systems=list(settings.loaded_systems),
-        default_system=settings.default_system,
+        served_system=settings.served_system,
         adapter_path=settings.adapter_path,
-        dtype=settings.dtype,
-        attn_implementation=settings.attn_implementation,
-        load_in_4bit=settings.load_in_4bit,
-        device=str(engine.device),
-        use_training_rendering={
-            str(system): settings.use_training_rendering(system)
-            for system in settings.loaded_systems
-        },
+        upstream=engine.upstream,
+        use_training_rendering=settings.use_training_rendering(settings.served_system),
         stop_token_ids=engine.stop_token_ids,
         stop_tokens=tokenizer.convert_ids_to_tokens(engine.stop_token_ids),
         default_source_lang=settings.source_lang,
         default_target_lang=settings.target_lang,
         max_new_tokens=settings.max_new_tokens,
         do_sample=settings.do_sample,
-        num_beams=settings.num_beams,
         batch_size=settings.batch_size,
     )
 

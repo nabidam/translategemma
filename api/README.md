@@ -76,9 +76,9 @@ generation itself now happens in vLLM:
   signature of an unstopped decoder, so trimming it in the gateway would hide a
   regression.
 
-`TG_NUM_BEAMS` is the one setting that no longer applies: the vLLM completions
-API has no beam search. A value above 1 logs a warning at startup and is
-ignored.
+Beam search is gone with the in-process engine: the vLLM completions API has no
+equivalent, so there is no `TG_NUM_BEAMS` to set. Greedy and sampling are the
+two decodings this gateway can ask for.
 
 ### Where the old `model_loading.py` configs went
 
@@ -100,33 +100,31 @@ them; for a checkpoint merged elsewhere they are whatever it shipped. Sending
 the whole set makes the served decoding independent of that. Do not pass
 `--generation-config vllm`: it discards the file, and with it the stop set.
 
-## Model modes
+## Which system is served
 
-`TG_MODEL_MODE` names which system the upstream answers as, and therefore what
-a request may ask for:
+One vLLM holds one set of weights, so one gateway serves exactly one system.
+`TG_SERVED_SYSTEM` states which it is:
 
-| Mode      | The upstream serves                     | `system` selectable per request  |
-| --------- | --------------------------------------- | -------------------------------- |
-| `base`    | an untouched checkpoint                 | no — always `base`               |
-| `adapter` | a merged or adapted checkpoint (default) | no — always `adapter`            |
-| `both`    | (needs two upstreams; not wired up)     | yes — `"system": "base"\|"adapter"` |
+| Value               | The upstream holds                            |
+| ------------------- | --------------------------------------------- |
+| `adapter` (default) | a merged or adapted checkpoint                |
+| `base`              | an untouched upstream checkpoint              |
 
-With one vLLM upstream, one system is served — `adapter` for a merged
-checkpoint, which is the deployment this compose file describes. `both` now
-requires two upstreams and is not wired up; asking for a system that is not
-loaded still returns 400 rather than silently answering as the other one.
+This is not cosmetic. It selects the prompt rendering: the adapter is queried
+after the SFT rendering, the base model after the generation prompt, and using
+one for the other is silent — generation still returns fluent Farsi from a
+prefix the model never saw. Override the pairing only when serving **merged**
+weights labelled as the base system: `TG_BASE_USE_TRAINING_RENDERING=true`.
 
-Each system is prompted the way it was trained — the adapter after the SFT
-rendering, the base model after the generation prompt. Override only when
-serving **merged** weights as the base system:
-`TG_BASE_USE_TRAINING_RENDERING=true`.
+To compare base against adapter, run a gateway and a vLLM per system. There is
+no in-process adapter toggle: the weights are not in this process.
 
 ## Endpoints
 
 | Method | Path               | Purpose                                                   |
 | ------ | ------------------ | --------------------------------------------------------- |
 | GET    | `/health-check`    | Runs a real translation. `{"translator": "OK"\|"FAIL"}`.   |
-| GET    | `/model-info`      | Checkpoint, adapter, mode, upstream, resolved stop tokens. |
+| GET    | `/model-info`      | Checkpoint, adapter, served system, upstream, stop tokens. |
 | POST   | `/translate`       | One text in, one translation out.                          |
 | POST   | `/translate/batch` | Many texts, dispatched concurrently to vLLM.               |
 
@@ -138,10 +136,11 @@ curl -s localhost:8000/translate -H 'content-type: application/json' -d '{
 }'
 # {"translation":"...","system":"adapter","source_lang":"en","target_lang":"fa"}
 
-# Every option is optional; "system" requires TG_MODEL_MODE=both.
+# Every option is optional. "system" is an assertion, not a selector: it 400s
+# when it disagrees with TG_SERVED_SYSTEM instead of answering as the other one.
 curl -s localhost:8000/translate/batch -H 'content-type: application/json' -d '{
   "texts": ["First segment.", "Second segment."],
-  "system": "base",
+  "system": "adapter",
   "source_lang": "en",
   "target_lang": "fa",
   "max_new_tokens": 256,
@@ -149,8 +148,8 @@ curl -s localhost:8000/translate/batch -H 'content-type: application/json' -d '{
 }'
 ```
 
-Asking for a system that is not loaded returns 400 with the available list,
-rather than silently answering as the other one.
+Naming a system this upstream does not serve returns 400 naming the one it
+does, rather than silently answering as the other one.
 
 ## Configuration
 
@@ -166,14 +165,16 @@ annotated list. The ones that decide what is served:
 | `TG_MAX_CONCURRENT_REQUESTS` | `32`                                       | In-flight upstream requests across all callers.                        |
 | `TG_BASE_MODEL_ID`           | `google/translategemma-12b-it`             | The checkpoint vLLM serves. Read locally for the tokenizer only.       |
 | `TG_TOKENIZER_PATH`          | `TG_BASE_MODEL_ID`                         | Override when the tokenizer does not live with the checkpoint.         |
-| `TG_MODEL_MODE`              | `adapter`                                  | `base` / `adapter` / `both`; one upstream serves one system.           |
+| `TG_SERVED_SYSTEM`           | `adapter`                                  | `base` or `adapter`; which system the upstream weights are.            |
 | `TG_ADAPTER_PATH`            | unset                                      | Provenance only — merged weights already contain the adapter.          |
-| `TG_DEFAULT_SYSTEM`          | the loaded one, else `adapter`             | Answers requests that do not name a system.                            |
 | `TG_BATCH_SIZE`              | `8`                                        | Prompts per upstream request. vLLM does the GPU batching.              |
 | `TG_SPLIT_SENTENCES`         | `false`                                    | pysbd splitting; also settable per request.                            |
 
-`TG_DTYPE`, `TG_ATTN_IMPLEMENTATION` and `TG_LOAD_IN_4BIT` describe how vLLM was
-launched and are reported by `/model-info`; nothing here applies them.
+How the upstream was loaded — dtype, attention kernel, quantization — is
+configured on the vLLM service (`--dtype`, and the flags beside it in
+`docker-compose.yml`) and is deliberately **not** mirrored here. A gateway-side
+copy of those flags would be a claim nothing verifies, and `/model-info` would
+report it even after the upstream was relaunched differently.
 
 A `TG_BASE_MODEL_ID` that does not resolve to a checkpoint directory fails at
 startup rather than on the first request.

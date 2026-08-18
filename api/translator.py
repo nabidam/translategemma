@@ -143,12 +143,9 @@ class TranslationEngine:
         )
 
         processor = load_processor(tokenizer_path)
-        # Kept for parity with the batched-generation path this replaced: the
-        # ids are produced here and padded by vLLM, but a tokenizer with no pad
-        # token still breaks any batched call made through it.
-        processor.tokenizer.padding_side = "left"
-        if processor.tokenizer.pad_token_id is None:
-            processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+        # No padding configuration: prompts are tokenized one rendering at a
+        # time and padded by vLLM, so this tokenizer is never asked to build a
+        # padded batch.
 
         # Resolved locally and sent on every request: a stop set configured on
         # the vLLM side, or inherited from a config.json, must not be able to
@@ -161,13 +158,6 @@ class TranslationEngine:
             processor.tokenizer.convert_ids_to_tokens(self.stop_token_ids),
             self.stop_token_ids,
         )
-        if settings.num_beams > 1:
-            logger.warning(
-                "TG_NUM_BEAMS=%s is ignored: the vLLM completions API has no beam search. "
-                "Generation runs with num_beams=1.",
-                settings.num_beams,
-            )
-
         headers = {"Content-Type": "application/json"}
         if settings.vllm_api_key:
             headers["Authorization"] = f"Bearer {settings.vllm_api_key}"
@@ -185,11 +175,10 @@ class TranslationEngine:
         self.processor = processor
 
     async def aclose(self):
+        """Release the upstream client. There are no weights to free."""
         if self._client is not None:
             await self._client.aclose()
             self._client = None
-
-    def unload(self):
         self.processor = None
 
     @property
@@ -197,8 +186,8 @@ class TranslationEngine:
         return self.processor is not None and self._client is not None
 
     @property
-    def device(self) -> str:
-        """What answered the request, in the shape /model-info reports."""
+    def upstream(self) -> str:
+        """Which vLLM answered the request, in the shape /model-info reports."""
         return f"vllm:{self.settings.vllm_base_url}"
 
     # ------------------------------------------------------------- translate
@@ -221,8 +210,11 @@ class TranslationEngine:
         """
         if not self.is_loaded:
             raise RuntimeError("Gateway is not ready.")
-        if system not in self.settings.loaded_systems:
-            raise ValueError(f"System {system!r} is not loaded.")
+        if system is not self.settings.served_system:
+            raise ValueError(
+                f"System {system!r} is not what this upstream serves "
+                f"({self.settings.served_system})."
+            )
 
         if split_sentences:
             segments_per_text = [self.splitter.split(text, source_lang) for text in texts]
