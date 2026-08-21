@@ -8,12 +8,12 @@ CANONICAL = "توجه چندپرسشی"
 VARIANT = "توجه چندگانه"
 
 
-def span(source="multi-query attention", target=CANONICAL, aliases=(), forbidden=()):
+def span(source="multi-query attention", target=CANONICAL, aliases=(), forbidden=(), entry_id=1):
     return Span(
         start=0,
         end=len(source),
         term=Term(
-            entry_id=1,
+            entry_id=entry_id,
             source_term=source,
             target_term=target,
             target_mode="preferred",
@@ -88,3 +88,42 @@ def test_forbidden_rendering_is_reported_even_when_the_term_is_missing():
 
 def test_no_spans_produces_an_empty_report_and_the_original_text():
     assert apply_preferred("unchanged", []) == ("unchanged", Report.empty())
+
+
+def test_overlapping_aliases_of_the_same_term_do_not_corrupt_the_result():
+    # An administrator adds both a long and a short variant of the same term.
+    # SHORT is a suffix of LONG, so both match the same occurrence in the
+    # output and their ranges overlap. Applying both edits (rather than only
+    # the longest, non-overlapping one) splices the replacement into itself.
+    short_variant = "چندگانه"
+    assert short_variant in VARIANT  # the overlap this test relies on
+    text = f"مدل {VARIANT} است."
+    result, report = apply_preferred(text, [span(aliases=[VARIANT, short_variant])])
+    assert result == f"مدل {CANONICAL} است."
+    assert report.applied[0].count == 1
+
+
+def test_overlapping_aliases_of_different_terms_do_not_corrupt_the_result():
+    # Two distinct glossary entries whose aliases happen to overlap in the
+    # model's output -- neither contains the other, they share a middle
+    # section, the same shape as "AB"/"BC" overlapping in "ABC". The longer
+    # match wins the overlap and is applied; the shorter one's hit is
+    # claimed by the winner, so that term has nothing applied and is
+    # reported as a miss instead of a phantom zero-effect success.
+    alias_a = VARIANT[0:8]  # "توجه چند"
+    alias_b = VARIANT[5:12]  # "چندگانه" -- overlaps alias_a at "چند"
+    assert alias_a != alias_b and alias_a not in alias_b and alias_b not in alias_a
+    text = f"مدل {VARIANT} است."
+    result, report = apply_preferred(
+        text,
+        [
+            span(source="term1", target="X", aliases=[alias_a], entry_id=1),
+            span(source="term2", target="Y", aliases=[alias_b], entry_id=2),
+        ],
+    )
+    assert "X" in result and "Y" not in result
+    assert VARIANT not in result
+    applied_sources = {a.source_term: a.count for a in report.applied}
+    miss_sources = {m.source_term for m in report.misses}
+    assert applied_sources == {"term1": 1}
+    assert miss_sources == {"term2"}

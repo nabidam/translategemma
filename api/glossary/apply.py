@@ -15,7 +15,7 @@ else in the translation is normalized as a side effect.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .matcher import Span
+from .matcher import Span, Term
 from .normalize import fold_target
 
 
@@ -80,15 +80,22 @@ def apply_preferred(
         return translation, Report.empty()
 
     folded, offsets = fold_target(translation)
-    applied: list[Applied] = []
     misses: list[Miss] = []
     violations: list[Violation] = []
-    # (start, end) in the ORIGINAL string -> replacement. Collected first and
-    # applied right-to-left so earlier edits cannot shift later offsets.
-    edits: list[tuple[int, int, str]] = []
 
-    # One entry may match several source spans; each entry is judged once.
+    # One entry may match several source spans; each entry is judged once, in
+    # first-seen order.
     seen: set[int] = set()
+    candidate_terms: list[Term] = []
+    canonical_counts: dict[int, int] = {}
+    # Alias hits from every term, pooled together: a hit from one term's alias
+    # can overlap a hit from another term's alias in the model's output (e.g.
+    # one entry's alias is a substring of a different entry's alias), and that
+    # is exactly as capable of corrupting the result as two aliases of the
+    # same term overlapping. Both need the same overlap resolution, so both
+    # are resolved in one pool rather than per term.
+    alias_candidates: list[tuple[int, int, Term]] = []
+
     for span in spans:
         term = span.term
         if term.entry_id in seen:
@@ -100,23 +107,57 @@ def apply_preferred(
                 violations.append(Violation(source_term=term.source_term, forbidden=forbidden))
 
         canonical_hits = _find_all(folded, term.target_term)
-        alias_hits: list[tuple[int, int]] = []
+        term_alias_hits = []
         for alias in term.aliases:
-            alias_hits.extend(_find_all(folded, alias))
+            term_alias_hits.extend(_find_all(folded, alias))
 
-        if not canonical_hits and not alias_hits:
+        if not canonical_hits and not term_alias_hits:
             misses.append(Miss(source_term=term.source_term, reason="target_not_found"))
             continue
 
-        for start, end in alias_hits:
-            edits.append((offsets[start], offsets[end - 1] + 1, term.target_term))
+        candidate_terms.append(term)
+        canonical_counts[term.entry_id] = len(canonical_hits)
+        for start, end in term_alias_hits:
+            alias_candidates.append((start, end, term))
 
+    # Resolve overlaps across ALL pooled alias hits with the same greedy
+    # longest-first claim loop matcher.find_spans uses for source spans:
+    # longest match wins, then higher priority, then leftmost; anything the
+    # winner overlaps is dropped rather than also rewritten, which is what
+    # would corrupt the string (e.g. "AB" and "BC" both claiming the "B" in
+    # "ABC").
+    alias_candidates.sort(key=lambda c: (-(c[1] - c[0]), -c[2].priority, c[0]))
+    claimed: list[tuple[int, int, Term]] = []
+    for start, end, term in alias_candidates:
+        if any(start < c_end and c_start < end for c_start, c_end, _ in claimed):
+            continue
+        claimed.append((start, end, term))
+
+    # (start, end) in the ORIGINAL string -> replacement. Collected first and
+    # applied right-to-left so earlier edits cannot shift later offsets.
+    edits: list[tuple[int, int, str]] = []
+    claimed_counts: dict[int, int] = {}
+    for start, end, term in claimed:
+        claimed_counts[term.entry_id] = claimed_counts.get(term.entry_id, 0) + 1
+        edits.append((offsets[start], offsets[end - 1] + 1, term.target_term))
+
+    applied: list[Applied] = []
+    for term in candidate_terms:
+        # count reflects what was actually applied: canonical hits plus only
+        # the alias hits that survived overlap resolution. A term whose sole
+        # alias hit was dropped because another term's hit claimed the same
+        # text is not "applied" -- nothing was rewritten for it -- so it is
+        # reported as a miss rather than as a zero-effect success.
+        count = canonical_counts[term.entry_id] + claimed_counts.get(term.entry_id, 0)
+        if count == 0:
+            misses.append(Miss(source_term=term.source_term, reason="target_not_found"))
+            continue
         applied.append(
             Applied(
                 source_term=term.source_term,
                 target_term=term.target_term,
                 mode=term.target_mode,
-                count=len(canonical_hits) + len(alias_hits),
+                count=count,
             )
         )
 
