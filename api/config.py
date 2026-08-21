@@ -134,6 +134,25 @@ class Settings(BaseSettings):
     # useful for long free text, off-distribution for short ones.
     split_sentences: bool = False
 
+    # --- Glossary (optional feature, off by default) ----------------------
+    # The kill switch. False means the glossary is not merely bypassed but
+    # absent: no database is opened, no admin router is mounted, and the token
+    # ids posted to vLLM are identical to those of a build without this
+    # feature. A terminology problem in production is one variable and a
+    # restart away from being gone.
+    glossary_enabled: bool = False
+    glossary_db_url: str = "sqlite+aiosqlite:///./data/glossary.db"
+    # The whole authorization boundary for the admin routes. No default: a
+    # guessable default key on a write endpoint is worse than no feature.
+    admin_api_key: str | None = None
+    # Applied when a request omits `domain`. Lets a single-field deployment pin
+    # its termbase without teaching callers the concept exists.
+    glossary_default_domain: str | None = None
+    # What to do with a domain name that does not exist. "reject" surfaces a
+    # caller's typo as a 404; "fallback" quietly uses the global layer.
+    glossary_unknown_domain: str = "reject"
+    terminology_mode: str = "enforce"
+
     # --- CORS -------------------------------------------------------------
     # Origins permitted by CORSMiddleware. Comma-separated string or JSON list
     # in environment variable (e.g. TG_CORS_ORIGINS="http://localhost:3000,http://localhost:8000").
@@ -143,7 +162,14 @@ class Settings(BaseSettings):
     cors_allow_methods: list[str] | str = ["*"]
     cors_allow_headers: list[str] | str = ["*"]
 
-    @field_validator("adapter_path", "tokenizer_path", "vllm_api_key", mode="before")
+    @field_validator(
+        "adapter_path",
+        "tokenizer_path",
+        "vllm_api_key",
+        "admin_api_key",
+        "glossary_default_domain",
+        mode="before",
+    )
     @classmethod
     def _convert_empty_str_to_none(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
@@ -187,6 +213,17 @@ class Settings(BaseSettings):
                 self.tokenizer_path, "TG_TOKENIZER_PATH"
             )
         self.vllm_base_url = self.vllm_base_url.rstrip("/")
+        if self.glossary_enabled and not self.admin_api_key:
+            raise ValueError(
+                "TG_GLOSSARY_ENABLED is true but TG_ADMIN_API_KEY is unset. The admin "
+                "routes would be the only unauthenticated write surface on this "
+                "gateway. Set a key or disable the glossary."
+            )
+        if self.glossary_unknown_domain not in ("reject", "fallback"):
+            raise ValueError(
+                f"TG_GLOSSARY_UNKNOWN_DOMAIN must be 'reject' or 'fallback'; "
+                f"got {self.glossary_unknown_domain!r}."
+            )
         return self
 
     @property

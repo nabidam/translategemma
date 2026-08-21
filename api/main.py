@@ -154,6 +154,7 @@ async def model_info(
         base_model_id=settings.base_model_id,
         served_system=settings.served_system,
         adapter_path=settings.adapter_path,
+        glossary_enabled=settings.glossary_enabled,
         upstream=engine.upstream,
         use_training_rendering=settings.use_training_rendering(settings.served_system),
         stop_token_ids=engine.stop_token_ids,

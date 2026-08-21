@@ -127,6 +127,9 @@ class ModelInfoResponse(BaseModel):
     base_model_id: str
     served_system: System
     adapter_path: str | None
+    # Whether the termbase is active on this deployment, so its state is
+    # observable without reading the container's environment.
+    glossary_enabled: bool
     # The vLLM that generated the text, as "vllm:<base url>".
     upstream: str
     # Which rendering served_system is queried with -- the pair is prompted
