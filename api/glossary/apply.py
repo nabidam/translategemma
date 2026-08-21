@@ -15,7 +15,7 @@ else in the translation is normalized as a side effect.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .matcher import Span, Term
+from .matcher import Span, Term, resolve_overlaps
 from .normalize import fold_target
 
 
@@ -67,6 +67,24 @@ def _find_all(folded_haystack: str, needle: str) -> list[tuple[int, int]]:
     return found
 
 
+@dataclass(frozen=True)
+class _Occupant:
+    """A range in the folded translation that some term lays claim to.
+
+    A canonical hit is already correct text -- it produces no edit, but it
+    still has to occupy its range in the SAME overlap-resolution pool as
+    alias hits. Without that, a competing alias edit that overlaps a
+    canonical range would win by default and splice over already-correct
+    text, corrupting the output while the canonical term is still reported
+    as successfully applied.
+    """
+
+    start: int
+    end: int
+    term: Term
+    is_edit: bool  # True: an alias hit, needs rewriting. False: a canonical hit, already correct.
+
+
 def apply_preferred(
     translation: str, spans: Sequence[Span]
 ) -> tuple[str, Report]:
@@ -87,14 +105,16 @@ def apply_preferred(
     # first-seen order.
     seen: set[int] = set()
     candidate_terms: list[Term] = []
-    canonical_counts: dict[int, int] = {}
-    # Alias hits from every term, pooled together: a hit from one term's alias
-    # can overlap a hit from another term's alias in the model's output (e.g.
-    # one entry's alias is a substring of a different entry's alias), and that
-    # is exactly as capable of corrupting the result as two aliases of the
-    # same term overlapping. Both need the same overlap resolution, so both
-    # are resolved in one pool rather than per term.
-    alias_candidates: list[tuple[int, int, Term]] = []
+    # Canonical hits (already correct, no edit needed) and alias hits (need
+    # rewriting) from every term, pooled together into one set of ranges
+    # competing for the same text. A hit from one term -- canonical or alias
+    # -- can overlap a hit from a different term (or a different alias of the
+    # SAME term) in the model's output: one entry's alias can be a substring
+    # of another's alias, or an alias can overlap where a different term's
+    # canonical text already sits. All of that is equally capable of
+    # corrupting the result if both were edited/counted independently, so all
+    # of it is resolved in one pool rather than per term or per kind.
+    occupants: list[_Occupant] = []
 
     for span in spans:
         term = span.term
@@ -116,41 +136,48 @@ def apply_preferred(
             continue
 
         candidate_terms.append(term)
-        canonical_counts[term.entry_id] = len(canonical_hits)
+        for start, end in canonical_hits:
+            occupants.append(_Occupant(start=start, end=end, term=term, is_edit=False))
         for start, end in term_alias_hits:
-            alias_candidates.append((start, end, term))
+            occupants.append(_Occupant(start=start, end=end, term=term, is_edit=True))
 
-    # Resolve overlaps across ALL pooled alias hits with the same greedy
+    # Resolve overlaps across ALL pooled occupants with the same greedy
     # longest-first claim loop matcher.find_spans uses for source spans:
     # longest match wins, then higher priority, then leftmost; anything the
-    # winner overlaps is dropped rather than also rewritten, which is what
-    # would corrupt the string (e.g. "AB" and "BC" both claiming the "B" in
-    # "ABC").
-    alias_candidates.sort(key=lambda c: (-(c[1] - c[0]), -c[2].priority, c[0]))
-    claimed: list[tuple[int, int, Term]] = []
-    for start, end, term in alias_candidates:
-        if any(start < c_end and c_start < end for c_start, c_end, _ in claimed):
-            continue
-        claimed.append((start, end, term))
+    # winner overlaps is dropped -- including a canonical range, which
+    # otherwise blocks nothing and lets an overlapping alias edit splice over
+    # already-correct text.
+    claimed = resolve_overlaps(
+        occupants,
+        start=lambda occupant: occupant.start,
+        end=lambda occupant: occupant.end,
+        priority=lambda occupant: occupant.term.priority,
+    )
 
     # (start, end) in the ORIGINAL string -> replacement. Collected first and
     # applied right-to-left so earlier edits cannot shift later offsets.
     edits: list[tuple[int, int, str]] = []
     claimed_counts: dict[int, int] = {}
-    for start, end, term in claimed:
-        claimed_counts[term.entry_id] = claimed_counts.get(term.entry_id, 0) + 1
-        edits.append((offsets[start], offsets[end - 1] + 1, term.target_term))
+    for occupant in claimed:
+        claimed_counts[occupant.term.entry_id] = claimed_counts.get(occupant.term.entry_id, 0) + 1
+        if occupant.is_edit:
+            edits.append(
+                (offsets[occupant.start], offsets[occupant.end - 1] + 1, occupant.term.target_term)
+            )
 
     applied: list[Applied] = []
     for term in candidate_terms:
-        # count reflects what was actually applied: canonical hits plus only
-        # the alias hits that survived overlap resolution. A term whose sole
-        # alias hit was dropped because another term's hit claimed the same
-        # text is not "applied" -- nothing was rewritten for it -- so it is
-        # reported as a miss rather than as a zero-effect success.
-        count = canonical_counts[term.entry_id] + claimed_counts.get(term.entry_id, 0)
+        # count reflects what was actually applied: only the canonical and
+        # alias occurrences that survived overlap resolution, not the raw
+        # pre-resolution tally. A term with real hits that all lost their
+        # claim to a competing term is not "applied" -- nothing of it
+        # survived in the output -- so it is reported as a miss instead of a
+        # zero-effect success, with a reason distinct from "never appeared at
+        # all": the text WAS there, it just lost to something else that
+        # occupied the same range.
+        count = claimed_counts.get(term.entry_id, 0)
         if count == 0:
-            misses.append(Miss(source_term=term.source_term, reason="target_not_found"))
+            misses.append(Miss(source_term=term.source_term, reason="claimed_by_overlap"))
             continue
         applied.append(
             Applied(

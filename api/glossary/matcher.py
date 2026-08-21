@@ -13,8 +13,9 @@ which is used.
 """
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 from .normalize import fold_source
 
@@ -23,6 +24,38 @@ from .normalize import fold_source
 # side of this deployment is English.
 _BOUNDARY_BEFORE = r"(?<![\w])"
 _BOUNDARY_AFTER = r"(?![\w])"
+
+_T = TypeVar("_T")
+
+
+def resolve_overlaps(
+    candidates: Sequence[_T],
+    start: Callable[[_T], int],
+    end: Callable[[_T], int],
+    priority: Callable[[_T], int],
+) -> list[_T]:
+    """Greedy longest-first overlap resolution, shared by every caller that
+    needs "claim a range, drop whatever it covers" semantics.
+
+    Sorts candidates longest span first, ties broken by higher priority then
+    leftmost position, then walks them claiming each one only if it does not
+    overlap a range already claimed. `find_spans` uses this to resolve
+    overlapping source-side term matches; `apply.apply_preferred` uses the
+    same function to resolve overlapping target-side edit and protected
+    ranges. One implementation instead of two: two copies of an overlap
+    resolver drift, and drift here means silent text corruption, not a
+    loud test failure.
+    """
+    ordered = sorted(
+        candidates,
+        key=lambda item: (-(end(item) - start(item)), -priority(item), start(item)),
+    )
+    claimed: list[_T] = []
+    for item in ordered:
+        if any(start(item) < end(other) and start(other) < end(item) for other in claimed):
+            continue
+        claimed.append(item)
+    return claimed
 
 
 @dataclass(frozen=True)
@@ -111,11 +144,11 @@ def find_spans(index: Index, text: str) -> list[Span]:
     # Resolve overlaps across the two patterns: longest first, then priority,
     # then leftmost. Claiming greedily in that order leaves the winner and drops
     # anything it covers.
-    candidates.sort(key=lambda span: (-(span.end - span.start), -span.term.priority, span.start))
-    claimed: list[Span] = []
-    for span in candidates:
-        if any(span.start < other.end and other.start < span.end for other in claimed):
-            continue
-        claimed.append(span)
+    claimed = resolve_overlaps(
+        candidates,
+        start=lambda span: span.start,
+        end=lambda span: span.end,
+        priority=lambda span: span.term.priority,
+    )
     claimed.sort(key=lambda span: span.start)
     return claimed

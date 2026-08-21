@@ -8,7 +8,14 @@ CANONICAL = "توجه چندپرسشی"
 VARIANT = "توجه چندگانه"
 
 
-def span(source="multi-query attention", target=CANONICAL, aliases=(), forbidden=(), entry_id=1):
+def span(
+    source="multi-query attention",
+    target=CANONICAL,
+    aliases=(),
+    forbidden=(),
+    entry_id=1,
+    priority=0,
+):
     return Span(
         start=0,
         end=len(source),
@@ -21,7 +28,7 @@ def span(source="multi-query attention", target=CANONICAL, aliases=(), forbidden
             forbidden=tuple(forbidden),
             case_sensitive=False,
             whole_word=True,
-            priority=0,
+            priority=priority,
         ),
     )
 
@@ -127,3 +134,44 @@ def test_overlapping_aliases_of_different_terms_do_not_corrupt_the_result():
     miss_sources = {m.source_term for m in report.misses}
     assert applied_sources == {"term1": 1}
     assert miss_sources == {"term2"}
+    # term2's alias text genuinely was in the output -- it just lost the
+    # overlap race to term1. That is a different, more specific fact than
+    # "never appeared at all", and the reason string an administrator reads
+    # in the misses report has to say which one actually happened.
+    assert [m.reason for m in report.misses] == ["claimed_by_overlap"]
+
+
+def test_alias_overlapping_a_different_terms_canonical_text_does_not_overwrite_it():
+    # term_a's canonical form is already present in the output. term_b's
+    # alias partially overlaps that same range -- neither contains the
+    # other, same "AB"/"BC" shape as the alias-vs-alias case above, except
+    # one side here is term_a's CANONICAL text rather than an alias. A
+    # canonical hit produces no edit of its own (the text is already
+    # correct), so unless it also claims its range in the overlap pool,
+    # term_b's alias edit is free to splice over term_a's already-correct
+    # text -- corrupting the output while term_a is still reported as
+    # successfully applied, computed before any edits happened.
+    #
+    # term_a is given higher priority so the outcome is deterministic
+    # (both ranges are 8 folded characters, so length alone would not
+    # separate them); priority is the documented tie-break both
+    # find_spans and apply_preferred use for exactly this situation.
+    canonical_tail = CANONICAL[5:13]  # "چندپرسشی", term_a's canonical text
+    overlapping_alias = CANONICAL[0:8]  # "توجه چند" -- overlaps at "چند"
+    assert overlapping_alias not in canonical_tail and canonical_tail not in overlapping_alias
+    text = f"مدل {CANONICAL} است."
+    result, report = apply_preferred(
+        text,
+        [
+            span(source="term_a", target=canonical_tail, aliases=[], entry_id=1, priority=10),
+            span(source="term_b", target="Z", aliases=[overlapping_alias], entry_id=2, priority=0),
+        ],
+    )
+    assert result == text
+    assert CANONICAL in result
+    assert "Z" not in result
+    applied_sources = {a.source_term: a.count for a in report.applied}
+    miss_sources = {m.source_term for m in report.misses}
+    assert applied_sources == {"term_a": 1}
+    assert miss_sources == {"term_b"}
+    assert [m.reason for m in report.misses] == ["claimed_by_overlap"]
