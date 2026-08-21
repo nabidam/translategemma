@@ -75,6 +75,23 @@ async def test_snapshots_are_cached_and_reload_replaces_them(service):
     assert await service.resolve("en", "fa", None) is not first
 
 
+async def test_version_reflects_reload_and_does_not_regress_on_resolve(service):
+    reloaded = await service.reload()
+    assert service.version == reloaded
+
+    # A write outside this reload cycle bumps the store's revision without
+    # the service knowing. resolve() must not adopt that newer number for
+    # a cache miss -- only reload() is allowed to move `version` forward,
+    # so an admin polling `version` between reloads sees a number that
+    # matches what the last reload actually served, never one implicitly
+    # advanced by an unrelated request.
+    await service.store.create_entry(
+        domain_name=None, src_lang="fr", tgt_lang="de", source_term="x", target_term="y"
+    )
+    await service.resolve("fr", "de", None)
+    assert service.version == reloaded
+
+
 async def test_plan_and_apply_round_trip(service):
     await service.store.create_entry(
         domain_name=None, src_lang="en", tgt_lang="fa",

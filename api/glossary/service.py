@@ -71,14 +71,21 @@ class GlossaryService:
             if self._unknown_domain == "fallback":
                 terms, version = await self.store.load_terms(src_lang, tgt_lang, None)
             else:
-                available = [row.name for row in await self.store.list_domains()]
+                available = [
+                    row.name for row in await self.store.list_domains() if row.enabled
+                ]
                 raise UnknownDomainError(name or "", available) from None
 
         index = build_index(terms, version)
         # Rebind rather than mutate: a concurrent reader either sees the old
         # dictionary or the new one, never a half-updated one.
         self._snapshots = {**self._snapshots, key: index}
-        self._version = version
+        # `self._version` is intentionally NOT set here. Two concurrent
+        # resolve() calls for different language pairs can race, and
+        # whichever reads the older revision last would otherwise move the
+        # counter backwards. The revision is a single global counter and
+        # every admin write path calls reload(), which reads it directly
+        # from the store -- so resolve() has nothing correct to add here.
         return index
 
     def plan(self, index: Index, text: str) -> list[Span]:
