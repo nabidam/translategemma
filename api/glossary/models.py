@@ -71,8 +71,8 @@ class Entry(Base):
     # Only 'preferred' is accepted until sentinel protection ships. The column
     # exists now so that phase is additive rather than a migration.
     target_mode: Mapped[str] = mapped_column(String(16), default="preferred")
-    aliases: Mapped[list] = mapped_column(JSON, default=list)
-    forbidden: Mapped[list] = mapped_column(JSON, default=list)
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    forbidden: Mapped[list[str]] = mapped_column(JSON, default=list)
     case_sensitive: Mapped[bool] = mapped_column(Boolean, default=False)
     whole_word: Mapped[bool] = mapped_column(Boolean, default=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)

@@ -1,7 +1,9 @@
 """Persistence, scoping and the layering of a domain over the global termbase."""
 
 import pytest
+from sqlalchemy import func, select
 
+from glossary.models import Entry
 from glossary.store import GlossaryStore
 
 
@@ -88,3 +90,72 @@ async def test_version_increases_on_every_write(store):
     )
     _, second = await store.load_terms("en", "fa", None)
     assert second > first
+
+
+async def test_deleting_a_domain_removes_its_entries(store):
+    await store.create_domain("medical", "en", "fa", None)
+    await store.create_entry(
+        domain_name="medical", src_lang="en", tgt_lang="fa", source_term="lesion", target_term="L"
+    )
+    assert await store.delete_domain("medical") is True
+    async with store._session() as session:
+        count = await session.scalar(select(func.count()).select_from(Entry))
+    assert count == 0
+
+
+async def test_deleting_a_nonexistent_domain_returns_false(store):
+    assert await store.delete_domain("nope") is False
+
+
+async def test_deleting_an_entry_removes_it(store):
+    entry = await store.create_entry(
+        domain_name=None, src_lang="en", tgt_lang="fa", source_term="genome", target_term="X"
+    )
+    assert await store.delete_entry(entry.id) is True
+    async with store._session() as session:
+        count = await session.scalar(select(func.count()).select_from(Entry))
+    assert count == 0
+
+
+async def test_deleting_a_nonexistent_entry_returns_false(store):
+    assert await store.delete_entry(999) is False
+
+
+async def test_deleting_a_nonexistent_domain_does_not_bump_the_version(store):
+    _, before = await store.load_terms("en", "fa", None)
+    await store.delete_domain("nope")
+    _, after = await store.load_terms("en", "fa", None)
+    assert after == before
+
+
+async def test_deleting_a_nonexistent_entry_does_not_bump_the_version(store):
+    _, before = await store.load_terms("en", "fa", None)
+    await store.delete_entry(999)
+    _, after = await store.load_terms("en", "fa", None)
+    assert after == before
+
+
+async def test_entries_differing_only_by_case_sensitivity_both_survive(store):
+    await store.create_entry(
+        domain_name=None, src_lang="en", tgt_lang="fa", source_term="Genome",
+        target_term="CS", case_sensitive=True,
+    )
+    await store.create_entry(
+        domain_name=None, src_lang="en", tgt_lang="fa", source_term="Genome",
+        target_term="CI", case_sensitive=False,
+    )
+    terms, _ = await store.load_terms("en", "fa", None)
+    assert sorted(term.target_term for term in terms) == ["CI", "CS"]
+
+
+async def test_domain_shadowing_still_holds_with_case_sensitivity_in_the_key(store):
+    await store.create_domain("medical", "en", "fa", None)
+    await store.create_entry(
+        domain_name=None, src_lang="en", tgt_lang="fa", source_term="culture", target_term="GLOBAL"
+    )
+    await store.create_entry(
+        domain_name="medical", src_lang="en", tgt_lang="fa", source_term="culture", target_term="DOMAIN"
+    )
+    terms, _ = await store.load_terms("en", "fa", "medical")
+    assert len(terms) == 1
+    assert terms[0].target_term == "DOMAIN"
