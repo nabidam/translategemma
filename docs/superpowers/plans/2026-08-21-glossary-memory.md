@@ -86,21 +86,18 @@ Phase 0 from the spec: the flag and its observability, with nothing behind it.
   `Settings.glossary_unknown_domain: str` (`"reject"` | `"fallback"`),
   `Settings.terminology_mode: str`. `ModelInfoResponse.glossary_enabled: bool`.
 
-- [ ] **Step 1: Add the dev dependency group**
+- [ ] **Step 1: Configure pytest**
 
-`pytest` is not currently declared. Add to `pyproject.toml` after
-`[project.optional-dependencies]`:
+The suite runs through `scripts/test_glossary.sh`, which already exists and
+supplies its own dependencies in an isolated environment. Do NOT add a
+`[dependency-groups]` table or otherwise touch the project's dependency
+declarations: the root project pins torch and CUDA wheels that this suite must
+never pull, and the installed uv is old enough that edits to that file are
+risky.
+
+Add only this to `pyproject.toml`:
 
 ```toml
-# Test-only. Not a runtime dependency of either the training stack or the
-# serving image; `uv run --group dev pytest` pulls it on demand.
-[dependency-groups]
-dev = [
-    "pytest>=8.0,<9.0",
-    "pytest-asyncio>=0.24,<1.0",
-    "httpx>=0.27,<1.0",
-]
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -166,7 +163,7 @@ def test_unknown_domain_policy_defaults_to_reject():
 
 - [ ] **Step 4: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_config.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_config.py -v`
 Expected: FAIL — `Settings` has no field `glossary_enabled`.
 
 - [ ] **Step 5: Add the settings**
@@ -226,7 +223,7 @@ Add to `_validate_and_resolve`, before `return self`:
 
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_config.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_config.py -v`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 7: Report the flag on /model-info**
@@ -320,7 +317,7 @@ def test_offsets_allow_slicing_the_original_by_a_folded_match():
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_normalize.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_normalize.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'glossary'`.
 
 - [ ] **Step 3: Implement normalization**
@@ -401,7 +398,7 @@ def fold_source(text: str, case_sensitive: bool) -> tuple[str, list[int]]:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_normalize.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_normalize.py -v`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
@@ -522,7 +519,7 @@ def test_an_empty_index_matches_nothing():
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_matcher.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_matcher.py -v`
 Expected: FAIL — no module `glossary.matcher`.
 
 - [ ] **Step 3: Implement the matcher**
@@ -655,7 +652,7 @@ def find_spans(index: Index, text: str) -> list[Span]:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_matcher.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_matcher.py -v`
 Expected: PASS, 10 tests.
 
 - [ ] **Step 5: Commit**
@@ -781,7 +778,7 @@ def test_no_spans_produces_an_empty_report_and_the_original_text():
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_apply.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_apply.py -v`
 Expected: FAIL — no module `glossary.apply`.
 
 - [ ] **Step 3: Implement application**
@@ -922,7 +919,7 @@ def apply_preferred(
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_apply.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_apply.py -v`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
@@ -1064,7 +1061,7 @@ async def test_version_increases_on_every_write(store):
 
 - [ ] **Step 3: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_store.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_store.py -v`
 Expected: FAIL — no module `glossary.store`.
 
 - [ ] **Step 4: Implement the models**
@@ -1350,7 +1347,7 @@ class GlossaryStore:
 
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_store.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_store.py -v`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 7: Commit**
@@ -1475,7 +1472,7 @@ async def test_plan_and_apply_round_trip(service):
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_service.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_service.py -v`
 Expected: FAIL — no module `glossary.service`.
 
 - [ ] **Step 3: Implement the service**
@@ -1575,7 +1572,7 @@ class GlossaryService:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_service.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_service.py -v`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
@@ -1699,7 +1696,7 @@ async def test_an_alias_in_the_output_is_rewritten_and_reported():
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_seam.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_seam.py -v`
 Expected: FAIL — cannot import `TranslationResult`.
 
 - [ ] **Step 3: Change the engine**
@@ -1798,7 +1795,7 @@ from glossary.matcher import find_spans
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_seam.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_seam.py -v`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Update the response schemas**
@@ -1986,8 +1983,6 @@ Replace the body of `translate_batch` after `resolved = _resolve(prompt, setting
     return response
 ```
 
-Update the `TranslationResponse` / `BatchTranslationResponse` imports in
-`api/main.py` to also import `GlossaryReport` from `schemas`.
 
 - [ ] **Step 7: Add the report converter**
 
@@ -2041,7 +2036,7 @@ def to_report(report: Report | None) -> GlossaryReport:
 
 - [ ] **Step 8: Run the whole suite**
 
-Run: `uv run --group dev pytest tests/ -v`
+Run: `scripts/test_glossary.sh tests/ -v`
 Expected: PASS, including the pre-existing tests.
 
 - [ ] **Step 9: Commit**
@@ -2196,7 +2191,7 @@ async def test_creating_a_domain_and_listing_it(client):
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --group dev pytest tests/test_glossary_admin.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_admin.py -v`
 Expected: FAIL — no module `glossary.router`.
 
 - [ ] **Step 3: Implement the router**
@@ -2219,7 +2214,7 @@ import secrets
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from .service import GlossaryService
+from .service import GlossaryService, UnknownDomainError
 
 # Entries matching one of these exactly are refused. Google ignores such
 # entries silently; refusing loudly is better, because an entry that is
@@ -2381,7 +2376,15 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
     @router.post("/dry-run")
     async def dry_run(payload: DryRunIn = Body(...)):
         """Show what would fire on this text. No model call, no side effects."""
-        index = await service.resolve(payload.src_lang, payload.tgt_lang, payload.domain)
+        try:
+            index = await service.resolve(payload.src_lang, payload.tgt_lang, payload.domain)
+        except UnknownDomainError as error:
+            # An endpoint whose whole purpose is catching mistakes before they
+            # reach traffic must not answer a typo'd domain with a 500.
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"Unknown glossary domain {error.name!r}. Available: {error.available}",
+            ) from error
         spans = service.plan(index, payload.text)
         return {
             "version": index.version,
@@ -2403,7 +2406,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `uv run --group dev pytest tests/test_glossary_admin.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_admin.py -v`
 Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Mount it conditionally**
@@ -2524,12 +2527,12 @@ def test_request_fields_are_accepted_when_the_feature_is_off(field):
 
 - [ ] **Step 2: Run the test**
 
-Run: `uv run --group dev pytest tests/test_glossary_disabled.py -v`
+Run: `scripts/test_glossary.sh tests/test_glossary_disabled.py -v`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 3: Run the entire suite**
 
-Run: `uv run --group dev pytest tests/ -v`
+Run: `scripts/test_glossary.sh tests/ -v`
 Expected: PASS. No pre-existing test regresses — in particular
 `tests/test_api_vendored_modules.py`, which fails if `api/prompting.py` was
 touched.
