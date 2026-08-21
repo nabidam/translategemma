@@ -82,3 +82,27 @@ def test_spans_are_returned_in_document_order():
 
 def test_an_empty_index_matches_nothing():
     assert find_spans(build_index([], version=1), "anything") == []
+
+
+def test_leftmost_wins_when_length_and_priority_tie():
+    # Without this test, a reversed (or dropped) `span.start` component in the
+    # overlap-resolution sort key would still pass every other test in this
+    # file. The two terms must differ in case_sensitive: two terms sharing a
+    # case mode compile into one alternation, and re.finditer never returns
+    # overlapping matches from a single pattern, so a same-pattern pair (e.g.
+    # "abc"/"bcd" both case-insensitive) never produces two overlapping
+    # candidates in the first place -- it can't exercise the tiebreak. Two
+    # different case modes give two independent finditer passes over the same
+    # text, which is the only way to get genuinely overlapping, equal-length,
+    # equal-priority candidates to resolve between.
+    index = build_index(
+        [
+            term("abc", "A", entry_id=1, whole_word=False, case_sensitive=True),
+            term("bcd", "B", entry_id=2, whole_word=False, case_sensitive=False),
+        ],
+        version=1,
+    )
+    spans = find_spans(index, "abcd")
+    assert len(spans) == 1
+    assert spans[0].term.entry_id == 1
+    assert spans[0].start == 0
