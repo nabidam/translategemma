@@ -41,3 +41,22 @@ def test_offsets_allow_slicing_the_original_by_a_folded_match():
     start = folded.index("genome")
     end = start + len("genome")
     assert original[offsets[start] : offsets[end - 1] + 1] == "Genome"
+
+
+def test_offsets_align_when_lowercasing_expands():
+    """Test that expanding characters (e.g., Turkish İ → i̇) preserve offset invariant.
+
+    Turkish capital dotted I (U+0130 İ) lowercases to i (U+0069) + combining dot
+    above (U+0307), expanding from 1 character to 2. The offsets list must have
+    one entry per output character, not per source character, so that slicing
+    the original string by folded match indices still works.
+    """
+    original = "İstanbul"
+    folded, offsets = fold_source(original, case_sensitive=False)
+    # "İstanbul".lower() → "i̇stanbul" (9 chars: i + combining-dot + s,t,a,n,b,u,l)
+    assert len(folded) == 9
+    assert len(folded) == len(offsets)
+    # Verify slicing: search for substring in folded, recover original slice
+    start = folded.index("stanbul")
+    end = start + len("stanbul")
+    assert original[offsets[start] : offsets[end - 1] + 1] == "stanbul"
