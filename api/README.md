@@ -179,6 +179,44 @@ report it even after the upstream was relaunched differently.
 A `TG_BASE_MODEL_ID` that does not resolve to a checkpoint directory fails at
 startup rather than on the first request.
 
+## Glossary (deterministic terminology)
+
+Off by default. Enable with `TG_GLOSSARY_ENABLED=true` and a `TG_ADMIN_API_KEY`;
+the gateway refuses to start if the key is missing. Disabled, `/admin/glossary/*`
+does not exist (404, not 401): there is nothing to authorize against.
+
+Design and measurements: `docs/2026-08-21_glossary_memory_design.md`.
+
+Add a term:
+
+```bash
+curl -X POST localhost:8000/admin/glossary/entries \
+  -H "X-Admin-Key: $TG_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"src_lang":"en","tgt_lang":"fa","source_term":"multi-query attention",
+       "target_term":"توجه چندپرسشی","aliases":["توجه چندگانه"]}'
+```
+
+Check what would fire before it reaches traffic:
+
+```bash
+curl -X POST localhost:8000/admin/glossary/dry-run \
+  -H "X-Admin-Key: $TG_ADMIN_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"text":"It uses multi-query attention.","src_lang":"en","tgt_lang":"fa"}'
+```
+
+`/translate` gains optional `domain` and `terminology_mode` fields. Omitting
+`domain` is the normal path and resolves to the global termbase; naming an
+unknown domain is a 404. Responses carry `glossary_version`, `raw_translation`
+(the model's output before any glossary rewriting), and a `glossary` report
+naming every term applied, missed, or found in a forbidden rendering. Only
+`target_mode: "preferred"` is accepted today — sentinel-based `exact` mode is a
+later phase.
+
+The curation loop matters more than any single field: a term is only rewritten
+when the model's own rendering is one the entry already knows about. Grow
+`aliases` from the `misses` report rather than assuming a first miss means the
+glossary is broken.
+
 ## Docker
 
 Run from inside this directory; the build context is this directory:

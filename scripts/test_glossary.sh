@@ -13,6 +13,19 @@
 # api/requirements.txt remains the source of truth for what production runs;
 # this list only has to be enough to import the modules under test.
 #
+# The default target is the whole tests/ directory, which also holds
+# test_benchmark_training.py, test_lora_configuration.py, test_split_dataset.py
+# and test_translation_benchmark.py -- training-stack tests that need
+# yaml/pandas/torch, none of which this runner installs (see above). pytest
+# *interrupts* the whole run on a collection error rather than skipping the
+# offending file, so without --continue-on-collection-errors a bare
+# `scripts/test_glossary.sh` collects zero tests and exits non-zero, which
+# reads as "the glossary suite failed" when really nothing ran. The flag makes
+# pytest report those four files as collection errors and still run --and
+# report on-- everything it could collect, which is the true result of this
+# suite. It is passed unconditionally, so it also applies -- harmlessly -- when
+# you narrow the run with explicit arguments below.
+#
 # Usage:
 #   scripts/test_glossary.sh                       # whole glossary suite
 #   scripts/test_glossary.sh tests/test_x.py -v    # one file
@@ -29,4 +42,4 @@ exec uv run --no-project \
     --with pydantic-settings \
     --with "sqlalchemy[asyncio]" \
     --with aiosqlite \
-    pytest "${@:-tests/}"
+    pytest --continue-on-collection-errors "${@:-tests/}"

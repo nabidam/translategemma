@@ -135,6 +135,10 @@ services:
       # Read for the tokenizer and chat template only. No weights are loaded in
       # this container, so no GPU is reserved for it.
       - ${MODELS_DIR:-./offline_assets/models}:/models:ro
+      # Termbase database. Outside the container filesystem so it survives a
+      # rebuild; harmless when TG_GLOSSARY_ENABLED is false, since nothing
+      # opens it.
+      - glossary-data:/data
     environment: *tg-environment
     healthcheck:
       # Runs a real translation through vLLM, so it proves the whole path, not
@@ -170,3 +174,6 @@ services:
       <<: *tg-environment
       TG_BENCHMARK_API_URL: ${TG_BENCHMARK_API_URL:-http://translategemma-api:8000}
       TG_BENCHMARK_OUTPUT_DIR: /app/benchmarks
+
+volumes:
+  glossary-data:
