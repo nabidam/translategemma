@@ -52,6 +52,10 @@ async def lifespan(app: FastAPI):
         )
         await glossary.start()
         logger.info("Glossary enabled: %s", settings.glossary_db_url)
+
+        from glossary.router import build_router
+
+        app.include_router(build_router(glossary, settings.admin_api_key))
     app.state.glossary = glossary
     try:
         yield
