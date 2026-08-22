@@ -41,6 +41,18 @@ class TranslationOptions(BaseModel):
             "adapter was trained on whole segments."
         ),
     )
+    domain: str | None = Field(
+        default=None,
+        description=(
+            "Termbase to layer over the global one. Omitting it is the normal "
+            "case and applies the global termbase; an unknown name is a 404. "
+            "Ignored when the glossary is disabled."
+        ),
+    )
+    terminology_mode: str | None = Field(
+        default=None,
+        description="'off' or 'enforce'. Defaults to TG_TERMINOLOGY_MODE.",
+    )
 
 
 class Prompt(TranslationOptions):
@@ -67,11 +79,45 @@ class BatchPrompt(TranslationOptions):
     }
 
 
+class AppliedTerm(BaseModel):
+    source_term: str
+    target_term: str
+    mode: str
+    count: int
+
+
+class MissedTerm(BaseModel):
+    source_term: str
+    reason: str
+
+
+class ForbiddenTerm(BaseModel):
+    source_term: str
+    forbidden: str
+
+
+class GlossaryReport(BaseModel):
+    """What the termbase did to one translation.
+
+    Omitted entirely when the glossary is disabled, so a caller written against
+    a deployment without the feature keeps working when it is switched on.
+    """
+
+    status: str
+    applied: list[AppliedTerm] = []
+    misses: list[MissedTerm] = []
+    violations: list[ForbiddenTerm] = []
+
+
 class TranslationResponse(BaseModel):
     translation: str
     system: System
     source_lang: str
     target_lang: str
+    # Absent, not null, when the glossary is disabled.
+    raw_translation: str | None = None
+    glossary_version: int | None = None
+    glossary: GlossaryReport | None = None
 
     model_config = {
         "json_schema_extra": {
@@ -92,6 +138,9 @@ class BatchTranslationResponse(BaseModel):
     system: System
     source_lang: str
     target_lang: str
+    raw_translations: list[str] | None = None
+    glossary_version: int | None = None
+    glossary: list[GlossaryReport] | None = None
 
     model_config = {
         "json_schema_extra": {

@@ -30,11 +30,15 @@ in-process engine needed is gone.
 import asyncio
 import logging
 import random
+from dataclasses import dataclass
 
 import httpx
 from anyio import to_thread
 
 from config import System
+from glossary.apply import Report, apply_preferred
+from glossary.matcher import Index, Span, find_spans
+from glossary.service import GlossaryService  # noqa: F401  (re-exported for main.py)
 from prompting import render_inference_prompts, resolve_stop_token_ids
 
 logger = logging.getLogger("translategemma.api")
@@ -107,6 +111,19 @@ def load_processor(model_path: str):
         )
         return _TokenizerProcessor(AutoTokenizer.from_pretrained(model_path, use_fast=True))
     return processor
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    """Translations plus, per text, what the glossary did — or None when off.
+
+    A result object rather than a bare list because the glossary's report has to
+    reach the response, and threading it through a second return value would put
+    the two out of step on the first refactor.
+    """
+
+    translations: list[str]
+    reports: list["Report | None"]
 
 
 class TranslationEngine:
@@ -200,13 +217,14 @@ class TranslationEngine:
         target_lang: str,
         max_new_tokens: int,
         split_sentences: bool,
-    ) -> list[str]:
+        *,
+        glossary_index: Index | None = None,
+    ) -> TranslationResult:
         """Translate texts, preserving order. One output per input.
 
-        With split_sentences, each text is segmented, every segment of every
-        text is sent to the shared upstream, and the segments are rejoined per
-        text. That keeps the server busy even when one request carries a single
-        long document.
+        Glossary matching runs on the FULL text before splitting: a term
+        straddling a sentence boundary would otherwise be invisible to every
+        segment. The spans are then applied to the rejoined translation.
         """
         if not self.is_loaded:
             raise RuntimeError("Gateway is not ready.")
@@ -215,6 +233,10 @@ class TranslationEngine:
                 f"System {system!r} is not what this upstream serves "
                 f"({self.settings.served_system})."
             )
+
+        spans_per_text: list[list[Span]] = [
+            [] if glossary_index is None else find_spans(glossary_index, text) for text in texts
+        ]
 
         if split_sentences:
             segments_per_text = [self.splitter.split(text, source_lang) for text in texts]
@@ -226,13 +248,21 @@ class TranslationEngine:
             flat_segments, system, source_lang, target_lang, max_new_tokens
         )
 
-        translations = []
+        translations: list[str] = []
+        reports: list[Report | None] = []
         cursor = 0
-        for segments in segments_per_text:
+        for text_index, segments in enumerate(segments_per_text):
             chunk = flat_translations[cursor : cursor + len(segments)]
             cursor += len(segments)
-            translations.append(" ".join(part for part in chunk if part))
-        return translations
+            joined = " ".join(part for part in chunk if part)
+            if glossary_index is None:
+                translations.append(joined)
+                reports.append(None)
+                continue
+            rewritten, report = apply_preferred(joined, spans_per_text[text_index])
+            translations.append(rewritten)
+            reports.append(report)
+        return TranslationResult(translations=translations, reports=reports)
 
     async def _generate(
         self,

@@ -20,6 +20,8 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import Settings, System, get_settings
+from glossary.serializers import to_report
+from glossary.service import GlossaryService, UnknownDomainError
 from schemas import (
     BatchPrompt,
     BatchTranslationResponse,
@@ -41,9 +43,21 @@ async def lifespan(app: FastAPI):
     # Tokenizer only, but still blocking file I/O: keep it off the event loop.
     await to_thread.run_sync(engine.load)
     app.state.engine = engine
+    glossary = None
+    if settings.glossary_enabled:
+        glossary = GlossaryService(
+            database_url=settings.glossary_db_url,
+            default_domain=settings.glossary_default_domain,
+            unknown_domain=settings.glossary_unknown_domain,
+        )
+        await glossary.start()
+        logger.info("Glossary enabled: %s", settings.glossary_db_url)
+    app.state.glossary = glossary
     try:
         yield
     finally:
+        if glossary is not None:
+            await glossary.aclose()
         await engine.aclose()
 
 
@@ -74,6 +88,11 @@ def get_engine() -> TranslationEngine:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway is not ready."
         )
     return engine
+
+
+def get_glossary() -> GlossaryService | None:
+    """None when the feature is off. Callers must not branch on settings instead."""
+    return getattr(app.state, "glossary", None)
 
 
 @dataclass(frozen=True)
@@ -112,7 +131,23 @@ def _resolve(options, settings: Settings) -> ResolvedOptions:
     )
 
 
-async def _translate(engine, texts: list[str], resolved: ResolvedOptions) -> list[str]:
+async def _resolve_index(glossary, prompt, resolved, settings):
+    """The snapshot for this request, or None when the glossary does not apply."""
+    if glossary is None:
+        return None
+    mode = prompt.terminology_mode or settings.terminology_mode
+    if mode == "off":
+        return None
+    try:
+        return await glossary.resolve(resolved.source_lang, resolved.target_lang, prompt.domain)
+    except UnknownDomainError as error:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Unknown glossary domain {error.name!r}. Available: {error.available}",
+        ) from error
+
+
+async def _translate(engine, texts, resolved, glossary_index=None):
     return await engine.translate(
         texts,
         resolved.system,
@@ -120,6 +155,7 @@ async def _translate(engine, texts: list[str], resolved: ResolvedOptions) -> lis
         resolved.target_lang,
         resolved.max_new_tokens,
         resolved.split_sentences,
+        glossary_index=glossary_index,
     )
 
 
@@ -137,7 +173,8 @@ async def health_check(
         split_sentences=False,
     )
     try:
-        translations = await _translate(engine, ["Hello."], resolved)
+        result = await _translate(engine, ["Hello."], resolved)
+        translations = result.translations
     except Exception:
         logger.exception("Health check translation failed.")
         return HealthResponse(translator="FAIL")
@@ -167,7 +204,7 @@ async def model_info(
     )
 
 
-@app.post("/translate", response_model=TranslationResponse)
+@app.post("/translate", response_model=TranslationResponse, response_model_exclude_none=True)
 async def translate(
     prompt: Prompt,
     engine: TranslationEngine = Depends(get_engine),
@@ -177,16 +214,27 @@ async def translate(
     if not text:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "text is empty.")
     resolved = _resolve(prompt, settings)
-    translations = await _translate(engine, [text], resolved)
-    return TranslationResponse(
-        translation=translations[0],
+    glossary = get_glossary()
+    index = await _resolve_index(glossary, prompt, resolved, settings)
+    result = await _translate(engine, [text], resolved, index)
+    response = TranslationResponse(
+        translation=result.translations[0],
         system=resolved.system,
         source_lang=resolved.source_lang,
         target_lang=resolved.target_lang,
     )
+    if index is not None:
+        response.raw_translation = result.translations[0]
+        response.glossary_version = index.version
+        response.glossary = to_report(result.reports[0])
+    return response
 
 
-@app.post("/translate/batch", response_model=BatchTranslationResponse)
+@app.post(
+    "/translate/batch",
+    response_model=BatchTranslationResponse,
+    response_model_exclude_none=True,
+)
 async def translate_batch(
     prompt: BatchPrompt,
     engine: TranslationEngine = Depends(get_engine),
@@ -201,10 +249,16 @@ async def translate_batch(
     if any(not text for text in texts):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "texts contains an empty item.")
     resolved = _resolve(prompt, settings)
-    translations = await _translate(engine, texts, resolved)
-    return BatchTranslationResponse(
-        translations=translations,
+    glossary = get_glossary()
+    index = await _resolve_index(glossary, prompt, resolved, settings)
+    result = await _translate(engine, texts, resolved, index)
+    response = BatchTranslationResponse(
+        translations=result.translations,
         system=resolved.system,
         source_lang=resolved.source_lang,
         target_lang=resolved.target_lang,
     )
+    if index is not None:
+        response.glossary_version = index.version
+        response.glossary = [to_report(report) for report in result.reports]
+    return response
