@@ -63,7 +63,17 @@ class DryRunIn(BaseModel):
 def build_router(service: GlossaryService, api_key: str) -> APIRouter:
     async def require_key(x_admin_key: str | None = Header(default=None)) -> None:
         # compare_digest so a wrong key costs the same time as a right one.
-        if x_admin_key is None or not secrets.compare_digest(x_admin_key, api_key):
+        # It also requires ASCII-only strings: headers are latin-1 decoded, so
+        # a byte above 127 in the header reaches us as a non-ASCII str and
+        # would otherwise raise TypeError here, turning the gateway's only
+        # authorization boundary into an unauthenticated 500 on malformed
+        # input rather than the 401 an unauthenticated caller must get.
+        valid = (
+            x_admin_key is not None
+            and x_admin_key.isascii()
+            and secrets.compare_digest(x_admin_key, api_key)
+        )
+        if not valid:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or missing admin key.")
 
     router = APIRouter(
@@ -151,13 +161,19 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
                 created_by=payload.created_by,
             )
         except ValueError as error:
-            message = str(error)
-            code = (
-                status.HTTP_404_NOT_FOUND
-                if "No such domain" in message
-                else status.HTTP_409_CONFLICT
+            # Not a substring match on the message: create_entry's duplicate
+            # message embeds the caller-supplied source_term verbatim, so an
+            # admin naming their term e.g. "No such domain" would otherwise
+            # be told their entry's domain is missing instead of that their
+            # entry is a duplicate. Ask the store what is actually true
+            # instead. A request with no domain at all can never be a domain
+            # error -- only a named, missing domain can be.
+            domain_missing = (
+                payload.domain is not None
+                and await service.store.get_domain(payload.domain) is None
             )
-            raise HTTPException(code, message) from error
+            code = status.HTTP_404_NOT_FOUND if domain_missing else status.HTTP_409_CONFLICT
+            raise HTTPException(code, str(error)) from error
         await service.reload()
         return {"id": entry.id}
 
