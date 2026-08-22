@@ -38,7 +38,6 @@ from anyio import to_thread
 from config import System
 from glossary.apply import Report, apply_preferred
 from glossary.matcher import Index, Span, find_spans
-from glossary.service import GlossaryService  # noqa: F401  (re-exported for main.py)
 from prompting import render_inference_prompts, resolve_stop_token_ids
 
 logger = logging.getLogger("translategemma.api")
@@ -115,14 +114,19 @@ def load_processor(model_path: str):
 
 @dataclass(frozen=True)
 class TranslationResult:
-    """Translations plus, per text, what the glossary did — or None when off.
+    """Translations plus, per text, the pre-glossary model output and what the
+    glossary did — or None for the report when off.
 
     A result object rather than a bare list because the glossary's report has to
     reach the response, and threading it through a second return value would put
-    the two out of step on the first refactor.
+    the two out of step on the first refactor. `raw_translations` is kept
+    index-aligned with `translations` even when the glossary is off (the two
+    are then equal), so a caller can always compare the pair without branching
+    on whether the feature is enabled.
     """
 
     translations: list[str]
+    raw_translations: list[str]
     reports: list["Report | None"]
 
 
@@ -249,12 +253,14 @@ class TranslationEngine:
         )
 
         translations: list[str] = []
+        raw_translations: list[str] = []
         reports: list[Report | None] = []
         cursor = 0
         for text_index, segments in enumerate(segments_per_text):
             chunk = flat_translations[cursor : cursor + len(segments)]
             cursor += len(segments)
             joined = " ".join(part for part in chunk if part)
+            raw_translations.append(joined)
             if glossary_index is None:
                 translations.append(joined)
                 reports.append(None)
@@ -262,7 +268,9 @@ class TranslationEngine:
             rewritten, report = apply_preferred(joined, spans_per_text[text_index])
             translations.append(rewritten)
             reports.append(report)
-        return TranslationResult(translations=translations, reports=reports)
+        return TranslationResult(
+            translations=translations, raw_translations=raw_translations, reports=reports
+        )
 
     async def _generate(
         self,

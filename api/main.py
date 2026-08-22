@@ -224,7 +224,7 @@ async def translate(
         target_lang=resolved.target_lang,
     )
     if index is not None:
-        response.raw_translation = result.translations[0]
+        response.raw_translation = result.raw_translations[0]
         response.glossary_version = index.version
         response.glossary = to_report(result.reports[0])
     return response
@@ -259,6 +259,7 @@ async def translate_batch(
         target_lang=resolved.target_lang,
     )
     if index is not None:
+        response.raw_translations = result.raw_translations
         response.glossary_version = index.version
         response.glossary = [to_report(report) for report in result.reports]
     return response
