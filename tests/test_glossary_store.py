@@ -159,3 +159,29 @@ async def test_domain_shadowing_still_holds_with_case_sensitivity_in_the_key(sto
     terms, _ = await store.load_terms("en", "fa", "medical")
     assert len(terms) == 1
     assert terms[0].target_term == "DOMAIN"
+
+
+async def test_create_all_creates_the_sqlite_files_parent_directory(tmp_path):
+    # The default TG_GLOSSARY_DB_URL (./data/glossary.db) and the compose
+    # deployment's mounted volume (/data/glossary.db) both name a directory
+    # nothing else creates; SQLite opens a file but never a directory, so
+    # without this an operator enabling the glossary with the default URL
+    # sees an opaque "unable to open database file".
+    db_path = tmp_path / "nested" / "glossary.db"
+    assert not db_path.parent.exists()
+    fresh_store = GlossaryStore(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        await fresh_store.create_all()
+        assert db_path.parent.is_dir()
+        assert db_path.exists()
+    finally:
+        await fresh_store.aclose()
+
+
+async def test_create_all_is_a_no_op_for_an_in_memory_database():
+    # No path to create a directory for -- must not raise or behave oddly.
+    memory_store = GlossaryStore("sqlite+aiosqlite:///:memory:")
+    try:
+        await memory_store.create_all()
+    finally:
+        await memory_store.aclose()

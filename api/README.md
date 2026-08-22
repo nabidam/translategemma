@@ -217,6 +217,15 @@ when the model's own rendering is one the entry already knows about. Grow
 `aliases` from the `misses` report rather than assuming a first miss means the
 glossary is broken.
 
+**Known limitations.** Entries and domains cannot currently be updated or
+disabled in place: there is no `PATCH /admin/glossary/entries/{id}` or
+`PATCH /admin/glossary/domains/{name}`. Correcting a mistake means deleting
+the row and recreating it, which changes its id. Both tables carry an
+`enabled` column, but no route ever writes it -- the only way to remove an
+entry or domain from matching today is `DELETE`. A deliberate scope decision,
+not an oversight; a later phase can add targeted updates without a schema
+change.
+
 ## Docker
 
 Run from inside this directory; the build context is this directory:

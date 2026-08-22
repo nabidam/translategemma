@@ -51,9 +51,13 @@ async def test_fallback_policy_uses_the_global_layer_for_an_unknown_domain():
 
 async def test_the_default_domain_applies_when_the_request_omits_one():
     service = build(default_domain="medical")
+    # start() validates TG_GLOSSARY_DEFAULT_DOMAIN against the store, so the
+    # domain must exist first. create_all() is idempotent -- start() also
+    # calls it -- so calling it here ahead of time is harmless.
+    await service.store.create_all()
+    await service.store.create_domain("medical", "en", "fa", None)
     await service.start()
     try:
-        await service.store.create_domain("medical", "en", "fa", None)
         await service.store.create_entry(
             domain_name="medical", src_lang="en", tgt_lang="fa",
             source_term="lesion", target_term="L",
@@ -63,6 +67,28 @@ async def test_the_default_domain_applies_when_the_request_omits_one():
         assert [term.source_term for term in index.terms] == ["lesion"]
     finally:
         await service.aclose()
+
+
+async def test_start_fails_when_the_default_domain_does_not_exist():
+    # A typo in TG_GLOSSARY_DEFAULT_DOMAIN must fail at boot: unnoticed, it
+    # 404s every ordinary caller that never mentioned a domain at all.
+    service = build(default_domain="nope")
+    with pytest.raises(ValueError, match="TG_GLOSSARY_DEFAULT_DOMAIN"):
+        await service.start()
+
+
+async def test_start_fails_when_the_default_domain_is_disabled():
+    service = build(default_domain="medical")
+    await service.store.create_all()
+    await service.store.create_domain("medical", "en", "fa", None)
+    from glossary.models import Domain
+    from sqlalchemy import update
+
+    async with service.store._session() as session:
+        await session.execute(update(Domain).where(Domain.name == "medical").values(enabled=False))
+        await session.commit()
+    with pytest.raises(ValueError, match="TG_GLOSSARY_DEFAULT_DOMAIN"):
+        await service.start()
 
 
 async def test_snapshots_are_cached_and_reload_replaces_them(service):

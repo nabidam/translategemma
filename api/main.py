@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from anyio import to_thread
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import Settings, System, get_settings
 from glossary.serializers import to_report
@@ -135,11 +136,28 @@ def _resolve(options, settings: Settings) -> ResolvedOptions:
     )
 
 
+_VALID_TERMINOLOGY_MODES = ("off", "enforce")
+
+
 async def _resolve_index(glossary, prompt, resolved, settings):
-    """The snapshot for this request, or None when the glossary does not apply."""
+    """The snapshot for this request, or None when the glossary does not apply.
+
+    terminology_mode is validated here rather than as a Pydantic Literal on
+    the request schema: this branch only runs when the glossary is enabled
+    (see the `glossary is None` guard immediately below), which keeps a
+    disabled deployment permissive about the field's value -- a caller who
+    learned to send `terminology_mode` must not start getting 422s the
+    instant an operator flips TG_GLOSSARY_ENABLED off, since the value is
+    then inert anyway.
+    """
     if glossary is None:
         return None
     mode = prompt.terminology_mode or settings.terminology_mode
+    if mode not in _VALID_TERMINOLOGY_MODES:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"terminology_mode must be one of {_VALID_TERMINOLOGY_MODES}; got {mode!r}.",
+        )
     if mode == "off":
         return None
     try:
@@ -149,6 +167,16 @@ async def _resolve_index(glossary, prompt, resolved, settings):
             status.HTTP_404_NOT_FOUND,
             f"Unknown glossary domain {error.name!r}. Available: {error.available}",
         ) from error
+    except (SQLAlchemyError, OSError):
+        # The glossary's own premise: a database problem (unmounted volume,
+        # unreadable file) must degrade to plain translation, not take down a
+        # healthy model. UnknownDomainError is a caller error and is handled
+        # above, not here -- it must keep its 404.
+        logger.error(
+            "Glossary store failed while resolving a snapshot; continuing without it.",
+            exc_info=True,
+        )
+        return None
 
 
 async def _translate(engine, texts, resolved, glossary_index=None):

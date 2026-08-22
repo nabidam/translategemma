@@ -12,6 +12,7 @@ Replacement is applied to the ORIGINAL string using the offset map, so nothing
 else in the translation is normalized as a side effect.
 """
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -54,15 +55,46 @@ class Report:
         return not (self.applied or self.misses or self.violations)
 
 
-def _find_all(folded_haystack: str, needle: str) -> list[tuple[int, int]]:
-    """Every occurrence of a folded needle, as (start, end) in the folded string."""
+# Persian letters, roughly the Arabic Unicode block Persian text is written
+# in. Checked against the FOLDED haystack, where ZWNJ has already been
+# dropped (see normalize.fold_target) -- so a suffix the model joined with a
+# ZWNJ ("کتاب‌ها") sits directly adjacent in the folded copy and is correctly
+# seen as an attached Persian letter, exactly as if there had been no ZWNJ at
+# all. Nothing extra needs to special-case ZWNJ here; folding already did it.
+_PERSIAN_LETTER = re.compile(r"[؀-ۿ]")
+
+
+def _is_whole_word_match(folded_haystack: str, start: int, end: int) -> bool:
+    """True unless a Persian letter sits directly against either edge."""
+    before_ok = start == 0 or not _PERSIAN_LETTER.match(folded_haystack[start - 1])
+    after_ok = end == len(folded_haystack) or not _PERSIAN_LETTER.match(folded_haystack[end])
+    return before_ok and after_ok
+
+
+def _find_all(
+    folded_haystack: str, needle: str, whole_word: bool = False
+) -> list[tuple[int, int]]:
+    """Every occurrence of a folded needle, as (start, end) in the folded string.
+
+    `whole_word=False` (the default aliases are curated with) is a bare
+    substring scan, deliberately: it is what makes `preferred` mode preserve
+    Persian affixes (a plural "ها", a prefixed preposition "به") around a
+    replaced stem rather than either missing the inflected form or
+    overwriting the affix. `whole_word=True` additionally requires that
+    neither edge of the match sit directly against another Persian letter,
+    the target-side equivalent of the source-side word-boundary check in
+    matcher.py -- it exists so an alias that happens to be a substring of an
+    unrelated Persian word cannot get spliced into the middle of it.
+    """
     folded_needle, _ = fold_target(needle)
     if not folded_needle:
         return []
     found = []
     position = folded_haystack.find(folded_needle)
     while position != -1:
-        found.append((position, position + len(folded_needle)))
+        end = position + len(folded_needle)
+        if not whole_word or _is_whole_word_match(folded_haystack, position, end):
+            found.append((position, end))
         position = folded_haystack.find(folded_needle, position + 1)
     return found
 
@@ -126,10 +158,10 @@ def apply_preferred(
             if _find_all(folded, forbidden):
                 violations.append(Violation(source_term=term.source_term, forbidden=forbidden))
 
-        canonical_hits = _find_all(folded, term.target_term)
+        canonical_hits = _find_all(folded, term.target_term, term.whole_word)
         term_alias_hits = []
         for alias in term.aliases:
-            term_alias_hits.extend(_find_all(folded, alias))
+            term_alias_hits.extend(_find_all(folded, alias, term.whole_word))
 
         if not canonical_hits and not term_alias_hits:
             misses.append(Miss(source_term=term.source_term, reason="target_not_found"))

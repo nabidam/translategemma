@@ -49,6 +49,20 @@ x-tg-environment: &tg-environment
   HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
   TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
 
+  # Glossary (optional; off by default). Absent from a running container's
+  # environment does not disable the feature by itself -- TG_GLOSSARY_ENABLED
+  # is the kill switch, and these defaults exist only so setting that one
+  # variable in api/.env is enough to turn the feature on without editing this
+  # file. See api/.env.example for what each one means.
+  TG_GLOSSARY_ENABLED: ${TG_GLOSSARY_ENABLED:-false}
+  TG_ADMIN_API_KEY: ${TG_ADMIN_API_KEY:-}
+  # Four-slash form: sqlite+aiosqlite:// + an absolute /data path, matching
+  # the glossary-data volume mounted below.
+  TG_GLOSSARY_DB_URL: ${TG_GLOSSARY_DB_URL:-sqlite+aiosqlite:////data/glossary.db}
+  TG_GLOSSARY_DEFAULT_DOMAIN: ${TG_GLOSSARY_DEFAULT_DOMAIN:-}
+  TG_GLOSSARY_UNKNOWN_DOMAIN: ${TG_GLOSSARY_UNKNOWN_DOMAIN:-reject}
+  TG_TERMINOLOGY_MODE: ${TG_TERMINOLOGY_MODE:-enforce}
+
 services:
   translategemma-vllm:
     image: vllm/vllm-openai:v0.13.0

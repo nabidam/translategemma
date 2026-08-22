@@ -26,3 +26,21 @@ def test_enabling_with_an_admin_key_is_accepted():
 def test_unknown_domain_policy_defaults_to_reject():
     settings = Settings(_env_file=None)
     assert settings.glossary_unknown_domain == "reject"
+
+
+def test_an_invalid_unknown_domain_policy_fails_at_startup():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, glossary_unknown_domain="ignore")
+
+
+def test_terminology_mode_defaults_to_enforce():
+    settings = Settings(_env_file=None)
+    assert settings.terminology_mode == "enforce"
+
+
+def test_an_invalid_terminology_mode_fails_at_startup():
+    # TG_TERMINOLOGY_MODE=enforcee used to boot happily and silently behave
+    # like every value that is not the exact string "off" -- indistinguishable
+    # from a correctly configured "enforce".
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, terminology_mode="enforcee")

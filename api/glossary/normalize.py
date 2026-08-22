@@ -12,7 +12,33 @@ the cases that actually occur in Persian text from this model, and each one is
 length-preserving or a pure deletion.
 """
 
+import re
+
 ZWNJ = "‌"
+
+# BCP-47-ish: a 2-3 letter primary subtag, optionally followed by one or more
+# subtags (script/region/variant), each 1-8 alphanumerics, hyphen-separated.
+# Deliberately loose -- this is a shape check to catch stray input ("EN ",
+# "eng-lish", ""), not a validator against the IANA subtag registry, which
+# would be a dependency this deployment does not need.
+_LANG_CODE_RE = re.compile(r"[a-z]{2,3}(-[a-z0-9]{1,8})*")
+
+
+def normalize_lang_code(code: str) -> str:
+    """Lowercase and validate a language code's shape.
+
+    Entries are matched with `==` (see store.load_terms), so an entry stored
+    as "EN" can never match a request carrying "en": both sides must agree on
+    case. Normalizing at every write and every read makes that agreement
+    automatic instead of a convention someone has to remember.
+    """
+    normalized = code.strip().lower()
+    if not _LANG_CODE_RE.fullmatch(normalized):
+        raise ValueError(
+            f"{code!r} does not look like a language code (expected e.g. 'en', "
+            "'en-us', 'zh-hans')."
+        )
+    return normalized
 
 # Arabic letters that Persian text is routinely typed with, folded to their
 # Persian equivalents. Without this, an alias containing the Persian form fails

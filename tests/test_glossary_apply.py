@@ -15,6 +15,13 @@ def span(
     forbidden=(),
     entry_id=1,
     priority=0,
+    # False is what every pre-existing test in this file exercises (and, per
+    # the finding this default documents, the setting realistic curated
+    # aliases want): target-side matching stays a bare substring scan so
+    # affixes like a plural "ها" or a prefixed "به" survive around the
+    # replaced stem. Tests that want the target-side word-boundary check
+    # pass whole_word=True explicitly.
+    whole_word=False,
 ):
     return Span(
         start=0,
@@ -27,7 +34,7 @@ def span(
             aliases=tuple(aliases),
             forbidden=tuple(forbidden),
             case_sensitive=False,
-            whole_word=True,
+            whole_word=whole_word,
             priority=priority,
         ),
     )
@@ -175,3 +182,47 @@ def test_alias_overlapping_a_different_terms_canonical_text_does_not_overwrite_i
     assert applied_sources == {"term_a": 1}
     assert miss_sources == {"term_b"}
     assert [m.reason for m in report.misses] == ["claimed_by_overlap"]
+
+
+def test_whole_word_true_blocks_splicing_into_an_unrelated_word():
+    # "کتاب" (book) is a substring of "کتابخانه" (library) -- exactly the
+    # failure mode whole_word=True on the target side exists to prevent: an
+    # alias that happens to be a substring of an unrelated Persian word must
+    # not get spliced into the middle of it.
+    alias = "کتاب"
+    unrelated = "کتابخانه"
+    text = f"او به {unrelated} رفت."
+    result, report = apply_preferred(
+        text, [span(target="X", aliases=[alias], whole_word=True)]
+    )
+    assert result == text
+    assert report.applied == ()
+    assert [miss.reason for miss in report.misses] == ["target_not_found"]
+
+
+def test_whole_word_true_still_matches_a_standalone_occurrence():
+    # The boundary check only rejects a match adjacent to another Persian
+    # letter; a clean, space-bounded occurrence of the same alias still
+    # applies normally.
+    alias = "کتاب"
+    text = "او کتاب را خواند."
+    result, report = apply_preferred(
+        text, [span(target="X", aliases=[alias], whole_word=True)]
+    )
+    assert "X" in result
+    assert report.applied[0].count == 1
+
+
+def test_whole_word_false_still_splices_into_an_unrelated_word():
+    # The documented risk whole_word=True exists to prevent: with
+    # whole_word=False (the default for curated aliases, so that affixes
+    # survive -- see test_persian_affixes_around_an_alias_are_preserved),
+    # the same alias as above DOES get spliced into the unrelated word.
+    alias = "کتاب"
+    unrelated = "کتابخانه"
+    text = f"او به {unrelated} رفت."
+    result, report = apply_preferred(
+        text, [span(target="X", aliases=[alias], whole_word=False)]
+    )
+    assert "X" in result
+    assert report.applied[0].count == 1

@@ -16,7 +16,7 @@ import json
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -150,8 +150,12 @@ class Settings(BaseSettings):
     glossary_default_domain: str | None = None
     # What to do with a domain name that does not exist. "reject" surfaces a
     # caller's typo as a 404; "fallback" quietly uses the global layer.
-    glossary_unknown_domain: str = "reject"
-    terminology_mode: str = "enforce"
+    glossary_unknown_domain: Literal["reject", "fallback"] = "reject"
+    # "off" disables matching entirely; anything else is a typo Pydantic
+    # should reject at boot rather than a mode that silently behaves like
+    # "enforce" (see TranslationOptions.terminology_mode for the per-request
+    # equivalent, which the same typo risk applies to).
+    terminology_mode: Literal["off", "enforce"] = "enforce"
 
     # --- CORS -------------------------------------------------------------
     # Origins permitted by CORSMiddleware. Comma-separated string or JSON list
@@ -218,11 +222,6 @@ class Settings(BaseSettings):
                 "TG_GLOSSARY_ENABLED is true but TG_ADMIN_API_KEY is unset. The admin "
                 "routes would be the only unauthenticated write surface on this "
                 "gateway. Set a key or disable the glossary."
-            )
-        if self.glossary_unknown_domain not in ("reject", "fallback"):
-            raise ValueError(
-                f"TG_GLOSSARY_UNKNOWN_DOMAIN must be 'reject' or 'fallback'; "
-                f"got {self.glossary_unknown_domain!r}."
             )
         return self
 

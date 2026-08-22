@@ -5,7 +5,10 @@ is built, and the snapshot answers requests. Querying the database per term per
 request is the thing this design exists to avoid.
 """
 
+from pathlib import Path
+
 from sqlalchemy import delete, event, select, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -15,6 +18,7 @@ from .models import Base, Domain, Entry, Revision
 
 class GlossaryStore:
     def __init__(self, database_url: str):
+        self._database_url = database_url
         self._engine = create_async_engine(database_url, future=True)
         self._session = async_sessionmaker(self._engine, expire_on_commit=False)
 
@@ -34,6 +38,7 @@ class GlossaryStore:
                 cursor.close()
 
     async def create_all(self) -> None:
+        self._ensure_sqlite_directory()
         async with self._engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         async with self._session() as session:
@@ -41,6 +46,23 @@ class GlossaryStore:
             if existing is None:
                 session.add(Revision(id=1, version=1))
                 await session.commit()
+
+    def _ensure_sqlite_directory(self) -> None:
+        """SQLite opens a file but will not create the directory it lives in.
+
+        The default TG_GLOSSARY_DB_URL (./data/glossary.db) and the compose
+        deployment's mounted volume (/data/glossary.db) both name a directory
+        nothing else in this process creates, so without this an operator who
+        only sets TG_GLOSSARY_ENABLED sees an opaque "unable to open database
+        file" instead of a working default. Guarded to SQLite, like the FK
+        pragma above: a file path is meaningless for another dialect.
+        """
+        if self._engine.sync_engine.dialect.name != "sqlite":
+            return
+        database = make_url(self._database_url).database
+        if not database or database == ":memory:":
+            return
+        Path(database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
     async def aclose(self) -> None:
         await self._engine.dispose()

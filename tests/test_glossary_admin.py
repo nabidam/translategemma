@@ -155,6 +155,79 @@ async def test_creating_a_domain_and_listing_it(client):
     assert [item["name"] for item in listed.json()] == ["medical"]
 
 
+async def test_an_entry_written_with_uppercase_langs_is_normalized_to_lowercase(client):
+    # load_terms compares language codes with `==`, so an entry stored as
+    # "EN" could never match a request carrying "en" -- exactly the
+    # "looks broken" failure the stopword rejection exists to prevent for a
+    # different mistake.
+    created = await client.post(
+        "/admin/glossary/entries",
+        headers=HEADERS,
+        json={"src_lang": "EN", "tgt_lang": "FA", "source_term": "genome", "target_term": "X"},
+    )
+    assert created.status_code == 201
+    index = await client.service.resolve("en", "fa", None)
+    assert [term.source_term for term in index.terms] == ["genome"]
+
+
+async def test_a_domain_written_with_uppercase_langs_is_normalized_to_lowercase(client):
+    created = await client.post(
+        "/admin/glossary/domains",
+        headers=HEADERS,
+        json={"name": "medical", "src_lang": "EN", "tgt_lang": "FA"},
+    )
+    assert created.status_code == 201
+    domain = await client.service.store.get_domain("medical")
+    assert (domain.src_lang, domain.tgt_lang) == ("en", "fa")
+
+
+async def test_an_implausible_language_code_is_rejected(client):
+    response = await client.post(
+        "/admin/glossary/entries",
+        headers=HEADERS,
+        json={
+            "src_lang": "english", "tgt_lang": "fa!",
+            "source_term": "genome", "target_term": "X",
+        },
+    )
+    assert response.status_code == 422
+
+
+async def test_a_request_with_an_uppercase_lang_still_matches_a_lowercase_entry(client):
+    # Proves normalization on the resolve path too, not just on write: a
+    # caller that sends "EN" must still hit an entry stored (lowercase) as
+    # "en", not silently resolve to an empty termbase.
+    await client.post(
+        "/admin/glossary/entries",
+        headers=HEADERS,
+        json={"src_lang": "en", "tgt_lang": "fa", "source_term": "genome", "target_term": "X"},
+    )
+    index = await client.service.resolve("EN", "FA", None)
+    assert [term.source_term for term in index.terms] == ["genome"]
+
+
+async def test_an_entry_whose_pair_disagrees_with_its_domains_pair_is_rejected(client):
+    # Domain.src_lang/tgt_lang is otherwise stored and never consulted by
+    # load_terms (see glossary/store.py), which filters purely by the
+    # entry's own pair -- enforced here at write time so the two columns
+    # cannot silently drift apart.
+    await client.post(
+        "/admin/glossary/domains",
+        headers=HEADERS,
+        json={"name": "medical", "src_lang": "en", "tgt_lang": "fa"},
+    )
+    response = await client.post(
+        "/admin/glossary/entries",
+        headers=HEADERS,
+        json={
+            "src_lang": "de", "tgt_lang": "fr", "source_term": "genom", "target_term": "X",
+            "domain": "medical",
+        },
+    )
+    assert response.status_code == 422
+    assert "medical" in response.text
+
+
 # ---------------------------------------------------------------------------
 # The tests above build a standalone FastAPI() and never touch main.lifespan,
 # so they cannot catch the router failing to be mounted in the real app (a

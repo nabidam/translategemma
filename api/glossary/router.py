@@ -11,8 +11,9 @@ part here.
 import secrets
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from .normalize import normalize_lang_code
 from .service import GlossaryService, UnknownDomainError
 
 # Entries matching one of these exactly are refused. Google ignores such
@@ -36,6 +37,15 @@ class DomainIn(BaseModel):
     tgt_lang: str
     description: str | None = None
 
+    # Lowercased and shape-checked at write time: load_terms compares
+    # language codes with `==` (see glossary/store.py), so an entry or domain
+    # stored as "EN" can never match a request carrying "en" -- a typo here
+    # is a feature that looks broken forever, not a loud failure.
+    @field_validator("src_lang", "tgt_lang")
+    @classmethod
+    def _normalize_lang(cls, value: str) -> str:
+        return normalize_lang_code(value)
+
 
 class EntryIn(BaseModel):
     src_lang: str
@@ -51,6 +61,11 @@ class EntryIn(BaseModel):
     priority: int = 0
     notes: str | None = None
     created_by: str | None = None
+
+    @field_validator("src_lang", "tgt_lang")
+    @classmethod
+    def _normalize_lang(cls, value: str) -> str:
+        return normalize_lang_code(value)
 
 
 class DryRunIn(BaseModel):
@@ -144,6 +159,23 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
                 f"{payload.source_term!r} is a stopword and would never be applied. "
                 "Multi-word phrases containing one are fine.",
             )
+        if payload.domain is not None:
+            # store.load_terms filters entries by the ENTRY's own language
+            # pair and never consults the domain row's src_lang/tgt_lang (see
+            # glossary/store.py) -- so those two columns are enforced here,
+            # at write time, rather than left as unread, purely advisory
+            # metadata that could quietly drift from what an entry actually
+            # declares.
+            domain = await service.store.get_domain(payload.domain)
+            if domain is not None and (
+                domain.src_lang != payload.src_lang or domain.tgt_lang != payload.tgt_lang
+            ):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"Domain {payload.domain!r} is {domain.src_lang}->{domain.tgt_lang}; "
+                    f"this entry is {payload.src_lang}->{payload.tgt_lang}. An entry's "
+                    "language pair must match the domain it is created in.",
+                )
         try:
             entry = await service.store.create_entry(
                 domain_name=payload.domain,
