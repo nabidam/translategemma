@@ -226,6 +226,17 @@ entry or domain from matching today is `DELETE`. A deliberate scope decision,
 not an oversight; a later phase can add targeted updates without a schema
 change.
 
+Target-side rewriting matches aliases and canonical terms as bare substrings
+of the translation, on purpose: it is what lets a Persian affix (a plural
+"ها", a prefixed "به") stay attached to a term stem that gets replaced,
+instead of the rewrite either missing the inflected form or overwriting the
+affix. The trade-off is that an alias which is itself a substring of an
+unrelated word can get spliced into the middle of that word. `whole_word`
+currently constrains only source-side matching (which term span is found in
+the source sentence); it does not gate target-side rewriting. Curate aliases
+specific enough that they don't collide with unrelated words in the target
+language.
+
 ## Docker
 
 Run from inside this directory; the build context is this directory:

@@ -15,13 +15,13 @@ def span(
     forbidden=(),
     entry_id=1,
     priority=0,
-    # False is what every pre-existing test in this file exercises (and, per
-    # the finding this default documents, the setting realistic curated
-    # aliases want): target-side matching stays a bare substring scan so
-    # affixes like a plural "ها" or a prefixed "به" survive around the
-    # replaced stem. Tests that want the target-side word-boundary check
-    # pass whole_word=True explicitly.
-    whole_word=False,
+    # True mirrors the production default (api/glossary/router.py,
+    # api/glossary/models.py). apply_preferred does not read this field at
+    # all -- target-side matching is always a bare substring scan, which is
+    # what makes affixes like a plural "ها" or a prefixed "به" survive around
+    # the replaced stem. `whole_word` only constrains source-side matching in
+    # matcher.py.
+    whole_word=True,
 ):
     return Span(
         start=0,
@@ -75,11 +75,13 @@ def test_alias_matching_ignores_zwnj_and_arabic_letters():
 
 
 def test_persian_affixes_around_an_alias_are_preserved():
-    # The spec's affix rule. Alias matching is substring-based on purpose, so a
-    # plural suffix or a prefixed preposition survives and only the stem is
-    # swapped. Matching whole words instead would either miss the inflected
-    # form or overwrite the affix, and the second produces ungrammatical Farsi
-    # -- the failure `preferred` mode exists to avoid.
+    # The spec's affix rule, exercised at the production `whole_word=True`
+    # default (see span()'s default above). Alias matching is
+    # substring-based on purpose, so a plural suffix or a prefixed
+    # preposition survives and only the stem is swapped. Matching whole
+    # words instead would either miss the inflected form or overwrite the
+    # affix, and the second produces ungrammatical Farsi -- the failure
+    # `preferred` mode exists to avoid.
     text = f"به{VARIANT}ها نگاه کن."
     result, report = apply_preferred(text, [span(aliases=[VARIANT])])
     assert result == f"به{CANONICAL}ها نگاه کن."
@@ -184,45 +186,18 @@ def test_alias_overlapping_a_different_terms_canonical_text_does_not_overwrite_i
     assert [m.reason for m in report.misses] == ["claimed_by_overlap"]
 
 
-def test_whole_word_true_blocks_splicing_into_an_unrelated_word():
-    # "کتاب" (book) is a substring of "کتابخانه" (library) -- exactly the
-    # failure mode whole_word=True on the target side exists to prevent: an
-    # alias that happens to be a substring of an unrelated Persian word must
-    # not get spliced into the middle of it.
-    alias = "کتاب"
-    unrelated = "کتابخانه"
-    text = f"او به {unrelated} رفت."
-    result, report = apply_preferred(
-        text, [span(target="X", aliases=[alias], whole_word=True)]
-    )
-    assert result == text
-    assert report.applied == ()
-    assert [miss.reason for miss in report.misses] == ["target_not_found"]
-
-
-def test_whole_word_true_still_matches_a_standalone_occurrence():
-    # The boundary check only rejects a match adjacent to another Persian
-    # letter; a clean, space-bounded occurrence of the same alias still
-    # applies normally.
-    alias = "کتاب"
-    text = "او کتاب را خواند."
-    result, report = apply_preferred(
-        text, [span(target="X", aliases=[alias], whole_word=True)]
-    )
-    assert "X" in result
-    assert report.applied[0].count == 1
-
-
-def test_whole_word_false_still_splices_into_an_unrelated_word():
-    # The documented risk whole_word=True exists to prevent: with
-    # whole_word=False (the default for curated aliases, so that affixes
-    # survive -- see test_persian_affixes_around_an_alias_are_preserved),
-    # the same alias as above DOES get spliced into the unrelated word.
-    alias = "کتاب"
-    unrelated = "کتابخانه"
-    text = f"او به {unrelated} رفت."
-    result, report = apply_preferred(
-        text, [span(target="X", aliases=[alias], whole_word=False)]
-    )
-    assert "X" in result
+def test_affixed_alias_is_rewritten_at_the_production_whole_word_default():
+    # Regression test for the finding-5 revert: an entry built exactly the
+    # way the admin API builds one (EntryIn.whole_word defaults to True,
+    # api/glossary/router.py:60; Boolean column default=True,
+    # api/glossary/models.py:77) must still have its affixed alias rewritten.
+    # Before this revert, target-side matching enforced `whole_word`, so this
+    # exact case -- the affix rule from
+    # test_persian_affixes_around_an_alias_are_preserved, but at the real
+    # default instead of a test-only False -- silently failed: applied=False,
+    # text unchanged. span()'s default is whole_word=True, so no override is
+    # needed here to reproduce the production configuration.
+    text = f"به{VARIANT}ها نگاه کن."
+    result, report = apply_preferred(text, [span(aliases=[VARIANT])])
+    assert result == f"به{CANONICAL}ها نگاه کن."
     assert report.applied[0].count == 1
