@@ -38,6 +38,9 @@ ALIAS = "توجه چندگانه"
 SENTENCE = "The model relies on multi-query attention."
 # Created and removed by check 8; named so it cannot collide with a real one.
 DOMAIN = "verify-script-temporary"
+# A second, *enabled* domain, so check 8 can prove the available list filters
+# by enabled rather than merely being empty.
+DOMAIN_ENABLED = "verify-script-enabled"
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -304,16 +307,17 @@ def main() -> int:
 
         # --- 8. A disabled domain says so --------------------------------
         print("\n8. A disabled domain is reported as disabled")
-        gateway.request(
-            "POST",
-            "/admin/glossary/domains",
-            {
-                "name": DOMAIN,
-                "src_lang": info.get("default_source_lang", "en"),
-                "tgt_lang": info.get("default_target_lang", "fa"),
-            },
-            admin=True,
-        )
+        for name in (DOMAIN, DOMAIN_ENABLED):
+            gateway.request(
+                "POST",
+                "/admin/glossary/domains",
+                {
+                    "name": name,
+                    "src_lang": info.get("default_source_lang", "en"),
+                    "tgt_lang": info.get("default_target_lang", "fa"),
+                },
+                admin=True,
+            )
         domain_created = True
         gateway.request(
             "PATCH", f"/admin/glossary/domains/{DOMAIN}", {"enabled": False}, admin=True
@@ -327,16 +331,31 @@ def main() -> int:
             status == 404 and "disabled" in detail.lower(),
             f"status {status}, detail={detail!r}",
         )
+        # Asking about a domain that does not exist, so the error carries the
+        # available list. Both halves matter: the disabled one must be absent
+        # AND the enabled one present -- without the second assertion this
+        # passes on any deployment whose list is simply empty, which is what
+        # happened the first time this check ran.
+        status, unknown = gateway.request(
+            "POST", "/translate", {"text": args.text, "domain": "definitely-not-a-domain"}
+        )
+        offered = str(unknown.get("detail", "")).split("Available:")[-1]
         checks.check(
-            "a disabled domain is not advertised as available",
-            DOMAIN not in detail.split("Available:")[-1],
-            f"detail={detail!r}",
+            "the available list names enabled domains",
+            DOMAIN_ENABLED in offered,
+            f"offered={offered.strip()!r}",
+        )
+        checks.check(
+            "the available list omits disabled domains",
+            DOMAIN not in offered,
+            f"offered={offered.strip()!r}",
         )
 
     finally:
         if domain_created:
-            gateway.request("DELETE", f"/admin/glossary/domains/{DOMAIN}", admin=True)
-            print(f"cleanup: deleted domain {DOMAIN!r}")
+            for name in (DOMAIN, DOMAIN_ENABLED):
+                gateway.request("DELETE", f"/admin/glossary/domains/{name}", admin=True)
+            print(f"cleanup: deleted domains {DOMAIN!r}, {DOMAIN_ENABLED!r}")
         if entry_id is not None and not args.keep:
             status, _ = gateway.request(
                 "DELETE", f"/admin/glossary/entries/{entry_id}", admin=True
