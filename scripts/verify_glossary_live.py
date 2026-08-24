@@ -36,6 +36,8 @@ SOURCE_TERM = "multi-query attention"
 CANONICAL = "توجه چندپرسشی"
 ALIAS = "توجه چندگانه"
 SENTENCE = "The model relies on multi-query attention."
+# Created and removed by check 8; named so it cannot collide with a real one.
+DOMAIN = "verify-script-temporary"
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -64,6 +66,12 @@ class Gateway:
                 return error.code, json.loads(body)
             except json.JSONDecodeError:
                 return error.code, {"raw": body[:400]}
+        except urllib.error.URLError as error:
+            # An unreachable gateway is a setup problem, not a failed check --
+            # say so plainly instead of dumping a traceback.
+            print(f"\nCannot reach {self.base_url}: {error.reason}")
+            print("Is the gateway running, and is --base-url right?")
+            raise SystemExit(2) from None
 
 
 class Checks:
@@ -102,8 +110,27 @@ def main() -> int:
     gateway = Gateway(args.base_url, args.admin_key)
     checks = Checks()
     entry_id = None
+    domain_created = False
 
     print(f"\ngateway: {gateway.base_url}\n")
+
+    # --- 0. Is the running container the code you think it is? -----------
+    # A passing run against a stale image proves nothing about a change you
+    # just made. The admin PATCH routes exist only in the newer code, so the
+    # served OpenAPI schema is a reliable, unauthenticated tell.
+    print("0. Deployed code")
+    status, schema = gateway.request("GET", "/openapi.json")
+    paths = schema.get("paths", {}) if status == 200 else {}
+    has_patch = "patch" in paths.get("/admin/glossary/entries/{entry_id}", {})
+    if not checks.check(
+        "the admin PATCH routes are served",
+        has_patch,
+        ""
+        if has_patch
+        else "This container predates them. Rebuild and restart:\n"
+        "         docker compose up -d --build translategemma-api",
+    ):
+        return 1
 
     # --- 1. Is the feature actually on? ----------------------------------
     print("1. Feature is enabled")
@@ -234,7 +261,82 @@ def main() -> int:
             f"status {status} (a 200 here would mean silent fallback)",
         )
 
+        # --- 7. Correcting an entry keeps its id -------------------------
+        print("\n7. PATCH corrects in place")
+        status, patched = gateway.request(
+            "PATCH",
+            f"/admin/glossary/entries/{entry_id}",
+            {"aliases": [ALIAS, "توجه چند پرسشی"]},
+            admin=True,
+        )
+        checks.check(
+            "patch preserves the entry id",
+            status == 200 and patched.get("id") == entry_id,
+            f"status {status}, id={patched.get('id')} (was {entry_id})",
+        )
+        checks.check(
+            "the new alias is persisted",
+            "توجه چند پرسشی" in (patched.get("aliases") or []),
+            f"aliases={patched.get('aliases')}",
+        )
+
+        status, disabled = gateway.request(
+            "PATCH", f"/admin/glossary/entries/{entry_id}", {"enabled": False}, admin=True
+        )
+        status, dry = gateway.request(
+            "POST",
+            "/admin/glossary/dry-run",
+            {
+                "text": args.text,
+                "src_lang": info.get("default_source_lang", "en"),
+                "tgt_lang": info.get("default_target_lang", "fa"),
+            },
+            admin=True,
+        )
+        checks.check(
+            "disabling an entry takes effect without a restart",
+            status == 200 and dry.get("matches") == [],
+            f"matches={dry.get('matches')}",
+        )
+        gateway.request(
+            "PATCH", f"/admin/glossary/entries/{entry_id}", {"enabled": True}, admin=True
+        )
+
+        # --- 8. A disabled domain says so --------------------------------
+        print("\n8. A disabled domain is reported as disabled")
+        gateway.request(
+            "POST",
+            "/admin/glossary/domains",
+            {
+                "name": DOMAIN,
+                "src_lang": info.get("default_source_lang", "en"),
+                "tgt_lang": info.get("default_target_lang", "fa"),
+            },
+            admin=True,
+        )
+        domain_created = True
+        gateway.request(
+            "PATCH", f"/admin/glossary/domains/{DOMAIN}", {"enabled": False}, admin=True
+        )
+        status, refused = gateway.request(
+            "POST", "/translate", {"text": args.text, "domain": DOMAIN}
+        )
+        detail = str(refused.get("detail", ""))
+        checks.check(
+            "a disabled domain is refused as disabled, not as missing",
+            status == 404 and "disabled" in detail.lower(),
+            f"status {status}, detail={detail!r}",
+        )
+        checks.check(
+            "a disabled domain is not advertised as available",
+            DOMAIN not in detail.split("Available:")[-1],
+            f"detail={detail!r}",
+        )
+
     finally:
+        if domain_created:
+            gateway.request("DELETE", f"/admin/glossary/domains/{DOMAIN}", admin=True)
+            print(f"cleanup: deleted domain {DOMAIN!r}")
         if entry_id is not None and not args.keep:
             status, _ = gateway.request(
                 "DELETE", f"/admin/glossary/entries/{entry_id}", admin=True
