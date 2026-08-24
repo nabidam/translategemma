@@ -52,6 +52,13 @@ _RETRY_BACKOFF_S = 0.5
 # upstream -- the opposite of what a fail-fast check is for.
 _MODEL_CHECK_TIMEOUT_S = 10.0
 
+# Magnitude for a forbidden-rendering ban. logit_bias is an additive penalty,
+# not a hard block: the value has to exceed whatever margin the banned token
+# holds, and measurement against the served checkpoint showed -1 and -2 leaving
+# a confident token in place where -3 flipped it. -100 is comfortably past any
+# realistic margin without being so large it distorts the rest of the sampler.
+_FORBIDDEN_LOGIT_BIAS = -100.0
+
 
 class SentenceSplitter:
     """pysbd segmenters, created lazily and cached per language.
@@ -396,6 +403,55 @@ class TranslationEngine:
                     report, protections[text_index], failures_per_text[text_index]
                 )
             )
+        # A forbidden rendering the model produced anyway is the one case where
+        # re-decoding helps: a negative bias can push it OFF that wording. It
+        # cannot push it ONTO the agreed term -- only post-hoc replacement does
+        # that -- so this runs after apply_preferred, never instead of it, and
+        # keeps the original translation unless the retry is strictly better.
+        #
+        # Only fires when an administrator has listed forbidden renderings and
+        # the model produced one, so it costs nothing on an ordinary request.
+        # Bias is request-scoped upstream, so each violating text is re-decoded
+        # on its own.
+        for text_index, report in enumerate(reports):
+            if report is None or not report.violations:
+                continue
+            bias = self._forbidden_bias(report.violations)
+            if not bias:
+                continue
+            logger.info(
+                "Re-decoding text %d away from %d forbidden rendering(s).",
+                text_index,
+                len(report.violations),
+            )
+            retried = await self._generate(
+                [prepared[text_index]],
+                system,
+                source_lang,
+                target_lang,
+                max_new_tokens,
+                logit_bias=bias,
+            )
+            candidate, failed = restore(retried[0], protections[text_index])
+            if failed:
+                # The ban cost us the sentinel; the protected original stands.
+                continue
+            preferred_spans = [
+                span
+                for span in spans_per_text[text_index]
+                if span.term.target_mode != EXACT
+            ]
+            rewritten, retry_report = apply_preferred(candidate, preferred_spans)
+            if retry_report.violations:
+                # Still forbidden. Keep the original rather than trade one bad
+                # rendering for another and hide that we tried.
+                continue
+            translations[text_index] = rewritten
+            raw_translations[text_index] = candidate
+            reports[text_index] = merge_exact_outcome(
+                retry_report, protections[text_index], failures_per_text[text_index]
+            )
+
         return TranslationResult(
             translations=translations, raw_translations=raw_translations, reports=reports
         )
@@ -407,6 +463,7 @@ class TranslationEngine:
         source_lang: str,
         target_lang: str,
         max_new_tokens: int,
+        logit_bias: dict[str, float] | None = None,
     ) -> list[str]:
         if not segments:
             return []
@@ -425,7 +482,7 @@ class TranslationEngine:
         # Chunks are independent requests dispatched at once; vLLM merges them
         # with every other in-flight request into its own running batch.
         results = await asyncio.gather(
-            *(self._complete(chunk, max_new_tokens) for chunk in chunks)
+            *(self._complete(chunk, max_new_tokens, logit_bias) for chunk in chunks)
         )
         return [text for chunk_texts in results for text in chunk_texts]
 
@@ -498,12 +555,22 @@ class TranslationEngine:
             params.update(temperature=0.0, top_p=1.0, top_k=-1)
         return params
 
-    async def _complete(self, prompt_ids: list[list[int]], max_new_tokens: int) -> list[str]:
+    async def _complete(
+        self,
+        prompt_ids: list[list[int]],
+        max_new_tokens: int,
+        logit_bias: dict[str, float] | None = None,
+    ) -> list[str]:
         payload = {
             "model": self.settings.vllm_model,
             "prompt": prompt_ids,
             **self._sampling_params(max_new_tokens),
         }
+        if logit_bias:
+            # Request-scoped, not per-prompt: vLLM takes one logit_bias for the
+            # whole request regardless of how many prompts it carries (verified
+            # against 0.13.0). A re-decode therefore sends one text at a time.
+            payload["logit_bias"] = logit_bias
         data = await self._post("/completions", payload)
         choices = data.get("choices", [])
         if len(choices) != len(prompt_ids):
@@ -519,6 +586,27 @@ class TranslationEngine:
         # rows in the 2026-08-10 run); trimming it here would hide a regression
         # from whoever is reading the output.
         return texts
+
+    def _forbidden_bias(self, violations) -> dict[str, float]:
+        """Token bias that pushes the decoder off a forbidden rendering.
+
+        Per-token, because vLLM 0.13.0 does not expose `bad_words` on
+        /v1/completions -- it is declared on the chat request only, and sending
+        it here is accepted and silently ignored, which is worse than being
+        rejected (measured during design). Banning a multi-token Persian term
+        therefore means banning its individual tokens, so the ban also applies
+        to those tokens inside unrelated words in the same segment. That
+        imprecision is the price of the only mechanism available.
+
+        Both a bare and a space-prefixed form are tokenized: the same word
+        carries a different leading token mid-sentence than at the start.
+        """
+        token_ids: set[int] = set()
+        tokenizer = self.processor.tokenizer
+        for violation in violations:
+            for variant in (violation.forbidden, f" {violation.forbidden}"):
+                token_ids.update(tokenizer(variant, add_special_tokens=False)["input_ids"])
+        return {str(token_id): _FORBIDDEN_LOGIT_BIAS for token_id in token_ids}
 
     async def _post(self, path: str, payload: dict) -> dict:
         """POST with a bounded retry on the failures a restart looks like."""

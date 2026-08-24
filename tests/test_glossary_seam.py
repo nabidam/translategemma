@@ -204,3 +204,83 @@ async def test_a_preferred_only_index_still_sends_the_text_untouched():
         ["The genome."], SYSTEM, "en", "fa", 128, False, glossary_index=index
     )
     assert engine.sent == [["The genome."]]
+
+
+class _Tokenizer:
+    """Maps each word to a stable fake token id, enough to build a bias dict."""
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [abs(hash(word)) % 50000 for word in text.split()]}
+
+
+class _Processor:
+    tokenizer = _Tokenizer()
+
+
+def forbidden_index(source="genome", target="ژنوم", forbidden=("گنوم",)):
+    return build_index(
+        [
+            Term(
+                entry_id=1, source_term=source, target_term=target,
+                target_mode="preferred", aliases=(), forbidden=tuple(forbidden),
+                case_sensitive=False, whole_word=True, priority=0,
+            )
+        ],
+        version=11,
+    )
+
+
+class BiasRecordingEngine(RecordingEngine):
+    """Records the logit_bias of each call and can answer differently per call."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs[0])
+        self._outputs = outputs
+        self.processor = _Processor()
+        self.biases: list[dict | None] = []
+        self.calls = 0
+
+    async def _generate(
+        self, segments, system, source_lang, target_lang, max_new_tokens, logit_bias=None
+    ):
+        self.sent.append(list(segments))
+        self.biases.append(logit_bias)
+        output = self._outputs[min(self.calls, len(self._outputs) - 1)]
+        self.calls += 1
+        return [output] * len(segments)
+
+
+async def test_a_forbidden_rendering_triggers_a_biased_redecode():
+    engine = BiasRecordingEngine(["گنوم است.", "ژنوم است."])
+    result = await engine.translate(
+        ["The genome."], SYSTEM, "en", "fa", 128, False,
+        glossary_index=forbidden_index(),
+    )
+    assert engine.calls == 2, "a violation should provoke exactly one re-decode"
+    assert engine.biases[0] is None
+    assert engine.biases[1] and all(v == -100.0 for v in engine.biases[1].values())
+    assert result.translations[0] == "ژنوم است."
+    assert result.reports[0].violations == ()
+
+
+async def test_a_clean_translation_is_never_redecoded():
+    """The cost only lands when an admin listed a forbidden rendering and it appeared."""
+    engine = BiasRecordingEngine(["ژنوم است."])
+    await engine.translate(
+        ["The genome."], SYSTEM, "en", "fa", 128, False,
+        glossary_index=forbidden_index(),
+    )
+    assert engine.calls == 1
+    assert engine.biases == [None]
+
+
+async def test_a_still_forbidden_retry_keeps_the_original():
+    """Never trade one bad rendering for another, and never hide that we tried."""
+    engine = BiasRecordingEngine(["گنوم است.", "گنوم هنوز است."])
+    result = await engine.translate(
+        ["The genome."], SYSTEM, "en", "fa", 128, False,
+        glossary_index=forbidden_index(),
+    )
+    assert engine.calls == 2
+    assert result.translations[0] == "گنوم است."
+    assert [v.forbidden for v in result.reports[0].violations] == ["گنوم"]
