@@ -20,7 +20,7 @@ async def client():
     service = GlossaryService(database_url="sqlite+aiosqlite:///:memory:")
     await service.start()
     app = FastAPI()
-    app.include_router(build_router(service, KEY))
+    app.include_router(build_router(lambda: service, KEY))
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         client.service = service
@@ -262,14 +262,20 @@ class _NoLoadTranslationEngine(TranslationEngine):
 
 
 def test_the_admin_router_is_actually_mounted_by_the_real_lifespan(monkeypatch):
-    """Drives main.app's real startup, not a hand-built FastAPI()."""
+    """Drives the real production wiring, not a hand-built FastAPI().
+
+    Builds the app through main.create_app() -- the same call the module makes
+    at import to produce `main.app` -- after setting the environment, because
+    routes are now mounted when an app is constructed and the import-time app
+    was built while the feature was off.
+    """
     monkeypatch.setenv("TG_GLOSSARY_ENABLED", "true")
     monkeypatch.setenv("TG_ADMIN_API_KEY", LIFESPAN_KEY)
     monkeypatch.setenv("TG_GLOSSARY_DB_URL", "sqlite+aiosqlite:///:memory:")
     get_settings.cache_clear()
     monkeypatch.setattr(main_module, "TranslationEngine", _NoLoadTranslationEngine)
     try:
-        with TestClient(main_module.app) as test_client:
+        with TestClient(main_module.create_app()) as test_client:
             unauthorized = test_client.get("/admin/glossary/domains")
             assert unauthorized.status_code == 401
 
@@ -277,5 +283,34 @@ def test_the_admin_router_is_actually_mounted_by_the_real_lifespan(monkeypatch):
                 "/admin/glossary/domains", headers={"X-Admin-Key": LIFESPAN_KEY}
             )
             assert authorized.status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+def test_entering_lifespan_twice_does_not_duplicate_routes(monkeypatch):
+    """The property the create_app() restructure exists to guarantee.
+
+    Routes used to be mounted as a side effect of `lifespan`, which is a
+    re-entrant context manager: every startup appended another copy of the
+    admin router, and the first, already-closed registration shadowed the live
+    one. Mounting at construction makes startup idempotent.
+    """
+    monkeypatch.setenv("TG_GLOSSARY_ENABLED", "true")
+    monkeypatch.setenv("TG_ADMIN_API_KEY", LIFESPAN_KEY)
+    monkeypatch.setenv("TG_GLOSSARY_DB_URL", "sqlite+aiosqlite:///:memory:")
+    get_settings.cache_clear()
+    monkeypatch.setattr(main_module, "TranslationEngine", _NoLoadTranslationEngine)
+    try:
+        app = main_module.create_app()
+        before = len(app.routes)
+        for _ in range(2):
+            with TestClient(app) as test_client:
+                assert (
+                    test_client.get(
+                        "/admin/glossary/domains", headers={"X-Admin-Key": LIFESPAN_KEY}
+                    ).status_code
+                    == 200
+                )
+        assert len(app.routes) == before
     finally:
         get_settings.cache_clear()

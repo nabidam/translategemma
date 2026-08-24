@@ -49,7 +49,8 @@ class StubEngine(TranslationEngine):
 @pytest.fixture
 async def client():
     """The real app, wired to a stub engine and a real, empty glossary."""
-    app = main_module.app
+    # An app of this test's own, so nothing it does can leak into another.
+    app = main_module.create_app()
     glossary = GlossaryService(
         database_url="sqlite+aiosqlite:///:memory:",
         default_domain=None,
@@ -64,6 +65,9 @@ async def client():
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as http_client:
             http_client.glossary = glossary
+            # The app this client is bound to, so a test can swap the stub
+            # engine without reaching for a module-level singleton.
+            http_client.app = app
             yield http_client
     finally:
         await glossary.aclose()
@@ -135,7 +139,7 @@ async def test_terminology_mode_off_disables_matching_on_a_populated_termbase(cl
         source_term="genome", target_term="ژنوم", aliases=["گنوم"],
     )
     await client.glossary.reload()
-    main_module.app.state.engine = StubEngine(output="گنوم است.")
+    client.app.state.engine = StubEngine(output="گنوم است.")
     try:
         response = await client.post(
             "/translate",
@@ -143,7 +147,7 @@ async def test_terminology_mode_off_disables_matching_on_a_populated_termbase(cl
                   "terminology_mode": "off"},
         )
     finally:
-        main_module.app.state.engine = StubEngine()
+        client.app.state.engine = StubEngine()
     assert response.status_code == 200
     body = response.json()
     assert body["translation"] == "گنوم است."
@@ -184,14 +188,14 @@ async def test_end_to_end_translate_rewrites_output_with_a_populated_termbase(cl
         source_term="genome", target_term="ژنوم", aliases=["گنوم"],
     )
     await client.glossary.reload()
-    main_module.app.state.engine = StubEngine(output="گنوم است.")
+    client.app.state.engine = StubEngine(output="گنوم است.")
     try:
         response = await client.post(
             "/translate",
             json={"text": "The genome.", "source_lang": "en", "target_lang": "fa"},
         )
     finally:
-        main_module.app.state.engine = StubEngine()
+        client.app.state.engine = StubEngine()
     assert response.status_code == 200
     body = response.json()
     assert body["translation"] != body["raw_translation"]

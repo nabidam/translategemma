@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from anyio import to_thread
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -36,10 +36,14 @@ from translator import TranslationEngine
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("translategemma.api")
 
+# Declared on a router, not on an app instance: create_app() must be able to
+# build more than one app, and a decorator binds to whichever object it names.
+router = APIRouter()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
+    settings = app.state.settings
     engine = TranslationEngine(settings)
     # Tokenizer only, but still blocking file I/O: keep it off the event loop.
     await to_thread.run_sync(engine.load)
@@ -62,41 +66,67 @@ async def lifespan(app: FastAPI):
         )
         await glossary.start()
         logger.info("Glossary enabled: %s", settings.glossary_db_url)
-
-        from glossary.router import build_router
-
-        app.include_router(build_router(glossary, settings.admin_api_key))
     app.state.glossary = glossary
     try:
         yield
     finally:
+        app.state.glossary = None
+        app.state.engine = None
         if glossary is not None:
             await glossary.aclose()
         await engine.aclose()
 
 
-app = FastAPI(
-    title="TranslateGemma API",
-    description=(
-        "Translation gateway for TranslateGemma: renders prompts and forwards "
-        "generation to a vLLM server."
-    ),
-    version="0.1.0",
-    lifespan=lifespan,
-)
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build an app bound to one Settings object.
 
-_settings = get_settings()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_settings.cors_origins,
-    allow_credentials=_settings.cors_allow_credentials,
-    allow_methods=_settings.cors_allow_methods,
-    allow_headers=_settings.cors_allow_headers,
-)
+    Routes are mounted here, at construction, rather than inside `lifespan`.
+    Lifespan is a re-entrant context manager: mounting from it appends another
+    copy of every route each time it runs, so a process that starts the app
+    twice (any test that drives startup more than once) accumulates duplicates
+    and the first, already-closed registration shadows the live one.
+
+    The admin router still only exists when the feature is enabled, so a
+    disabled deployment answers 404 rather than 401 -- there is nothing there
+    to authorize against. What moved is *when* it is mounted, not *whether*.
+    """
+    settings = settings or get_settings()
+    app = FastAPI(
+        title="TranslateGemma API",
+        description=(
+            "Translation gateway for TranslateGemma: renders prompts and forwards "
+            "generation to a vLLM server."
+        ),
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    # Read by lifespan and by the request-scoped dependencies below, so an app
+    # never consults the module-level cache and two apps can differ.
+    app.state.settings = settings
+    app.state.engine = None
+    app.state.glossary = None
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=settings.cors_allow_credentials,
+        allow_methods=settings.cors_allow_methods,
+        allow_headers=settings.cors_allow_headers,
+    )
+    app.include_router(router)
+    if settings.glossary_enabled:
+        from glossary.router import build_router
+
+        app.include_router(
+            build_router(lambda: app.state.glossary, settings.admin_api_key)
+        )
+    return app
 
 
-def get_engine() -> TranslationEngine:
-    engine = getattr(app.state, "engine", None)
+app = create_app()
+
+
+def get_engine(request: Request) -> TranslationEngine:
+    engine = getattr(request.app.state, "engine", None)
     if engine is None or not engine.is_loaded:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Gateway is not ready."
@@ -104,9 +134,14 @@ def get_engine() -> TranslationEngine:
     return engine
 
 
-def get_glossary() -> GlossaryService | None:
-    """None when the feature is off. Callers must not branch on settings instead."""
-    return getattr(app.state, "glossary", None)
+def get_glossary(request: Request) -> GlossaryService | None:
+    """None when the feature is off. Callers must not branch on settings instead.
+
+    Read from `request.app`, never the module-level `app`: a test (or any host
+    that builds more than one app in a process) must not have its requests
+    answered from another app's state.
+    """
+    return getattr(request.app.state, "glossary", None)
 
 
 @dataclass(frozen=True)
@@ -200,7 +235,7 @@ async def _translate(engine, texts, resolved, glossary_index=None):
     )
 
 
-@app.get("/health-check", response_model=HealthResponse)
+@router.get("/health-check", response_model=HealthResponse)
 async def health_check(
     engine: TranslationEngine = Depends(get_engine),
     settings: Settings = Depends(get_settings),
@@ -222,7 +257,7 @@ async def health_check(
     return HealthResponse(translator="OK" if translations and translations[0].strip() else "FAIL")
 
 
-@app.get("/model-info", response_model=ModelInfoResponse)
+@router.get("/model-info", response_model=ModelInfoResponse)
 async def model_info(
     engine: TranslationEngine = Depends(get_engine),
     settings: Settings = Depends(get_settings),
@@ -245,17 +280,17 @@ async def model_info(
     )
 
 
-@app.post("/translate", response_model=TranslationResponse, response_model_exclude_none=True)
+@router.post("/translate", response_model=TranslationResponse, response_model_exclude_none=True)
 async def translate(
     prompt: Prompt,
     engine: TranslationEngine = Depends(get_engine),
     settings: Settings = Depends(get_settings),
+    glossary: GlossaryService | None = Depends(get_glossary),
 ):
     text = prompt.text.strip()
     if not text:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "text is empty.")
     resolved = _resolve(prompt, settings)
-    glossary = get_glossary()
     index = await _resolve_index(glossary, prompt, resolved, settings)
     result = await _translate(engine, [text], resolved, index)
     response = TranslationResponse(
@@ -271,7 +306,7 @@ async def translate(
     return response
 
 
-@app.post(
+@router.post(
     "/translate/batch",
     response_model=BatchTranslationResponse,
     response_model_exclude_none=True,
@@ -280,6 +315,7 @@ async def translate_batch(
     prompt: BatchPrompt,
     engine: TranslationEngine = Depends(get_engine),
     settings: Settings = Depends(get_settings),
+    glossary: GlossaryService | None = Depends(get_glossary),
 ):
     if len(prompt.texts) > settings.max_batch_items:
         raise HTTPException(
@@ -290,7 +326,6 @@ async def translate_batch(
     if any(not text for text in texts):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "texts contains an empty item.")
     resolved = _resolve(prompt, settings)
-    glossary = get_glossary()
     index = await _resolve_index(glossary, prompt, resolved, settings)
     result = await _translate(engine, texts, resolved, index)
     response = BatchTranslationResponse(

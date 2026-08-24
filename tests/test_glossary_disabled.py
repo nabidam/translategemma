@@ -1,6 +1,5 @@
 """With TG_GLOSSARY_ENABLED=false, the feature must be absent, not merely bypassed."""
 
-import importlib
 from pathlib import Path
 
 import pytest
@@ -61,24 +60,20 @@ class _StubTranslationEngine(TranslationEngine):
         return ["stub"] * len(segments)
 
 
-def _reload_app(monkeypatch):
-    """Re-execute main.py to get a fresh FastAPI() app, wired to the stub engine.
+def _fresh_app(monkeypatch):
+    """A brand-new app for this test, wired to the stub engine.
 
-    main.app is a module-level singleton, imported once for the whole pytest
-    session. FastAPI never undoes an app.include_router() call, so a prior
-    test in this same process that ran the real lifespan with the glossary
-    enabled (e.g. the lifespan test in tests/test_glossary_admin.py) leaves
-    the admin router mounted on that shared object permanently -- reusing it
-    here would make "the router is absent" pass or fail depending on test
-    order rather than on the behaviour under test. A real restart, which is
-    what disabling the glossary via an env var actually relies on, gets a
-    brand-new process and therefore a brand-new FastAPI() object; reloading
-    main.py mirrors that precisely instead of trusting the possibly
-    already-mutated shared singleton.
+    main.create_app() builds an independent FastAPI object bound to the
+    settings in force right now, which is exactly what a real restart gives a
+    disabled deployment. This used to call importlib.reload(main) because the
+    module-level app was the only app there was, and any earlier test that ran
+    the real lifespan with the glossary enabled left the admin router mounted
+    on that shared object forever -- making "the router is absent" depend on
+    test order rather than on behaviour. Routes are now mounted when the app is
+    constructed, so a fresh app is genuinely fresh and no reload is needed.
     """
-    importlib.reload(main_module)
     monkeypatch.setattr(main_module, "TranslationEngine", _StubTranslationEngine)
-    return main_module.app
+    return main_module.create_app()
 
 
 async def test_segments_sent_upstream_are_identical_with_and_without_a_glossary():
@@ -114,7 +109,7 @@ def test_no_database_file_is_created_when_disabled(tmp_path, monkeypatch):
     monkeypatch.delenv("TG_GLOSSARY_ENABLED", raising=False)
     get_settings.cache_clear()
     try:
-        app = _reload_app(monkeypatch)
+        app = _fresh_app(monkeypatch)
         with TestClient(app) as client:
             response = client.post(
                 "/translate",
@@ -140,7 +135,7 @@ def test_admin_routes_are_absent_not_unauthorized(monkeypatch):
     monkeypatch.delenv("TG_GLOSSARY_ENABLED", raising=False)
     get_settings.cache_clear()
     try:
-        app = _reload_app(monkeypatch)
+        app = _fresh_app(monkeypatch)
         with TestClient(app) as client:
             response = client.get("/admin/glossary/entries")
             assert response.status_code == 404
@@ -156,7 +151,7 @@ def test_response_body_carries_no_glossary_keys_when_disabled(monkeypatch):
     monkeypatch.delenv("TG_GLOSSARY_ENABLED", raising=False)
     get_settings.cache_clear()
     try:
-        app = _reload_app(monkeypatch)
+        app = _fresh_app(monkeypatch)
         with TestClient(app) as client:
             response = client.post(
                 "/translate",
@@ -202,7 +197,7 @@ def test_disabling_the_glossary_does_not_destroy_its_data(tmp_path, monkeypatch)
             monkeypatch.delenv("TG_ADMIN_API_KEY", raising=False)
         monkeypatch.setenv("TG_GLOSSARY_DB_URL", db_url)
         get_settings.cache_clear()
-        return _reload_app(monkeypatch)
+        return _fresh_app(monkeypatch)
 
     try:
         # Enable, write an entry.
@@ -234,4 +229,3 @@ def test_disabling_the_glossary_does_not_destroy_its_data(tmp_path, monkeypatch)
             assert [item["source_term"] for item in listed.json()] == ["genome"]
     finally:
         get_settings.cache_clear()
-        importlib.reload(main_module)

@@ -9,6 +9,7 @@ part here.
 """
 
 import secrets
+from collections.abc import Callable
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
@@ -75,7 +76,28 @@ class DryRunIn(BaseModel):
     domain: str | None = None
 
 
-def build_router(service: GlossaryService, api_key: str) -> APIRouter:
+def build_router(
+    get_service: Callable[[], "GlossaryService | None"], api_key: str
+) -> APIRouter:
+    """Build the admin router.
+
+    Takes a getter rather than a service instance so the router can be mounted
+    when the app is constructed, while the service it talks to is created later
+    by the lifespan. Mounting at construction is what keeps route registration
+    idempotent: mounting as a side effect of a re-entrant lifespan appends a
+    second copy of every route each time it runs.
+    """
+
+    def _service() -> GlossaryService:
+        service = get_service()
+        if service is None:
+            # Reachable only if the app was built with the glossary enabled and
+            # the lifespan has not finished (or has already torn down).
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Glossary is not ready."
+            )
+        return service
+
     async def require_key(x_admin_key: str | None = Header(default=None)) -> None:
         # compare_digest so a wrong key costs the same time as a right one.
         # It also requires ASCII-only strings: headers are latin-1 decoded, so
@@ -97,6 +119,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.get("/domains")
     async def list_domains():
+        service = _service()
         return [
             {
                 "name": domain.name,
@@ -110,6 +133,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.post("/domains", status_code=status.HTTP_201_CREATED)
     async def create_domain(payload: DomainIn):
+        service = _service()
         try:
             domain = await service.store.create_domain(
                 payload.name, payload.src_lang, payload.tgt_lang, payload.description
@@ -121,6 +145,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.delete("/domains/{name}")
     async def delete_domain(name: str):
+        service = _service()
         if not await service.store.delete_domain(name):
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"No such domain: {name!r}")
         await service.reload()
@@ -128,6 +153,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.get("/entries")
     async def list_entries(domain: str | None = None):
+        service = _service()
         try:
             entries = await service.store.list_entries(domain)
         except ValueError as error:
@@ -147,6 +173,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.post("/entries", status_code=status.HTTP_201_CREATED)
     async def create_entry(payload: EntryIn):
+        service = _service()
         if payload.target_mode not in SUPPORTED_TARGET_MODES:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -211,6 +238,7 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.delete("/entries/{entry_id}")
     async def delete_entry(entry_id: int):
+        service = _service()
         if not await service.store.delete_entry(entry_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"No entry {entry_id}.")
         await service.reload()
@@ -218,11 +246,13 @@ def build_router(service: GlossaryService, api_key: str) -> APIRouter:
 
     @router.post("/reload")
     async def reload():
+        service = _service()
         return {"version": await service.reload()}
 
     @router.post("/dry-run")
     async def dry_run(payload: DryRunIn = Body(...)):
         """Show what would fire on this text. No model call, no side effects."""
+        service = _service()
         try:
             index = await service.resolve(payload.src_lang, payload.tgt_lang, payload.domain)
         except UnknownDomainError as error:
