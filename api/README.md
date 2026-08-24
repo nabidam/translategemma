@@ -25,7 +25,8 @@ api/                    # ← copy this, and only this, to the server
 ├── schemas.py
 ├── translator.py       # prompt rendering + vLLM client
 ├── prompting.py        # copy, see below
-├── docker-compose.yml  # vLLM + gateway + benchmark profile
+├── docker-compose.yml  # gateway alone, against a remote vLLM (default)
+├── docker-compose.full.yml # vLLM + gateway on one host + benchmark profile
 ├── scripts/            # benchmark_speed.py, run inside the image
 └── .env.example
 ```
@@ -89,7 +90,7 @@ built three things. Under vLLM they are owned as follows:
 | ------------- | --------------- |
 | The stop set including `<end_of_turn>` (106) | Both sides. `scripts/merge_lora_adapter.py` bakes it into the merged checkpoint's `generation_config.json`, and the gateway resolves it again and sends `stop_token_ids` on every request. |
 | Sampling defaults, replacing TranslateGemma's invalid `config.json` values | The gateway, explicitly, per request — `temperature`, `top_p` and `top_k` are always sent. |
-| `dtype` | vLLM, via `--dtype` in `docker-compose.yml`. |
+| `dtype` | vLLM, via `--dtype` in `docker-compose.full.yml` (or however the remote server was launched). |
 
 The middle row is the one that needs care. vLLM's `--generation-config` defaults
 to `auto`, which reads `generation_config.json` from the model directory and
@@ -172,7 +173,7 @@ annotated list. The ones that decide what is served:
 
 How the upstream was loaded — dtype, attention kernel, quantization — is
 configured on the vLLM service (`--dtype`, and the flags beside it in
-`docker-compose.yml`) and is deliberately **not** mirrored here. A gateway-side
+`docker-compose.full.yml`) and is deliberately **not** mirrored here. A gateway-side
 copy of those flags would be a claim nothing verifies, and `/model-info` would
 report it even after the upstream was relaunched differently.
 
@@ -259,11 +260,35 @@ Restarting the gateway does **not** reload the weights: vLLM keeps them, and
 `/health`. That is the point of the split — shipping a change to the serving
 contract no longer costs a model load.
 
-`docker-compose.yml` in this directory ships both services:
+Two compose files ship here, and they differ only in whether vLLM is theirs.
+
+**`docker-compose.yml` (default) — the gateway alone, against a vLLM that is
+already running elsewhere.** No GPU is reserved, nothing waits on a model load,
+and `TG_VLLM_BASE_URL` is required: compose refuses to start without it rather
+than booting a gateway that 503s on every request.
 
 ```bash
-docker compose up -d              # vLLM, then the gateway once vLLM is healthy
-docker compose logs -f translategemma-vllm
+# in api/.env, or in the environment
+TG_VLLM_BASE_URL=http://10.0.0.5:8000/v1   # include the /v1 suffix
+TG_VLLM_MODEL=model                        # the remote's --served-model-name
+# TG_VLLM_API_KEY=...                      # sent as `Authorization: Bearer`
+
+docker compose up -d
+docker compose logs -f translategemma-api
+```
+
+vLLM on this same host but outside compose is reachable as
+`http://host.docker.internal:8001/v1`; the service maps that name to the docker
+host already. `TG_BASE_MODEL_ID` still has to name the checkpoint the remote
+serves — the gateway reads its tokenizer to render prompts — either as a path
+under the `${MODELS_DIR}` mount or as a Hub id with `HF_HUB_OFFLINE=0`.
+
+**`docker-compose.full.yml` — vLLM and the gateway on one host.** This is the
+single-machine deployment, and the one the paragraphs below describe.
+
+```bash
+docker compose -f docker-compose.full.yml up -d   # vLLM, then the gateway once vLLM is healthy
+docker compose -f docker-compose.full.yml logs -f translategemma-vllm
 ```
 
 * `translategemma-vllm` serves `${MODEL_PATH:-/models/translategemma-12b-merged}`
@@ -294,7 +319,8 @@ are numbers a caller can receive. The in-process engine transport is gone: the
 API loads no weights, so there is nothing left to measure without the server.
 
 ```bash
-# Needs both services up; the benchmark loads no weights itself.
+# Needs the gateway up and its upstream reachable; the benchmark loads no
+# weights itself. Add `-f docker-compose.full.yml` for the single-host stack.
 docker compose up -d
 docker compose run --rm benchmark --api-url http://translategemma-api:8000
 
