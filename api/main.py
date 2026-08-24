@@ -43,6 +43,15 @@ async def lifespan(app: FastAPI):
     engine = TranslationEngine(settings)
     # Tokenizer only, but still blocking file I/O: keep it off the event loop.
     await to_thread.run_sync(engine.load)
+    try:
+        # Before anything else: a TG_VLLM_MODEL that names a model this upstream
+        # does not serve is fatal here rather than an opaque 500 on every
+        # translation later. Closing the client on the way out keeps a
+        # misconfigured start from leaking a connection pool.
+        await engine.verify_upstream_model()
+    except Exception:
+        await engine.aclose()
+        raise
     app.state.engine = engine
     glossary = None
     if settings.glossary_enabled:

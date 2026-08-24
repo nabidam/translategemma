@@ -45,6 +45,12 @@ logger = logging.getLogger("translategemma.api")
 # Backoff base for retried requests, in seconds.
 _RETRY_BACKOFF_S = 0.5
 
+# Timeout for the startup model check, deliberately not settings.vllm_timeout.
+# That defaults to 300s to accommodate a cold vLLM compiling CUDA graphs, and
+# inheriting it here would hold startup for five minutes against a dead
+# upstream -- the opposite of what a fail-fast check is for.
+_MODEL_CHECK_TIMEOUT_S = 10.0
+
 
 class SentenceSplitter:
     """pysbd segmenters, created lazily and cached per language.
@@ -194,6 +200,70 @@ class TranslationEngine:
             ),
         )
         self.processor = processor
+
+    async def verify_upstream_model(self):
+        """Fail fast when TG_VLLM_MODEL names something the upstream does not serve.
+
+        A wrong model name is otherwise invisible until the first translation,
+        where vLLM answers 4xx, `_post` correctly refuses to retry, and the
+        caller receives a bare 500 with nothing actionable in it.
+
+        Only a *definite* mismatch is fatal: we asked, we got an answer, and the
+        configured name was not in it. An upstream we could not reach is not a
+        misconfiguration -- it is a restart, a slow start, or a network blip --
+        and crash-looping the gateway for it would be a worse outage than the
+        one this check exists to prevent. The retry logic in `_post` already
+        covers a briefly absent upstream.
+        """
+        settings = self.settings
+        if self._client is None:
+            # No client means no way to ask, which is the "could not verify"
+            # case, not a definite mismatch — the same reasoning as an
+            # unreachable upstream below. Nothing is hidden by being lenient
+            # here: translate() already refuses to run without a client.
+            logger.warning(
+                "Could not verify TG_VLLM_MODEL: no upstream client. Continuing."
+            )
+            return
+        try:
+            response = await self._client.get("/models", timeout=_MODEL_CHECK_TIMEOUT_S)
+        except httpx.HTTPError as error:
+            logger.warning(
+                "Could not verify TG_VLLM_MODEL against %s (%s). Continuing: an "
+                "unreachable upstream is a restart, not a misconfiguration.",
+                settings.vllm_base_url,
+                error,
+            )
+            return
+
+        if response.status_code != 200:
+            logger.warning(
+                "Could not verify TG_VLLM_MODEL: %s/models returned %s. Continuing.",
+                settings.vllm_base_url,
+                response.status_code,
+            )
+            return
+
+        try:
+            served = [entry["id"] for entry in response.json()["data"]]
+        except (ValueError, KeyError, TypeError) as error:
+            logger.warning(
+                "Could not verify TG_VLLM_MODEL: unexpected /models body from %s (%s). "
+                "Continuing.",
+                settings.vllm_base_url,
+                error,
+            )
+            return
+
+        if settings.vllm_model not in served:
+            raise ValueError(
+                f"TG_VLLM_MODEL={settings.vllm_model!r} is not served by "
+                f"{settings.vllm_base_url}, which serves {served}. This name must match "
+                "vLLM's --served-model-name. Left unfixed, every translation fails with "
+                "an opaque 500."
+            )
+        logger.info("Upstream at %s serves %r, as configured.", settings.vllm_base_url,
+                    settings.vllm_model)
 
     async def aclose(self):
         """Release the upstream client. There are no weights to free."""
@@ -409,9 +479,12 @@ class TranslationEngine:
                 if response.status_code >= 400:
                     # A 4xx is this gateway's bug (bad model name, prompt too
                     # long for the context window); retrying cannot help.
+                    # Name the configured model: a wrong TG_VLLM_MODEL is the
+                    # most common cause, and this message may be all a reader
+                    # gets if the startup check could not reach the upstream.
                     raise RuntimeError(
-                        f"vLLM rejected the request ({response.status_code}): "
-                        f"{response.text[:500]}"
+                        f"vLLM rejected the request ({response.status_code}) for "
+                        f"model {self.settings.vllm_model!r}: {response.text[:500]}"
                     )
                 return response.json()
             except (httpx.TransportError, httpx.HTTPStatusError) as error:
