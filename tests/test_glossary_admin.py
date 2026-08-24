@@ -314,3 +314,115 @@ def test_entering_lifespan_twice_does_not_duplicate_routes(monkeypatch):
         assert len(app.routes) == before
     finally:
         get_settings.cache_clear()
+
+
+async def test_patching_an_entry_preserves_its_id(client):
+    """The reason PATCH exists at all.
+
+    Correcting a term used to mean delete plus create, which changes the id --
+    and the id is what an administrator follows in the misses report while
+    curating aliases.
+    """
+    created = await client.post(
+        "/admin/glossary/entries", headers=HEADERS,
+        json={"src_lang": "en", "tgt_lang": "fa",
+              "source_term": "genome", "target_term": "wrong"},
+    )
+    entry_id = created.json()["id"]
+    patched = await client.patch(
+        f"/admin/glossary/entries/{entry_id}", headers=HEADERS,
+        json={"target_term": "ژنوم", "aliases": ["گنوم"]},
+    )
+    assert patched.status_code == 200
+    body = patched.json()
+    assert body["id"] == entry_id
+    assert body["target_term"] == "ژنوم"
+    assert body["aliases"] == ["گنوم"]
+    # and it is really persisted, not just echoed
+    listed = await client.get("/admin/glossary/entries", headers=HEADERS)
+    assert listed.json()[0]["target_term"] == "ژنوم"
+
+
+async def test_patching_an_entry_takes_effect_without_a_restart(client):
+    """Every mutation reloads the snapshot; a patch is no exception."""
+    created = await client.post(
+        "/admin/glossary/entries", headers=HEADERS,
+        json={"src_lang": "en", "tgt_lang": "fa",
+              "source_term": "genome", "target_term": "ژنوم"},
+    )
+    entry_id = created.json()["id"]
+    await client.patch(
+        f"/admin/glossary/entries/{entry_id}", headers=HEADERS, json={"enabled": False}
+    )
+    dry = await client.post(
+        "/admin/glossary/dry-run", headers=HEADERS,
+        json={"text": "The genome sequence.", "src_lang": "en", "tgt_lang": "fa"},
+    )
+    assert dry.json()["matches"] == []
+
+
+async def test_patching_an_unknown_entry_is_a_404(client):
+    response = await client.patch(
+        "/admin/glossary/entries/9999", headers=HEADERS, json={"target_term": "x"}
+    )
+    assert response.status_code == 404
+
+
+async def test_an_empty_patch_is_refused(client):
+    created = await client.post(
+        "/admin/glossary/entries", headers=HEADERS,
+        json={"src_lang": "en", "tgt_lang": "fa",
+              "source_term": "genome", "target_term": "ژنوم"},
+    )
+    response = await client.patch(
+        f"/admin/glossary/entries/{created.json()['id']}", headers=HEADERS, json={}
+    )
+    assert response.status_code == 422
+
+
+async def test_a_disabled_domain_is_reported_as_disabled_not_missing(client):
+    """Deferred item, reachable for the first time now that domains can be disabled.
+
+    A domain that exists but is off is equally unusable, so it is still a 404 --
+    but telling an administrator who just disabled it that it does not exist
+    would send them looking for the wrong problem.
+    """
+    await client.post(
+        "/admin/glossary/domains", headers=HEADERS,
+        json={"name": "medical", "src_lang": "en", "tgt_lang": "fa"},
+    )
+    patched = await client.patch(
+        "/admin/glossary/domains/medical", headers=HEADERS, json={"enabled": False}
+    )
+    assert patched.status_code == 200 and patched.json()["enabled"] is False
+
+    response = await client.post(
+        "/admin/glossary/dry-run", headers=HEADERS,
+        json={"text": "anything", "src_lang": "en", "tgt_lang": "fa", "domain": "medical"},
+    )
+    assert response.status_code == 404
+    assert "disabled" in response.json()["detail"].lower()
+
+
+async def test_a_disabled_domain_is_not_advertised_as_available(client):
+    """The other half of the same deferred item.
+
+    `available` exists to tell a caller what would actually work, so listing a
+    name that would itself 404 defeats it. Only testable now that something can
+    disable a domain.
+    """
+    for name in ("medical", "legal"):
+        await client.post(
+            "/admin/glossary/domains", headers=HEADERS,
+            json={"name": name, "src_lang": "en", "tgt_lang": "fa"},
+        )
+    await client.patch(
+        "/admin/glossary/domains/legal", headers=HEADERS, json={"enabled": False}
+    )
+    response = await client.post(
+        "/admin/glossary/dry-run", headers=HEADERS,
+        json={"text": "anything", "src_lang": "en", "tgt_lang": "fa", "domain": "nope"},
+    )
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "medical" in detail and "legal" not in detail

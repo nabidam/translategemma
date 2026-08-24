@@ -14,15 +14,20 @@ from .store import GlossaryStore
 
 
 class UnknownDomainError(Exception):
-    """A request named a domain that does not exist.
+    """A request named a domain that cannot be used.
 
     Carries the valid names so the API can say what the caller could have
     meant. A typo silently answered from the global termbase is the failure
     this whole layer exists to prevent.
+
+    `reason` distinguishes a domain that does not exist from one that exists
+    and is disabled. Both are equally unusable, so both are a 404, but an
+    administrator who just turned one off should not be told it never existed.
     """
 
-    def __init__(self, name: str, available: list[str]):
-        super().__init__(f"No such glossary domain: {name!r}. Available: {available}")
+    def __init__(self, name: str, available: list[str], reason: str | None = None):
+        self.reason = reason or f"No such glossary domain: {name!r}."
+        super().__init__(f"{self.reason} Available: {available}")
         self.name = name
         self.available = available
 
@@ -106,14 +111,14 @@ class GlossaryService:
 
         try:
             terms, version = await self.store.load_terms(src_lang, tgt_lang, name)
-        except ValueError:
+        except ValueError as error:
             if self._unknown_domain == "fallback":
                 terms, version = await self.store.load_terms(src_lang, tgt_lang, None)
             else:
                 available = [
                     row.name for row in await self.store.list_domains() if row.enabled
                 ]
-                raise UnknownDomainError(name or "", available) from None
+                raise UnknownDomainError(name or "", available, str(error)) from None
 
         index = build_index(terms, version)
         # Rebind rather than mutate: a concurrent reader either sees the old

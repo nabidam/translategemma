@@ -69,6 +69,35 @@ class EntryIn(BaseModel):
         return normalize_lang_code(value)
 
 
+class DomainPatch(BaseModel):
+    """Patchable fields of a domain. Omitted fields are left alone.
+
+    The name is not patchable: it is the selector callers send, so renaming
+    would silently break every request naming it.
+    """
+
+    description: str | None = None
+    enabled: bool | None = None
+
+
+class EntryPatch(BaseModel):
+    """Patchable fields of an entry. Omitted fields are left alone.
+
+    Identity -- source term, language pair, domain, case sensitivity -- is not
+    patchable: those form the unique key, and changing one makes it a different
+    entry. Preserving the id is the point, since that is what an administrator
+    tracks in the misses report while curating aliases.
+    """
+
+    target_term: str | None = Field(default=None, min_length=1, max_length=512)
+    aliases: list[str] | None = None
+    forbidden: list[str] | None = None
+    priority: int | None = None
+    whole_word: bool | None = None
+    enabled: bool | None = None
+    notes: str | None = None
+
+
 class DryRunIn(BaseModel):
     text: str
     src_lang: str
@@ -142,6 +171,21 @@ def build_router(
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         await service.reload()
         return {"name": domain.name}
+
+    @router.patch("/domains/{name}")
+    async def update_domain(name: str, payload: DomainPatch):
+        service = _service()
+        fields = payload.model_dump(exclude_unset=True, exclude_none=True)
+        if not fields:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "No patchable fields supplied."
+            )
+        domain = await service.store.update_domain(name, **fields)
+        if domain is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No such domain: {name!r}")
+        await service.reload()
+        return {"name": domain.name, "enabled": domain.enabled,
+                "description": domain.description}
 
     @router.delete("/domains/{name}")
     async def delete_domain(name: str):
@@ -236,6 +280,29 @@ def build_router(
         await service.reload()
         return {"id": entry.id}
 
+    @router.patch("/entries/{entry_id}")
+    async def update_entry(entry_id: int, payload: EntryPatch):
+        service = _service()
+        fields = payload.model_dump(exclude_unset=True, exclude_none=True)
+        if not fields:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "No patchable fields supplied."
+            )
+        entry = await service.store.update_entry(entry_id, **fields)
+        if entry is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No entry {entry_id}.")
+        await service.reload()
+        return {
+            "id": entry.id,
+            "source_term": entry.source_term,
+            "target_term": entry.target_term,
+            "aliases": entry.aliases,
+            "forbidden": entry.forbidden,
+            "priority": entry.priority,
+            "whole_word": entry.whole_word,
+            "enabled": entry.enabled,
+        }
+
     @router.delete("/entries/{entry_id}")
     async def delete_entry(entry_id: int):
         service = _service()
@@ -260,7 +327,7 @@ def build_router(
             # reach traffic must not answer a typo'd domain with a 500.
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
-                f"Unknown glossary domain {error.name!r}. Available: {error.available}",
+                f"{error.reason} Available: {error.available}",
             ) from error
         spans = service.plan(index, payload.text)
         return {

@@ -113,6 +113,25 @@ class GlossaryStore:
             await session.commit()
             return deleted
 
+    async def update_domain(self, name: str, **fields) -> Domain | None:
+        """Patch a domain in place. Returns None when there is no such domain.
+
+        Only `description` and `enabled` are patchable. The name is the selector
+        callers send and part of the identity a snapshot is keyed by; renaming
+        would silently break every caller naming it, so a rename is a delete
+        plus a create, deliberately.
+        """
+        async with self._session() as session:
+            domain = await session.scalar(select(Domain).where(Domain.name == name))
+            if domain is None:
+                return None
+            for key, value in fields.items():
+                setattr(domain, key, value)
+            await self._bump(session)
+            await session.commit()
+            return domain
+
+
     # ---------------------------------------------------------------- entries
 
     async def list_entries(self, domain_name: str | None = None) -> list[Entry]:
@@ -181,6 +200,26 @@ class GlossaryStore:
             await session.commit()
             return deleted
 
+    async def update_entry(self, entry_id: int, **fields) -> Entry | None:
+        """Patch an entry in place. Returns None when there is no such entry.
+
+        Identity is not patchable: `source_term`, the language pair, the domain
+        and `case_sensitive` together form the unique key, and changing any of
+        them makes it a different entry. Preserving the id is the whole point --
+        it is what an administrator is tracking in the misses report while
+        curating aliases, and delete-plus-create loses it.
+        """
+        async with self._session() as session:
+            entry = await session.scalar(select(Entry).where(Entry.id == entry_id))
+            if entry is None:
+                return None
+            for key, value in fields.items():
+                setattr(entry, key, value)
+            await self._bump(session)
+            await session.commit()
+            return entry
+
+
     # ----------------------------------------------------------------- terms
 
     async def load_terms(
@@ -196,9 +235,15 @@ class GlossaryStore:
 
             domain_id = None
             if domain_name is not None:
+                # Looked up without the enabled filter so a disabled domain can
+                # be reported as disabled rather than as nonexistent. They are
+                # equally unusable, but an administrator who just turned one off
+                # should not be told it does not exist.
                 domain = await session.scalar(
-                    select(Domain).where(Domain.name == domain_name, Domain.enabled.is_(True))
+                    select(Domain).where(Domain.name == domain_name)
                 )
+                if domain is not None and not domain.enabled:
+                    raise ValueError(f"Domain {domain_name!r} is disabled.")
                 if domain is None:
                     raise ValueError(f"No such domain: {domain_name!r}")
                 domain_id = domain.id

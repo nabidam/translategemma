@@ -209,7 +209,7 @@ async def _resolve_index(glossary, prompt, resolved, settings):
     except UnknownDomainError as error:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"Unknown glossary domain {error.name!r}. Available: {error.available}",
+            f"{error.reason} Available: {error.available}",
         ) from error
     except (SQLAlchemyError, OSError):
         # The glossary's own premise: a database problem (unmounted volume,
