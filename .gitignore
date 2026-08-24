@@ -47,3 +47,7 @@ api/benchmarks/
 # scripts/bench_ab.sh. .env.bench.example is the tracked template.
 .env.bench
 benchmark_ab/
+
+# Persian-language internal guide to the glossary feature, kept local for the
+# team's own agents rather than carried in history.
+docs/GLOSSARY_FA.md
