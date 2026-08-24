@@ -202,3 +202,36 @@ def apply_preferred(
     return result, Report(
         applied=tuple(applied), misses=tuple(misses), violations=tuple(violations)
     )
+
+
+def merge_exact_outcome(report: Report, protection, failed_source_terms: list[str]) -> Report:
+    """Fold `exact` mode's outcome into the report `preferred` mode produced.
+
+    Exact terms never pass through apply_preferred — the model never saw them,
+    so there is nothing in the output to match. They are reported here instead:
+    a sentinel that survived is an applied term, one that did not is a miss with
+    a reason that names what actually went wrong, so an administrator can tell
+    "the model ignored my sentinel" from "the model chose different words".
+    """
+    if protection.is_empty:
+        return report
+
+    failed = set(failed_source_terms)
+    applied = list(report.applied)
+    misses = list(report.misses)
+    for index, (_, target_term) in enumerate(protection.restorations):
+        source_term = protection.source_terms[index]
+        if source_term in failed:
+            misses.append(Miss(source_term=source_term, reason="sentinel_lost"))
+        else:
+            applied.append(
+                Applied(
+                    source_term=source_term,
+                    target_term=target_term,
+                    mode="exact",
+                    count=1,
+                )
+            )
+    return Report(
+        applied=tuple(applied), misses=tuple(misses), violations=report.violations
+    )

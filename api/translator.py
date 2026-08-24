@@ -36,8 +36,9 @@ import httpx
 from anyio import to_thread
 
 from config import System
-from glossary.apply import Report, apply_preferred
+from glossary.apply import Report, apply_preferred, merge_exact_outcome
 from glossary.matcher import Index, Span, find_spans
+from glossary.protect import EXACT, protect, restore, strip_sentinels
 from prompting import render_inference_prompts, resolve_stop_token_ids
 
 logger = logging.getLogger("translategemma.api")
@@ -312,32 +313,89 @@ class TranslationEngine:
             [] if glossary_index is None else find_spans(glossary_index, text) for text in texts
         ]
 
+        # `exact` spans are substituted out of the SOURCE before generation, so
+        # the model never sees the term and cannot inflect it. This is the one
+        # place the glossary alters what is sent upstream, and only for entries
+        # an administrator explicitly created as exact -- a deployment with no
+        # such entries posts byte-identical payloads, as before.
+        protections = [protect(text, spans) for text, spans in zip(texts, spans_per_text)]
+        prepared = [
+            protection.text if not protection.is_empty else text
+            for text, protection in zip(texts, protections)
+        ]
+
         if split_sentences:
-            segments_per_text = [self.splitter.split(text, source_lang) for text in texts]
+            segments_per_text = [self.splitter.split(text, source_lang) for text in prepared]
         else:
-            segments_per_text = [[text] for text in texts]
+            segments_per_text = [[text] for text in prepared]
 
         flat_segments = [segment for segments in segments_per_text for segment in segments]
         flat_translations = await self._generate(
             flat_segments, system, source_lang, target_lang, max_new_tokens
         )
 
+        joined_per_text: list[str] = []
+        cursor = 0
+        for segments in segments_per_text:
+            chunk = flat_translations[cursor : cursor + len(segments)]
+            cursor += len(segments)
+            joined_per_text.append(" ".join(part for part in chunk if part))
+
+        # Restore the agreed terms, and note any text whose sentinels the model
+        # did not carry through faithfully.
+        restored_per_text: list[str] = []
+        failures_per_text: list[list[str]] = []
+        for joined, protection in zip(joined_per_text, protections):
+            restored, failed = restore(joined, protection)
+            restored_per_text.append(restored)
+            failures_per_text.append(failed)
+
+        # A lost sentinel means this translation was generated from a prompt the
+        # model mishandled, so the honest answer is the unprotected translation
+        # plus a reported miss -- not a guess about where the term belonged.
+        retry_indices = [i for i, failed in enumerate(failures_per_text) if failed]
+        if retry_indices:
+            logger.warning(
+                "Sentinel validation failed for %d text(s); re-translating unprotected.",
+                len(retry_indices),
+            )
+            retry_translations = await self._generate(
+                [texts[i] for i in retry_indices],
+                system,
+                source_lang,
+                target_lang,
+                max_new_tokens,
+            )
+            for index, translation in zip(retry_indices, retry_translations):
+                # strip_sentinels is belt and braces: the retry sends the
+                # original text, so there is nothing for it to remove.
+                restored_per_text[index] = strip_sentinels(translation, protections[index])
+
         translations: list[str] = []
         raw_translations: list[str] = []
         reports: list[Report | None] = []
-        cursor = 0
-        for text_index, segments in enumerate(segments_per_text):
-            chunk = flat_translations[cursor : cursor + len(segments)]
-            cursor += len(segments)
-            joined = " ".join(part for part in chunk if part)
-            raw_translations.append(joined)
+        for text_index, restored in enumerate(restored_per_text):
+            raw_translations.append(restored)
             if glossary_index is None:
-                translations.append(joined)
+                translations.append(restored)
                 reports.append(None)
                 continue
-            rewritten, report = apply_preferred(joined, spans_per_text[text_index])
+            # Exact spans are deliberately withheld: the model never saw those
+            # terms, so there is nothing in the output for apply_preferred to
+            # match, and letting it try would report each one twice -- once
+            # here and once from merge_exact_outcome below.
+            preferred_spans = [
+                span
+                for span in spans_per_text[text_index]
+                if span.term.target_mode != EXACT
+            ]
+            rewritten, report = apply_preferred(restored, preferred_spans)
             translations.append(rewritten)
-            reports.append(report)
+            reports.append(
+                merge_exact_outcome(
+                    report, protections[text_index], failures_per_text[text_index]
+                )
+            )
         return TranslationResult(
             translations=translations, raw_translations=raw_translations, reports=reports
         )

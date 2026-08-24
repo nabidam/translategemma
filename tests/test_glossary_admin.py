@@ -88,13 +88,26 @@ async def test_a_multi_word_phrase_containing_a_stopword_is_allowed(client):
     assert response.status_code == 201
 
 
-async def test_exact_mode_is_refused_until_phase_two(client):
+async def test_exact_mode_is_accepted(client):
+    """Superseded the earlier "refused until phase two" test, now that it ships."""
     response = await client.post(
         "/admin/glossary/entries",
         headers=HEADERS,
         json={
             "src_lang": "en", "tgt_lang": "fa", "source_term": "wordomatic",
             "target_term": "wordomatic", "target_mode": "exact",
+        },
+    )
+    assert response.status_code == 201
+
+
+async def test_an_unknown_target_mode_is_still_refused(client):
+    response = await client.post(
+        "/admin/glossary/entries",
+        headers=HEADERS,
+        json={
+            "src_lang": "en", "tgt_lang": "fa", "source_term": "wordomatic",
+            "target_term": "wordomatic", "target_mode": "sentinel-please",
         },
     )
     assert response.status_code == 422

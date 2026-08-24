@@ -28,8 +28,11 @@ STOPWORDS = frozenset(
     """.split()
 )
 
-# Widened when sentinel protection ships (phase 2 of the design document).
-SUPPORTED_TARGET_MODES = frozenset({"preferred"})
+# 'exact' substitutes the term out of the source before generation, so the
+# model never sees it. Restricted by documentation, not by code, to terms
+# Persian morphology does not attach to -- product names, organisations,
+# codes, units. See glossary/protect.py.
+SUPPORTED_TARGET_MODES = frozenset({"preferred", "exact"})
 
 
 class DomainIn(BaseModel):
