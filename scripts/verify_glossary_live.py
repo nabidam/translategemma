@@ -17,10 +17,19 @@ Run it on the host where the gateway runs, after enabling the feature:
     TG_ADMIN_API_KEY=... python3 scripts/verify_glossary_live.py \
         --base-url http://localhost:8000
 
-It creates one entry, exercises it, and deletes it again, so it is safe to run
-against a deployment that already has a termbase -- with one caveat: if an
-entry for the same source term already exists, the create returns 409 and the
-script stops rather than touching data it did not create.
+It creates its own entries and domains, exercises them, and removes them
+again, so it is safe to run against a deployment that already has a termbase
+-- with one caveat: if an entry for the same source term already exists, the
+create returns 409 and the script stops rather than touching data it did not
+create.
+
+Checks 9 and 10 cover the two modes that alter behaviour beyond post-hoc
+replacement. Neither asserts that the model obeys, because neither mechanism
+can compel it: exact mode can only ask the decoder to carry a placeholder
+through, and a forbidden ban can only push it off a wording, never onto the
+right one. What they assert is that the gateway is honest about which
+happened -- a placeholder never reaches a caller, and a forbidden rendering is
+never returned unflagged.
 
 Stdlib only, so it runs anywhere that can reach the gateway.
 """
@@ -41,6 +50,12 @@ DOMAIN = "verify-script-temporary"
 # A second, *enabled* domain, so check 8 can prove the available list filters
 # by enabled rather than merely being empty.
 DOMAIN_ENABLED = "verify-script-enabled"
+
+# exact mode: an invented product name, so the model has no learned rendering
+# for it and any faithful output must be the sentinel carried through. Azure's
+# own dynamic-dictionary documentation uses the same shape of example.
+EXACT_TERM = "Wordomatic"
+EXACT_SENTENCE = "We deployed Wordomatic on the cluster last week."
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -114,6 +129,7 @@ def main() -> int:
     checks = Checks()
     entry_id = None
     domain_created = False
+    exact_entry_id = None
 
     print(f"\ngateway: {gateway.base_url}\n")
 
@@ -125,6 +141,8 @@ def main() -> int:
     status, schema = gateway.request("GET", "/openapi.json")
     paths = schema.get("paths", {}) if status == 200 else {}
     has_patch = "patch" in paths.get("/admin/glossary/entries/{entry_id}", {})
+    # exact mode and the forbidden re-decode ship together with the patch
+    # routes, so one probe covers the build these checks assume.
     if not checks.check(
         "the admin PATCH routes are served",
         has_patch,
@@ -351,7 +369,88 @@ def main() -> int:
             f"offered={offered.strip()!r}",
         )
 
+        # --- 9. exact mode: the model never sees the term ----------------
+        print("\n9. exact mode keeps a term verbatim")
+        status, exact_created = gateway.request(
+            "POST",
+            "/admin/glossary/entries",
+            {
+                "src_lang": info.get("default_source_lang", "en"),
+                "tgt_lang": info.get("default_target_lang", "fa"),
+                "source_term": EXACT_TERM,
+                "target_term": EXACT_TERM,
+                "target_mode": "exact",
+            },
+            admin=True,
+        )
+        if checks.check(
+            "an exact entry is accepted", status == 201, f"status {status}"
+        ):
+            exact_entry_id = exact_created.get("id")
+            status, result = gateway.request(
+                "POST", "/translate", {"text": EXACT_SENTENCE}
+            )
+            translation = result.get("translation", "")
+            report = result.get("glossary") or {}
+            applied = report.get("applied", [])
+            misses = report.get("misses", [])
+            print(f"         {translation}")
+            checks.check(
+                "the term survives character-for-character",
+                status == 200 and EXACT_TERM in translation,
+                f"status {status}, expected {EXACT_TERM!r} in the output",
+            )
+            checks.check(
+                "no placeholder leaked to the caller",
+                "__TG_TERM" not in translation,
+                f"translation={translation!r}",
+            )
+            reported_exact = [a for a in applied if a.get("mode") == "exact"]
+            lost = [m for m in misses if m.get("reason") == "sentinel_lost"]
+            checks.check(
+                "the outcome is reported honestly",
+                bool(reported_exact) != bool(lost),
+                f"applied(exact)={reported_exact}, misses={misses}",
+            )
+            if lost:
+                print(
+                    "         NOTE: the model did not carry the placeholder through.\n"
+                    "         The gateway fell back correctly, but exact mode is not\n"
+                    "         reliable on this checkpoint -- run the sentinel probe at\n"
+                    "         scale before depending on it."
+                )
+
+        # --- 10. a forbidden rendering is removed or reported -------------
+        print("\n10. a forbidden rendering never passes silently")
+        gateway.request(
+            "PATCH",
+            f"/admin/glossary/entries/{entry_id}",
+            {"aliases": [], "forbidden": [ALIAS]},
+            admin=True,
+        )
+        status, result = gateway.request("POST", "/translate", {"text": args.text})
+        translation = result.get("translation", "")
+        violations = (result.get("glossary") or {}).get("violations", [])
+        print(f"         {translation}")
+        # The contract is not "the model obeys" -- a ban can only push it off a
+        # wording, never onto the right one. What must hold is that a forbidden
+        # rendering is never returned without being flagged.
+        checks.check(
+            "a forbidden rendering is either gone or reported",
+            status == 200 and (ALIAS not in translation or bool(violations)),
+            f"status {status}, violations={violations}",
+        )
+        if ALIAS in translation:
+            print("         NOTE: the re-decode did not shift the model; reported instead.")
+        else:
+            print("         The re-decode moved the model off the forbidden rendering.")
+
     finally:
+        if exact_entry_id is not None:
+            gateway.request(
+                "DELETE", f"/admin/glossary/entries/{exact_entry_id}", admin=True
+            )
+            print(f"cleanup: deleted exact entry {exact_entry_id}")
         if domain_created:
             for name in (DOMAIN, DOMAIN_ENABLED):
                 gateway.request("DELETE", f"/admin/glossary/domains/{name}", admin=True)
