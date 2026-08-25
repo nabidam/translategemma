@@ -1,0 +1,214 @@
+# Fine-tuning data-volume benchmark: TranslateGemma vs NLLB-200.
+#
+# Every path, volume, model and metric decision lives here. Nothing in this
+# directory reads config.yaml / benchmark_config.yaml directly; those two files
+# are used only as BASE templates that the overrides below are merged over, so
+# the repository's validated training and scoring defaults are inherited without
+# being modified.
+#
+#   docker compose run --rm trainer \
+#     python scripts/finetune_benchmark/run_sweep.py all \
+#       --config scripts/finetune_benchmark/sweep_config.yaml
+sweep:
+  output_dir: "logs/finetune_benchmark"
+  # Physical GPU IDs the sweep may use. One job per GPU, scheduled as a pool:
+  # 8 fine-tunes and every evaluation shard run 4-wide on this host.
+  gpus: [4, 5, 6, 7]
+  # Fine-tune data volumes, in rows. Subsets are nested (5k is a subset of 10k
+  # and so on), so a volume-to-volume delta is data ADDED, not data swapped.
+  volumes: [5000, 10000, 50000, 100000]
+  # Fixed for every volume, so a delta reads as "what more data buys".
+  # Training compute therefore scales with the volume; the report states the
+  # GPU-hours each cell actually cost so the confound stays visible.
+  epochs: 3
+  seed: 42
+  # Keep the matrix running when one cell fails (an OOM, a bad path) and mark it
+  # failed in the report instead of losing the completed cells.
+  fail_fast: false
+  telemetry:
+    enabled: true
+    interval_seconds: 2.0
+
+# The domain corpus every training subset and the in-domain test set come from.
+corpus:
+  csv_path: "data/domain_corpus.csv"
+  columns:
+    id: "id"
+    source: "en"
+    target: "fa"
+    domain: "domain"
+  # Document id is the part of `id` before this separator. Subsets and the test
+  # set are split on documents, never rows, or adjacent chunks leak.
+  id_separator: ":"
+  source_lang: "en"
+  target_lang: "fa"
+
+data:
+  work_dir: "data/finetune_benchmark"
+  # 500 rows reserved with build_test_set.py's strategy: stratified by
+  # domain x length, diversity-maximised, then document-level held out from the
+  # training pool with a near-duplicate purge.
+  in_domain_test:
+    mode: "build" # "build" runs build_test_set.py; "existing" uses existing_path.
+    existing_path: null
+    size: 500
+    # Merged over testset_config.yaml. selection.total_size and the dev split
+    # are forced by the sweep (500 rows, test only), so do not set them here.
+    overrides:
+      selection:
+        seed: 42
+        max_test_documents: 40
+      dedup:
+        enabled: true
+        minhash_enabled: true
+        embedding_dedup_enabled: true
+      splits:
+        dev_test_split: false
+      gold_subset:
+        enabled: false
+  # Held out from each training subset for the trainer's eval_loss. No test
+  # split is produced here: the test sets are the three files below.
+  validation_ratio: 0.05
+
+models:
+  translategemma:
+    enabled: true
+    label: "TranslateGemma 12B"
+    kind: "causal_lora" # Fine-tuned by the repository's train.py, unmodified.
+    family: "translategemma"
+    size: "12b"
+    base_model_id: "google/translategemma-12b-it"
+    # Merged over config.yaml. Data paths, output dirs, epochs and the
+    # evaluation-after-training switch are set per cell by the sweep.
+    overrides:
+      model:
+        attn_implementation: "flash_attention_3"
+      training:
+        batch_size: 6
+        eval_batch_size: 2
+        effective_batch_size: 48
+        learning_rate: 2.0e-4
+        packing: true
+        gradient_checkpointing: true
+        use_liger_kernel: true
+        save_total_limit: 1
+        eval_steps: 200
+        save_steps: 200
+        report_to: "none"
+    evaluation:
+      runner: "translategemma"
+      source_lang: "en"
+      target_lang: "fa"
+      dtype: "bfloat16"
+      attn_implementation: "sdpa"
+
+  nllb:
+    enabled: true
+    label: "NLLB-200 3.3B"
+    kind: "seq2seq_lora" # Fine-tuned by train_nllb_lora.py in this directory.
+    family: "nllb"
+    size: "3.3b"
+    base_model_id: "facebook/nllb-200-3.3B"
+    # NLLB language tags are model-specific, not ISO-639-1.
+    source_lang_token: "eng_Latn"
+    target_lang_token: "pes_Arab"
+    training:
+      learning_rate: 1.0e-4
+      per_device_batch_size: 8
+      gradient_accumulation_steps: 6 # Effective batch 48, matching the Gemma side.
+      max_source_length: 384
+      max_target_length: 384
+      warmup_ratio: 0.03
+      lr_scheduler_type: "cosine"
+      weight_decay: 0.0
+      max_grad_norm: 1.0
+      label_smoothing_factor: 0.0
+      logging_steps: 25
+      eval_steps: 200
+      save_steps: 200
+      save_total_limit: 1
+      bf16: true
+      gradient_checkpointing: true
+      dataloader_num_workers: 2
+      optim: "adamw_torch_fused"
+      lora:
+        r: 16
+        alpha: 32
+        dropout: 0.05
+        # Encoder/decoder attention and FFN projections. NLLB names its FFN
+        # layers fc1/fc2, not gate/up/down.
+        target_modules: ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+    evaluation:
+      runner: "nllb"
+      source_lang: "eng_Latn"
+      target_lang: "pes_Arab"
+      dtype: "bfloat16"
+
+# Every system is evaluated on every enabled test set. `path: auto` on the
+# in-domain set resolves to the 500 rows produced by the data stage.
+test_sets:
+  - id: "in_domain"
+    label: "In-domain (500, held out)"
+    enabled: true
+    path: "auto"
+    columns: { id: "id", source: "en", reference: "fa", domain: "domain" }
+  - id: "ntrex"
+    label: "NTREX-128 en→fa"
+    enabled: true
+    path: "data/testsets/ntrex_en_fa.csv"
+    columns: { id: "id", source: "en", reference: "fa", domain: "domain" }
+    # Public sets carry no domain column; a constant keeps the slice tables valid.
+    default_domain: "ntrex"
+  - id: "flores"
+    label: "FLORES-200 devtest en→fa"
+    enabled: true
+    path: "data/testsets/flores200_devtest_en_fa.csv"
+    columns: { id: "id", source: "en", reference: "fa", domain: "domain" }
+    default_domain: "flores"
+
+evaluation:
+  # One candidate per GPU. Generation is scheduled across sweep.gpus; scoring
+  # and report rendering are single-process stages by design.
+  generation:
+    batch_size: 8
+    max_new_tokens: 512
+    num_beams: 1
+    do_sample: false
+  # Merged over benchmark_config.yaml's metrics/statistics/report sections, so
+  # a number here is comparable with a number from a plain benchmark run.
+  overrides:
+    metrics:
+      transparent:
+        enabled: true
+        chrf_word_order: 2
+      comet:
+        enabled: true
+        model: "Unbabel/XCOMET-XL"
+        batch_size: 8
+        gpus: 1
+      metricx:
+        enabled: true
+        model: "google/metricx-24-hybrid-xl-v2p6-bfloat16"
+        tokenizer: "google/mt5-xl"
+        max_length: 1536
+    statistics:
+      bootstrap_samples: 2000
+      seed: 42
+    report:
+      slices: ["domain"]
+
+report:
+  # Headline metric for rankings, the conclusion, and the cost-per-point table.
+  primary_metric: "comet"
+  # Shown in the cross-test-set tables, in this order. Unavailable metrics are
+  # dropped rather than erroring.
+  metrics: ["comet", "metricx", "sentence_chrf", "sentence_bleu", "empty_output", "source_copy"]
+  filename: "finetune_benchmark_report.html"
+  # Energy is estimated from sampled power draw; on a shared host the power a
+  # concurrent job draws is not attributed away from this one.
+  electricity_price_per_kwh: null
+
+logging:
+  logs_dir: "logs"
+  level: "INFO"
+  file_level: "DEBUG"
