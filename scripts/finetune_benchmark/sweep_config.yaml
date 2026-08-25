@@ -249,6 +249,13 @@ report:
   # degeneration.py can, and the 2026-08-10 adapter is why it exists. null
   # disables the check. Reported, never fatal: the generation has already run.
   max_degeneration_rate: 0.15
+  # Blinded side-by-side export for human judgement: randomized per-row system
+  # labels, no scores, empty adequacy/fluency/terminology columns to fill in.
+  # The key that unblinds it is written beside it.
+  human_review:
+    enabled: true
+    rows_per_test_set: 40
+    seed: 42
   # Energy is estimated from sampled power draw; on a shared host the power a
   # concurrent job draws is not attributed away from this one.
   electricity_price_per_kwh: null

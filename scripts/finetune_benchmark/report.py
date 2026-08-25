@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .config import SweepConfig, System, volume_label
@@ -413,6 +414,60 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
     return conclusion
 
 
+def build_human_review(config: SweepConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Blinded side-by-side rows for human judgement, plus the key to unblind.
+
+    Automatic metrics identify patterns; a blinded human read decides whether
+    they matter (docs/TRANSLATION_BENCHMARK.md, human evaluation protocol). The
+    export carries randomized per-row labels and no scores, so a reviewer cannot
+    infer the system from the column order or from a metric.
+    """
+    settings = config.report.get("human_review") or {}
+    if not settings.get("enabled", True):
+        return pd.DataFrame(), pd.DataFrame()
+    rows_per_test_set = int(settings.get("rows_per_test_set", 40))
+    rng = np.random.default_rng(int(settings.get("seed", config.sweep["seed"])))
+    review_rows, key_rows = [], []
+    for test_set in config.test_sets:
+        outputs_path = config.evaluation_dir / test_set["id"] / "all_model_outputs.csv"
+        if not outputs_path.exists():
+            continue
+        frame = pd.read_csv(outputs_path, dtype={"example_id": str})
+        columns = [column for column in frame.columns if column.startswith("translation__")]
+        if not columns:
+            continue
+        group_column = "domain" if "domain" in frame.columns else None
+        # Stratified by domain when the test set has one, so a rare domain is not
+        # missing from the review entirely.
+        if group_column:
+            groups = [group for _, group in frame.groupby(group_column, sort=True)]
+            per_group = max(1, rows_per_test_set // max(len(groups), 1))
+            sampled = pd.concat(
+                [group.sample(n=min(len(group), per_group), random_state=int(rng.integers(1 << 31)))
+                 for group in groups],
+                ignore_index=True,
+            )
+        else:
+            sampled = frame.sample(n=min(len(frame), rows_per_test_set),
+                                   random_state=int(rng.integers(1 << 31)))
+        for _, row in sampled.iterrows():
+            order = list(columns)
+            rng.shuffle(order)
+            for index, column in enumerate(order):
+                label = chr(ord("A") + index)
+                candidate_id = column[len("translation__"):]
+                review_rows.append({
+                    "test_set": test_set["id"], "example_id": row["example_id"],
+                    "domain": row.get(group_column) if group_column else None,
+                    "source": row.get("source"), "reference": row.get("reference"),
+                    "system_label": label, "translation": row[column],
+                    "adequacy_1_5": "", "fluency_1_5": "", "terminology_1_5": "", "notes": "",
+                })
+                key_rows.append({"test_set": test_set["id"], "example_id": row["example_id"],
+                                 "system_label": label, "candidate_id": candidate_id})
+    return pd.DataFrame(review_rows), pd.DataFrame(key_rows)
+
+
 # ---------------------------------------------------------------- rendering
 def _format_value(metric: str, value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -650,6 +705,12 @@ def run(config: SweepConfig) -> dict[str, Path]:
     deltas.to_csv(paths["deltas"], index=False)
     marginal.to_csv(paths["marginal_gains"], index=False)
     degeneration.to_csv(paths["degeneration"], index=False)
+    review, review_key = build_human_review(config)
+    if not review.empty:
+        paths["human_review"] = directory / "human_review_blind.csv"
+        paths["human_review_key"] = directory / "human_review_key.csv"
+        review.to_csv(paths["human_review"], index=False)
+        review_key.to_csv(paths["human_review_key"], index=False)
     paths["conclusion"].write_text(json.dumps(conclusion, indent=2, ensure_ascii=False), encoding="utf-8")
     paths["html"].write_text(
         render_html(config, master, cost, deltas, marginal, degeneration, conclusion), encoding="utf-8"

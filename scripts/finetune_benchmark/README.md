@@ -171,6 +171,8 @@ logs/finetune_benchmark/
     ├── deltas.csv            each cell vs its family's base, with 95% CIs
     ├── marginal_gains.csv    per-step gain and GPU-hours per metric point
     ├── degeneration_audit.csv decoding-failure classes per system and test set
+    ├── human_review_blind.csv randomized-label side-by-side rows, no scores
+    ├── human_review_key.csv   the mapping that unblinds them
     ├── conclusion.json       the machine-readable verdict
     └── finetune_benchmark_report.html
 ```

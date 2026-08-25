@@ -54,6 +54,12 @@ def _candidate(config: SweepConfig, system: System) -> dict[str, Any]:
     }
     if system.kind == CAUSAL_LORA and evaluation.get("attn_implementation"):
         candidate["attn_implementation"] = evaluation["attn_implementation"]
+    # Pinning the checkpoint is the difference between a reproducible published
+    # number and one that silently moves when the Hub repository is updated
+    # (docs/TRANSLATION_BENCHMARK.md, fair-comparison checklist).
+    for key in ("revision", "processor", "tokenizer"):
+        if value := evaluation.get(key):
+            candidate[key] = value
     if not system.is_base:
         candidate["adapter"] = str(config.adapter_path(system))
     return candidate
