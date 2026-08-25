@@ -70,6 +70,31 @@ data:
   # split is produced here: the test sets are the three files below.
   validation_ratio: 0.05
 
+  # Domain composition of every training subset.
+  #
+  #   pool_proportional  mirror the train pool's own domain shares (default)
+  #   random             ignore domains; one random document order
+  #   domain_shares      hit the explicit target shares below
+  #
+  # Subsets stay nested (5k subset of 10k subset of ...) in all three modes,
+  # because each domain keeps one fixed document order and a larger volume just
+  # takes a longer prefix of it. Setting per_volume breaks that guarantee, and
+  # the data stage says so in the log when it does.
+  composition:
+    mode: "pool_proportional"
+    # Used by mode: domain_shares. Labels must match the corpus domain column
+    # exactly; shares must sum to 1.
+    domain_shares:
+      # Computer: 0.80
+      # Mathematics: 0.15
+      # General: 0.05
+    # Optional per-volume override, keyed by row count.
+    per_volume:
+      # 5000: { Computer: 0.90, Mathematics: 0.10 }
+    # A domain that cannot fill its quota is either an error (default) or its
+    # deficit is spread over the domains that still have documents left.
+    on_shortfall: "error" # error | redistribute
+
 models:
   translategemma:
     enabled: true
@@ -92,8 +117,12 @@ models:
         gradient_checkpointing: true
         use_liger_kernel: true
         save_total_limit: 1
-        eval_steps: 200
-        save_steps: 200
+        # Per epoch, not per N steps. A 5k cell is only tens of optimizer steps
+        # long, so a step interval tuned for the full corpus would never fire:
+        # no eval, no checkpoint, and load_best_model_at_end with nothing to
+        # load. Epoch boundaries also make eval_loss comparable across volumes.
+        evaluation_strategy: "epoch"
+        save_strategy: "epoch"
         report_to: "none"
     evaluation:
       runner: "translategemma"
@@ -116,16 +145,21 @@ models:
       learning_rate: 1.0e-4
       per_device_batch_size: 8
       gradient_accumulation_steps: 6 # Effective batch 48, matching the Gemma side.
-      max_source_length: 384
-      max_target_length: 384
+      # The corpus averages 336 tokens with p95 at 1072
+      # (docs/2026-08-03_training_speed_tier1_tier2_applied.md), so 512 truncates
+      # a long tail. NLLB's encoder caps at 1024 positions; raise these towards
+      # it if the OOM headroom allows, and lower per_device_batch_size to match.
+      max_source_length: 512
+      max_target_length: 512
       warmup_ratio: 0.03
       lr_scheduler_type: "cosine"
       weight_decay: 0.0
       max_grad_norm: 1.0
       label_smoothing_factor: 0.0
       logging_steps: 25
-      eval_steps: 200
-      save_steps: 200
+      # Epoch boundaries, for the same reason as the Gemma arm above.
+      eval_strategy: "epoch"
+      save_strategy: "epoch"
       save_total_limit: 1
       bf16: true
       gradient_checkpointing: true
@@ -174,6 +208,11 @@ evaluation:
     max_new_tokens: 512
     num_beams: 1
     do_sample: false
+    # Applies to the NLLB runner only (the TranslateGemma runner does not
+    # truncate its prompts). 1024 is NLLB's encoder position limit, so this is
+    # the most source it can see; the hit_max_new_tokens metric shows whether
+    # the output side was the binding constraint instead.
+    max_source_tokens: 1024
   # Merged over benchmark_config.yaml's metrics/statistics/report sections, so
   # a number here is comparable with a number from a plain benchmark run.
   overrides:
@@ -204,6 +243,12 @@ report:
   # dropped rather than erroring.
   metrics: ["comet", "metricx", "sentence_chrf", "sentence_bleu", "empty_output", "source_copy"]
   filename: "finetune_benchmark_report.html"
+  # Decoding-failure rate above which a system is called out in the report.
+  # translation_benchmark scores corpus averages, which cannot express "this
+  # system stopped translating and filled the token budget"; the audit from
+  # degeneration.py can, and the 2026-08-10 adapter is why it exists. null
+  # disables the check. Reported, never fatal: the generation has already run.
+  max_degeneration_rate: 0.15
   # Energy is estimated from sampled power draw; on a shared host the power a
   # concurrent job draws is not attributed away from this one.
   electricity_price_per_kwh: null

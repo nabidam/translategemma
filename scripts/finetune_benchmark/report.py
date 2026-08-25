@@ -29,6 +29,7 @@ from .config import SweepConfig, System, volume_label
 from .scheduler import PROJECT_ROOT, logger  # noqa: F401  (PROJECT_ROOT sets sys.path)
 
 from translation_benchmark.metrics import METRIC_DIRECTIONS  # noqa: E402
+from degeneration import audit_outputs  # noqa: E402
 
 PERCENT_METRICS = frozenset({"empty_output", "source_copy", "hit_max_new_tokens",
                              "number_preservation", "acronym_preservation", "formula_preservation"})
@@ -279,12 +280,54 @@ def build_marginal_gains(config: SweepConfig, master: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataFrame, marginal: pd.DataFrame) -> dict:
+def build_degeneration(config: SweepConfig) -> pd.DataFrame:
+    """Classify decoding failures per system, from the generated text itself.
+
+    translation_benchmark scores corpus averages, and a corpus average cannot
+    say "this system stopped translating and filled the token budget" — the
+    2026-08-10 adapter posted its best eval_loss while 87% of its output was
+    unusable. This audit is the only check in the sweep that can see that, so it
+    runs over every candidate's translations.csv regardless of scoring.
+    """
+    rows = []
+    for test_set in config.test_sets:
+        dataset_path = config.work_dir / "testsets" / f"{test_set['id']}.csv"
+        if not dataset_path.exists():
+            continue
+        dataset = pd.read_csv(dataset_path, dtype={"id": str})
+        references = dataset.set_index("id")["fa"].astype(str)
+        candidates_dir = config.evaluation_dir / test_set["id"] / "candidates"
+        for path in sorted(candidates_dir.glob("*/translations.csv")):
+            frame = pd.read_csv(path, dtype={"example_id": str})
+            frame["translation"] = frame["translation"].fillna("").astype(str)
+            aligned = frame.join(references.rename("reference"), on="example_id")
+            if aligned["reference"].isna().any():
+                logger.warning("%s has ids absent from %s; auditing the joined rows only.", path, dataset_path)
+                aligned = aligned.dropna(subset=["reference"])
+            audit = audit_outputs(aligned["translation"].tolist(), aligned["reference"].tolist())
+            rows.append(
+                {
+                    "test_set": test_set["id"],
+                    "candidate_id": path.parent.name,
+                    "rows": audit["rows"],
+                    "clean_rate": audit["clean_rate"],
+                    "failure_rate": audit["failure_rate"],
+                    "mean_chars": audit["mean_chars"],
+                    "mean_trailing_chars": audit["mean_trailing_chars"],
+                    "max_trailing_chars": audit["max_trailing_chars"],
+                    **{f"failure_{name}": values["rate"] for name, values in audit["failures"].items()},
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataFrame,
+                     marginal: pd.DataFrame, degeneration: pd.DataFrame) -> dict:
     """The claims the report is willing to make, each tied to a number."""
     metric = config.report.get("primary_metric", "comet")
     higher_is_better = METRIC_DIRECTIONS.get(metric, "higher") == "higher"
     conclusion: dict[str, Any] = {"primary_metric": metric, "direction": "higher" if higher_is_better else "lower",
-                                  "per_test_set": {}, "notes": []}
+                                  "per_test_set": {}, "notes": [], "degeneration_gate": None}
     if master.empty or metric not in master.columns:
         conclusion["notes"].append(f"No {metric} column available; the ranking sections are empty.")
         return conclusion
@@ -328,7 +371,31 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
             entry["plateau_after"] = plateau
         conclusion["per_test_set"][test_set_id] = entry
 
-    conclusion["notes"] = [
+    threshold = config.report.get("max_degeneration_rate")
+    if threshold is not None and not degeneration.empty:
+        breached = degeneration[degeneration["failure_rate"] > float(threshold)]
+        conclusion["degeneration_gate"] = {
+            "threshold": float(threshold),
+            "breached": [
+                {"test_set": row["test_set"], "candidate_id": row["candidate_id"],
+                 "failure_rate": float(row["failure_rate"])}
+                for _, row in breached.iterrows()
+            ],
+        }
+        if not breached.empty:
+            # A system can top the metric table while a large share of its output
+            # is structurally broken. Say so next to the ranking, not in a log.
+            conclusion["notes"].append(
+                "Decoding audit: "
+                + ", ".join(
+                    f"{row['candidate_id']} on {row['test_set']} fails {row['failure_rate']:.1%} of rows"
+                    for _, row in breached.iterrows()
+                )
+                + f" (above report.max_degeneration_rate={float(threshold):.1%}). Treat those scores as "
+                "unreliable until the decoding failure is fixed."
+            )
+
+    conclusion["notes"] += [
         f"Every cell trained for {config.sweep['epochs']} epochs, so a larger volume also received "
         "proportionally more optimizer steps. Volume and compute are deliberately not separated; "
         "the training-cost table shows what each cell actually spent.",
@@ -338,6 +405,10 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
         "means the difference is not resolvable at this test-set size.",
         "Energy is integrated from sampled power draw on a shared host; with four concurrent jobs it "
         "is an estimate of the job's own draw, not an isolated measurement.",
+        "COMET and MetricX correlations were established on WMT MQM language pairs, which do not include "
+        "Persian (docs/EVALUATION_BACKLOG.md). Read these scores as ordinal within one test set: compare "
+        "systems on the same rows, never a score on one test set against a score on another, and do not "
+        "read an absolute quality threshold into them.",
     ]
     return conclusion
 
@@ -492,7 +563,7 @@ def _conclusion_html(config: SweepConfig, conclusion: dict, deltas: pd.DataFrame
 
 
 def render_html(config: SweepConfig, master: pd.DataFrame, cost: pd.DataFrame, deltas: pd.DataFrame,
-                marginal: pd.DataFrame, conclusion: dict) -> str:
+                marginal: pd.DataFrame, degeneration: pd.DataFrame, conclusion: dict) -> str:
     metric = conclusion["primary_metric"]
     metrics = _metric_columns(config, master) if not master.empty else []
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -528,6 +599,13 @@ def render_html(config: SweepConfig, master: pd.DataFrame, cost: pd.DataFrame, d
         sections.append("<p class='empty'>No pairwise comparisons available.</p>")
     sections.append("<h2>What each step up in data volume bought</h2>")
     sections.append(f"<div class='scroll'>{_table(marginal)}</div>")
+    sections.append("<h2>Decoding audit</h2>")
+    sections.append(
+        "<p class='lede'>Failure classes measured on the generated text: empty output, unstopped "
+        "whitespace, repeated n-grams, leaked boilerplate, length blowup. A high failure rate invalidates "
+        "that system's metric scores, however good they look.</p>"
+    )
+    sections.append(f"<div class='scroll'>{_table(degeneration)}</div>")
     sections.append("<h2>Fine-tuning cost</h2>")
     sections.append(f"<div class='scroll'>{_table(cost, '{:,.3f}')}</div>")
     if not cost.empty:
@@ -553,7 +631,8 @@ def run(config: SweepConfig) -> dict[str, Path]:
     cost = build_training_cost(config, finetune_jobs)
     deltas = build_deltas(config, master) if not master.empty else pd.DataFrame()
     marginal = build_marginal_gains(config, master) if not master.empty else pd.DataFrame()
-    conclusion = build_conclusion(config, master, deltas, marginal)
+    degeneration = build_degeneration(config)
+    conclusion = build_conclusion(config, master, deltas, marginal, degeneration)
 
     directory = config.report_dir
     directory.mkdir(parents=True, exist_ok=True)
@@ -562,6 +641,7 @@ def run(config: SweepConfig) -> dict[str, Path]:
         "training_cost": directory / "training_cost.csv",
         "deltas": directory / "deltas.csv",
         "marginal_gains": directory / "marginal_gains.csv",
+        "degeneration": directory / "degeneration_audit.csv",
         "conclusion": directory / "conclusion.json",
         "html": directory / config.report.get("filename", "finetune_benchmark_report.html"),
     }
@@ -569,8 +649,11 @@ def run(config: SweepConfig) -> dict[str, Path]:
     cost.to_csv(paths["training_cost"], index=False)
     deltas.to_csv(paths["deltas"], index=False)
     marginal.to_csv(paths["marginal_gains"], index=False)
+    degeneration.to_csv(paths["degeneration"], index=False)
     paths["conclusion"].write_text(json.dumps(conclusion, indent=2, ensure_ascii=False), encoding="utf-8")
-    paths["html"].write_text(render_html(config, master, cost, deltas, marginal, conclusion), encoding="utf-8")
+    paths["html"].write_text(
+        render_html(config, master, cost, deltas, marginal, degeneration, conclusion), encoding="utf-8"
+    )
     logger.info("Report written to [bold]%s[/bold]", paths["html"])
     for name, path in paths.items():
         logger.info("  %-16s %s", name, path)

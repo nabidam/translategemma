@@ -103,6 +103,37 @@ class SweepConfig:
         return self.raw["evaluation"]
 
     @property
+    def composition(self) -> dict[str, Any]:
+        """Domain composition settings, with every optional key defaulted.
+
+        An absent section means the historical behaviour: mirror the train
+        pool's own domain shares.
+        """
+        raw = self.data.get("composition") or {}
+        return {
+            "mode": raw.get("mode") or "pool_proportional",
+            "domain_shares": {key: float(value) for key, value in (raw.get("domain_shares") or {}).items()},
+            "per_volume": {
+                int(volume): {key: float(value) for key, value in (shares or {}).items()}
+                for volume, shares in (raw.get("per_volume") or {}).items()
+            },
+            "on_shortfall": raw.get("on_shortfall") or "error",
+        }
+
+    def composition_shares(self, volume: int) -> dict[str, float] | None:
+        """Target domain shares for one volume, or None when they are implicit.
+
+        None means "derive from the pool" (pool_proportional) or "do not
+        stratify at all" (random); the caller distinguishes those by mode.
+        """
+        composition = self.composition
+        if override := composition["per_volume"].get(int(volume)):
+            return override
+        if composition["mode"] == "domain_shares":
+            return composition["domain_shares"]
+        return None
+
+    @property
     def report(self) -> dict[str, Any]:
         return self.raw.get("report", {})
 
@@ -321,9 +352,42 @@ def _validate(config: SweepConfig) -> None:
     if not 0.0 <= ratio < 1.0:
         raise ValueError("data.validation_ratio must be in [0, 1)")
 
+    _validate_composition(config)
+
     # Duplicate ids across systems would silently overwrite candidate outputs.
     ids = [system.id for system in config.systems]
     if len(set(ids)) != len(ids):
         raise ValueError(f"system ids collide: {ids}")
     for system_id in ids:
         _slug(system_id, "system id")
+
+
+COMPOSITION_MODES = ("pool_proportional", "random", "domain_shares")
+
+
+def _validate_shares(shares: dict[str, Any], label: str) -> None:
+    if not shares:
+        raise ValueError(f"{label} must name at least one domain")
+    for domain, share in shares.items():
+        if not isinstance(share, (int, float)) or isinstance(share, bool) or share < 0:
+            raise ValueError(f"{label}[{domain!r}] must be a non-negative number (got {share!r})")
+    total = float(sum(shares.values()))
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"{label} must sum to 1.0 (got {total:.6f}): {shares}")
+
+
+def _validate_composition(config: SweepConfig) -> None:
+    composition = config.composition
+    if composition["mode"] not in COMPOSITION_MODES:
+        raise ValueError(f"data.composition.mode must be one of {list(COMPOSITION_MODES)}")
+    if composition["on_shortfall"] not in {"error", "redistribute"}:
+        raise ValueError("data.composition.on_shortfall must be 'error' or 'redistribute'")
+    if composition["mode"] == "domain_shares":
+        _validate_shares(composition["domain_shares"], "data.composition.domain_shares")
+    for volume, shares in composition["per_volume"].items():
+        if int(volume) not in config.volumes:
+            raise ValueError(
+                f"data.composition.per_volume has an entry for {volume}, which is not in "
+                f"sweep.volumes {config.volumes}"
+            )
+        _validate_shares(shares, f"data.composition.per_volume[{volume}]")

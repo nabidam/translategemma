@@ -251,6 +251,15 @@ def run_jobs(
         try:
             logger.info("[bold]%s[/bold] starting on GPU %d", job.id, gpu)
             result = _run_with_telemetry(job, gpu, telemetry_settings)
+        except Exception as error:  # noqa: BLE001 - a launch failure is a job failure
+            # Raising here would abort the pool mid-matrix and lose the jobs that
+            # are still running. Record it as a failed cell instead.
+            logger.exception("%s could not be launched", job.id)
+            result = {
+                "job_id": job.id, "stage": job.stage, "status": "failed", "returncode": None,
+                "gpu": gpu, "command": job.command, "error": f"{type(error).__name__}: {error}",
+                "duration_seconds": 0.0, "hardware": {}, "metadata": job.metadata,
+            }
         finally:
             available.put(gpu)
         job.result_path.parent.mkdir(parents=True, exist_ok=True)

@@ -247,38 +247,134 @@ def _read_any(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported test set format {path.suffix!r}: {path}")
 
 
-def _document_order(pool: pd.DataFrame, seed: int) -> list[str]:
-    """One global document order that keeps every prefix domain-proportional.
+ALL_DOMAINS = "__all__"
 
-    Documents are shuffled inside each domain, then drawn round-robin from the
-    domain currently furthest below its share of the pool. Every prefix of the
-    result is therefore both nested and roughly domain-balanced, which is what
-    lets 5k, 10k, 50k and 100k differ only in size.
+
+def _domain_orders(pool: pd.DataFrame, seed: int, stratified: bool) -> dict[str, list[str]]:
+    """One fixed, shuffled document order per domain (or one global order).
+
+    Fixed is the whole point: every volume takes a longer prefix of the same
+    order, which is what makes the subsets nested. `stratified=False` collapses
+    all domains into one bucket, i.e. a purely random draw.
     """
     rng = np.random.default_rng(seed)
-    per_domain: dict[str, list[str]] = {}
-    rows_per_domain: dict[str, int] = {}
-    for domain, group in pool.groupby("domain", sort=True):
+    orders: dict[str, list[str]] = {}
+    groups = pool.groupby("domain", sort=True) if stratified else [(ALL_DOMAINS, pool)]
+    for domain, group in groups:
         documents = group["document_id"].drop_duplicates().to_numpy()
         rng.shuffle(documents)
-        per_domain[domain] = list(documents)
-        rows_per_domain[domain] = len(group)
-    total_rows = sum(rows_per_domain.values())
-    shares = {domain: count / total_rows for domain, count in rows_per_domain.items()}
-    document_rows = pool.groupby("document_id", sort=False).size().to_dict()
+        orders[str(domain)] = [str(document) for document in documents]
+    return orders
 
-    taken_rows = {domain: 0 for domain in per_domain}
-    order: list[str] = []
-    total_taken = 0
-    while any(per_domain.values()):
-        candidates = [domain for domain, documents in per_domain.items() if documents]
-        # Deficit against the domain's target share; ties break on domain name.
-        domain = min(candidates, key=lambda name: (taken_rows[name] - shares[name] * max(total_taken, 1), name))
-        document = per_domain[domain].pop(0)
-        order.append(document)
-        taken_rows[domain] += document_rows[document]
-        total_taken += document_rows[document]
-    return order
+
+def _resolve_shares(config: SweepConfig, pool: pd.DataFrame, volume: int) -> dict[str, float]:
+    """Target domain shares for one volume, as an explicit mapping."""
+    composition = config.composition
+    shares = config.composition_shares(volume)
+    if composition["mode"] == "random" and not shares:
+        return {ALL_DOMAINS: 1.0}
+    if shares:
+        if unknown := sorted(set(shares) - set(pool["domain"].unique())):
+            raise ValueError(
+                f"data.composition names domains {unknown} that do not exist in the train pool. "
+                f"Available: {sorted(pool['domain'].unique())}"
+            )
+        return dict(shares)
+    counts = pool["domain"].value_counts(normalize=True)
+    return {str(domain): float(share) for domain, share in counts.items()}
+
+
+def _quotas(shares: dict[str, float], volume: int, available: dict[str, int], on_shortfall: str) -> dict[str, int]:
+    """Row quota per domain: shares scaled to `volume`, then made feasible.
+
+    Largest-remainder rounding, so the quotas sum to exactly `volume` instead of
+    volume +/- the number of domains. A domain that cannot fill its quota is an
+    error by default: silently shifting its rows elsewhere would change what the
+    cell measures without saying so.
+    """
+    exact = {domain: shares.get(domain, 0.0) * volume for domain in shares}
+    quotas = {domain: int(value) for domain, value in exact.items()}
+    remainder = volume - sum(quotas.values())
+    ranked = sorted(exact.items(), key=lambda item: (-(item[1] - int(item[1])), item[0]))
+    for domain, _ in ranked[:remainder]:
+        quotas[domain] += 1
+
+    short = {domain: quota for domain, quota in quotas.items() if quota > available.get(domain, 0)}
+    if not short:
+        return quotas
+    detail = ", ".join(
+        f"{domain}: need {quotas[domain]}, have {available.get(domain, 0)}" for domain in sorted(short)
+    )
+    if on_shortfall == "error":
+        raise ValueError(
+            f"Domain composition is not satisfiable at volume {volume} ({detail}). Lower the volume, "
+            "change data.composition.domain_shares, or set data.composition.on_shortfall: redistribute."
+        )
+    logger.warning("Volume %d: %s. Redistributing the deficit over the domains with room.", volume, detail)
+    deficit = 0
+    for domain in short:
+        deficit += quotas[domain] - available.get(domain, 0)
+        quotas[domain] = available.get(domain, 0)
+    # Every domain in the pool becomes eligible, not only the ones the requested
+    # shares named: a share of 0 means "not wanted", but redistribution is the
+    # explicit instruction to fill the gap from wherever rows exist.
+    for domain in available:
+        quotas.setdefault(domain, 0)
+    room = {domain: available.get(domain, 0) - quota for domain, quota in quotas.items()}
+    while deficit > 0:
+        open_domains = sorted((domain for domain, value in room.items() if value > 0),
+                             key=lambda name: (-room[name], name))
+        if not open_domains:
+            raise ValueError(f"Train pool cannot supply {volume} rows: {deficit} rows short after redistribution.")
+        for domain in open_domains:
+            if deficit == 0:
+                break
+            quotas[domain] += 1
+            room[domain] -= 1
+            deficit -= 1
+    return quotas
+
+
+def _take_rows(documents: list[str], by_document: dict[str, pd.DataFrame], target: int) -> list[pd.DataFrame]:
+    """Prefix of `documents` holding exactly `target` rows (last one truncated)."""
+    picked: list[pd.DataFrame] = []
+    rows = 0
+    for document in documents:
+        group = by_document[document]
+        if rows + len(group) > target:
+            # Truncating one document keeps the cell at exactly `target` rows.
+            # Deterministic (sorted by id), and harmless for nesting: volumes are
+            # supersets of one another, not disjoint folds.
+            picked.append(group.sort_values("id").head(target - rows))
+            return picked
+        picked.append(group)
+        rows += len(group)
+        if rows == target:
+            return picked
+    return picked
+
+
+def _select_subset(
+    config: SweepConfig,
+    pool: pd.DataFrame,
+    orders: dict[str, list[str]],
+    by_document: dict[str, pd.DataFrame],
+    volume: int,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    shares = _resolve_shares(config, pool, volume)
+    available = {
+        domain: int(sum(len(by_document[document]) for document in documents))
+        for domain, documents in orders.items()
+    }
+    quotas = _quotas(shares, volume, available, config.composition["on_shortfall"])
+    frames: list[pd.DataFrame] = []
+    for domain, quota in sorted(quotas.items()):
+        if quota <= 0:
+            continue
+        if domain not in orders:
+            raise ValueError(f"No documents for domain {domain!r} in the train pool")
+        frames.extend(_take_rows(orders[domain], by_document, quota))
+    return pd.concat(frames, ignore_index=True), quotas
 
 
 def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> dict[int, dict[str, Path]]:
@@ -296,46 +392,47 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
             f"volume, or reduce the holdout cost (data.in_domain_test.overrides.selection.max_test_documents)."
         )
 
-    order = _document_order(pool, int(config.sweep["seed"]))
-    logger.info("Train pool: %d rows across %d documents", len(pool), len(order))
-    by_document = {document: group for document, group in pool.groupby("document_id", sort=False)}
+    composition = config.composition
+    stratified = composition["mode"] != "random" or bool(composition["per_volume"])
+    orders = _domain_orders(pool, int(config.sweep["seed"]), stratified)
+    if composition["per_volume"]:
+        logger.warning(
+            "data.composition.per_volume is set, so the volumes target different compositions and are NOT "
+            "nested. A volume-to-volume delta then mixes 'more data' with 'different data'."
+        )
+    logger.info(
+        "Train pool: %d rows, %d documents, composition mode '%s'",
+        len(pool), pool["document_id"].nunique(), composition["mode"],
+    )
+    by_document = {str(document): group for document, group in pool.groupby("document_id", sort=False)}
 
     results: dict[int, dict[str, Path]] = {}
     manifest: dict[str, dict] = {}
     for volume in config.volumes:
         paths = config.subset_split_paths(volume)
         results[volume] = paths
-        if paths["train"].exists() and not force and (paths["validation"].exists() or config.data["validation_ratio"] == 0):
+        if paths["train"].exists() and not force and (
+            paths["validation"].exists() or config.data["validation_ratio"] == 0
+        ):
             logger.info("Reusing subset %s", paths["train"].parent)
             continue
-        selected, rows = [], 0
-        for document in order:
-            group = by_document[document]
-            if rows + len(group) > volume:
-                # Truncate this one document so the cell holds exactly `volume`
-                # rows. Deterministic (sorted by id), and harmless for nesting:
-                # the volumes are subsets of each other, not disjoint folds.
-                remaining = volume - rows
-                selected.append(group.sort_values("id").head(remaining))
-                rows = volume
-                break
-            selected.append(group)
-            rows += len(group)
-            if rows == volume:
-                break
-        subset = pd.concat(selected, ignore_index=True)
+        subset, quotas = _select_subset(config, pool, orders, by_document, volume)
+        realized = subset["domain"].value_counts(normalize=True).round(4).to_dict()
         subset_jsonl = _write_sft_jsonl(subset, config, columns, config.subset_dir(volume) / "subset.jsonl")
         manifest[volume_label(volume)] = {
             "requested_rows": volume,
             "rows": len(subset),
             "documents": int(subset["document_id"].nunique()),
-            "domains": subset["domain"].value_counts().to_dict(),
+            "composition_mode": composition["mode"],
+            "target_row_quotas": quotas,
+            "realized_domain_shares": realized,
+            "domain_rows": subset["domain"].value_counts().to_dict(),
             "subset_path": str(subset_jsonl),
         }
         _split_subset(config, subset_jsonl, volume)
         logger.info(
-            "Volume %s: %d rows, %d documents -> %s",
-            volume_label(volume), len(subset), subset["document_id"].nunique(), paths["train"],
+            "Volume %s: %d rows, %d documents, domains %s -> %s",
+            volume_label(volume), len(subset), subset["document_id"].nunique(), realized, paths["train"],
         )
 
     if manifest:

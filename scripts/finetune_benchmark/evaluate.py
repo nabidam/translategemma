@@ -22,6 +22,8 @@ from typing import Any
 
 from .config import (
     BASE_BENCHMARK_CONFIG,
+    BASE_TESTSET_CONFIG,
+    BASE_TRAINING_CONFIG,
     CAUSAL_LORA,
     SweepConfig,
     System,
@@ -104,6 +106,72 @@ def write_benchmark_config(config: SweepConfig, test_set: dict[str, Any], system
     return write_yaml(benchmark_config_path(config, test_set), payload)
 
 
+def write_staging_configs(config: SweepConfig) -> dict[str, Path]:
+    """Emit the configs scripts/fetch_offline_assets.py reads, for this sweep.
+
+    Asset staging happens on the ONLINE machine, before the sweep's own derived
+    configs exist (those need the prepared test sets). This renders the same
+    model and metric choices into the three files the staging script expects, so
+    nothing the sweep will load offline is missed: both base checkpoints, XCOMET
+    with the encoder it pulls in, MetricX with its mT5 tokenizer, and the test-set
+    builder's sentence embedding model.
+
+    Local adapters are deliberately absent — they do not exist yet, and they are
+    produced on the offline host anyway.
+    """
+    metrics = (config.evaluation.get("overrides") or {}).get("metrics") or {}
+    comet, metricx = metrics.get("comet") or {}, metrics.get("metricx") or {}
+    training_config = deep_merge(
+        load_yaml(BASE_TRAINING_CONFIG),
+        {
+            "model": {
+                "base_model_id": next(
+                    (model["base_model_id"] for model in config.models.values()
+                     if model["kind"] == CAUSAL_LORA),
+                    next(iter(config.models.values()))["base_model_id"],
+                )
+            },
+            "evaluation": {
+                "metricx_enabled": bool(metricx.get("enabled", False)),
+                "metricx_model_id": metricx.get("model") or load_yaml(BASE_TRAINING_CONFIG)["evaluation"]["metricx_model_id"],
+                "metricx_tokenizer_id": metricx.get("tokenizer") or load_yaml(BASE_TRAINING_CONFIG)["evaluation"]["metricx_tokenizer_id"],
+                "comet_enabled": bool(comet.get("enabled", False)),
+                "comet_model_id": comet.get("model") or load_yaml(BASE_TRAINING_CONFIG)["evaluation"]["comet_model_id"],
+            },
+        },
+    )
+    # Base models only, and every one marked enabled: the staging script skips
+    # candidates that are disabled or imported.
+    base_systems = [system for system in config.systems if system.is_base]
+    benchmark_config = deep_merge(
+        load_yaml(BASE_BENCHMARK_CONFIG),
+        deep_merge(config.evaluation.get("overrides") or {}, {}),
+    )
+    benchmark_config["candidates"] = [_candidate(config, system) for system in base_systems]
+    testset_config = deep_merge(
+        load_yaml(BASE_TESTSET_CONFIG), config.data["in_domain_test"].get("overrides") or {}
+    )
+    paths = {
+        "config": write_yaml(config.derived_config_dir / "staging_config.yaml", training_config),
+        "benchmark_config": write_yaml(config.derived_config_dir / "staging_benchmark.yaml", benchmark_config),
+        "testset_config": write_yaml(config.derived_config_dir / "staging_testset.yaml", testset_config),
+    }
+    logger.info("Staging configs written. On the ONLINE machine, with HF_TOKEN exported, run:")
+    logger.info(
+        "  uv run --no-project --with huggingface_hub --with pyyaml python scripts/fetch_offline_assets.py "
+        "--config %s --testset-config %s --benchmark-config %s --dest offline_assets/models",
+        paths["config"], paths["testset_config"], paths["benchmark_config"],
+    )
+    required = {system.model["base_model_id"] for system in config.systems}
+    required.update(
+        value for value in (comet.get("model"), metricx.get("model"), metricx.get("tokenizer")) if value
+    )
+    if embedding_model := (testset_config.get("embeddings") or {}).get("model"):
+        required.add(embedding_model)
+    logger.info("Repositories this sweep needs: %s", sorted(required))
+    return paths
+
+
 def _benchmark_command(config_path: Path, command: str, extra: list[str] | None = None) -> list[str]:
     return [sys.executable, "benchmark_translations.py", "--config", str(config_path), command, *(extra or [])]
 
@@ -155,23 +223,44 @@ def run(config: SweepConfig, force: bool = False, test_set_ids: list[str] | None
     )
     results.update(run_jobs(generation_jobs, config.gpus, telemetry, force=force, fail_fast=fail_fast))
 
-    failed = [job.id for job in generation_jobs if results.get(job.id, {}).get("status") != "ok"]
-    if failed:
-        logger.warning(
-            "%d generation job(s) failed; scoring a test set requires all of its candidates: %s",
-            len(failed), failed,
-        )
+    # A failed candidate must not take its whole test set down with it: score
+    # the candidates that did produce output, and say which ones are missing.
+    # Scoring every candidate named in the config would fail on the absent file.
+    scorable: dict[str, list[str]] = {}
+    for test_set in test_sets:
+        succeeded = [
+            job.metadata["system_id"]
+            for job in generation_jobs
+            if job.metadata["test_set"] == test_set["id"] and results.get(job.id, {}).get("status") == "ok"
+        ]
+        missing = [system.id for system in systems if system.id not in succeeded]
+        if missing:
+            logger.warning(
+                "Test set %s: scoring %d of %d candidates; no output for %s.",
+                test_set["id"], len(succeeded), len(systems), missing,
+            )
+        if len(succeeded) < 2:
+            logger.error(
+                "Test set %s has %d usable candidate(s); pairwise statistics need at least two. Skipping "
+                "its scoring — fix the failed generation job(s) and re-run this stage.",
+                test_set["id"], len(succeeded),
+            )
+            continue
+        scorable[test_set["id"]] = succeeded
 
     # Scoring loads XCOMET and MetricX, so it wants a GPU of its own; one job per
-    # test set keeps the three of them running side by side.
-    scored_test_sets = [
-        test_set for test_set in test_sets
-        if not any(job.metadata["test_set"] == test_set["id"] and job.id in failed for job in generation_jobs)
-    ]
+    # test set keeps them running side by side.
     for phase in ("score", "report"):
         jobs = [
-            _job(config, test_set["id"], phase, "all", _benchmark_command(config_paths[test_set["id"]], phase), {})
-            for test_set in scored_test_sets
+            _job(
+                config, test_set_id, phase, "all",
+                _benchmark_command(
+                    config_paths[test_set_id], phase,
+                    ["--candidates", *candidate_ids] if phase == "score" else None,
+                ),
+                {"candidates": candidate_ids},
+            )
+            for test_set_id, candidate_ids in scorable.items()
         ]
         if not jobs:
             continue

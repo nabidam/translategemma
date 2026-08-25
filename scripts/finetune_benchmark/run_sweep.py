@@ -3,6 +3,8 @@
 
 Four stages, each resumable and independently runnable:
 
+    plan      print the matrix, the job counts and every path, run nothing
+    assets    (online machine) emit configs for scripts/fetch_offline_assets.py
     data      normalize the corpus, carve out the in-domain test set, build the
               nested training subsets and their train/validation splits
     finetune  one LoRA job per (model, volume) cell, one GPU each
@@ -41,7 +43,7 @@ STAGES = ("data", "finetune", "evaluate", "report")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stage", choices=[*STAGES, "all", "plan"])
+    parser.add_argument("stage", choices=[*STAGES, "all", "plan", "assets"])
     parser.add_argument("--config", default="scripts/finetune_benchmark/sweep_config.yaml")
     parser.add_argument("--force", action="store_true", help="Redo completed work instead of reusing it.")
     parser.add_argument("--systems", nargs="+", help="Limit the finetune stage to these system ids.")
@@ -99,6 +101,11 @@ def main() -> None:
 
     if args.stage == "plan":
         show_plan(config)
+        return
+    if args.stage == "assets":
+        # Run this on the ONLINE staging machine; it writes configs for
+        # scripts/fetch_offline_assets.py and prints the command to run.
+        evaluate.write_staging_configs(config)
         return
 
     stages = STAGES if args.stage == "all" else (args.stage,)
