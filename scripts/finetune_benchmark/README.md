@@ -24,6 +24,36 @@ docker compose run --rm trainer \
   python -m scripts.finetune_benchmark.run_sweep all
 ```
 
+### Training budget
+
+`sweep.budget.mode` decides what a volume-to-volume delta means:
+
+| Mode | Every cell gets | Reads as | Watch for |
+| --- | --- | --- | --- |
+| `fixed_epochs` (default, 1 epoch) | the same number of passes over its own data | "what does more data buy me" | volume and compute move together; the cost table prices it |
+| `fixed_steps` | the same number of optimizer steps | "what does more *diverse* data buy me at equal compute" | small volumes repeat their data and will overfit — read `eval_loss` |
+
+In `fixed_steps` mode, `max_steps: "auto"` derives the cap from the smallest
+volume at `epochs` epochs; an integer applies to both arms and a mapping
+(`{ translategemma: 120, nllb: 700 }`) sets each arm separately. Prefer explicit
+values for the TranslateGemma arm: packing turns rows into fewer, longer blocks,
+so a row-derived cap covers more epochs than the arithmetic suggests. Evaluation
+and checkpointing switch to a step cadence (`max_steps / evals_per_run`) in that
+mode, because a capped run can stop before the first epoch ends.
+
+Run both to separate the two effects. Artefacts live under
+`<output_dir>/<run_id>`, and `run_id` defaults to the budget's own name, so the
+second run neither overwrites nor silently reuses the first one's cells:
+
+```bash
+docker compose run --rm trainer python -m scripts.finetune_benchmark.run_sweep all   # fixed_epochs_e1
+# edit sweep.budget.mode: fixed_steps
+docker compose run --rm trainer python -m scripts.finetune_benchmark.run_sweep all   # fixed_steps_auto
+```
+
+The data stage is shared between them by design — same subsets, same test sets,
+so the two budgets are comparable.
+
 | Stage | What it does | Parallelism |
 | --- | --- | --- |
 | `data` | Normalizes the corpus, carves out the 500-row in-domain test set with `build_test_set.py`, builds nested subsets, splits each into train/validation with `split_dataset.py` | CPU, sequential |
@@ -138,10 +168,10 @@ each subset's realized composition.
 - **Nested volumes.** 5k ⊂ 10k ⊂ 50k ⊂ 100k, from one domain-balanced document
   order. A step along the curve is data *added*, so the marginal-gain table
   means what it says.
-- **Fixed epochs.** Every cell trains for `sweep.epochs`, so larger volumes also
-  get more optimizer steps. Volume and compute are intentionally not separated —
-  the report prices each cell in GPU-hours so the confound stays visible. For the
-  compute-matched variant instead, cap steps in `models.<key>` and re-run.
+- **A stated budget.** `fixed_epochs` mixes volume with compute on purpose and
+  the report prices each cell in GPU-hours; `fixed_steps` holds compute roughly
+  constant instead. Whichever ran, the report's notes say which and how to read
+  the curve, and the cost table carries the steps actually run.
 - **Shared metric implementations.** Scoring goes through
   `translation_benchmark`, so a chrF++ or MetricX number here is the same
   quantity as in any other benchmark run in this repository.
@@ -160,7 +190,7 @@ each subset's realized composition.
 ## Outputs
 
 ```
-logs/finetune_benchmark/
+logs/finetune_benchmark/<run_id>/     e.g. fixed_epochs_e1, fixed_steps_auto
 ├── derived_configs/          generated train/testset/benchmark configs (reproducibility)
 ├── jobs/<stage>/<name>/      result.json, log, telemetry.json per job
 ├── finetune/<system>/        adapter, checkpoints, trainer metrics

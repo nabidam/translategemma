@@ -10,6 +10,7 @@ the same config always names the same files.
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -138,6 +139,77 @@ class SweepConfig:
         return self.raw.get("report", {})
 
     @property
+    def budget(self) -> dict[str, Any]:
+        """Training-budget settings, with every optional key defaulted.
+
+        Two modes, and the choice decides what a volume-to-volume delta means:
+
+        fixed_epochs  every cell sees its data the same number of times, so a
+                      larger volume also gets proportionally more optimizer
+                      steps. Answers "what does more data buy me", and mixes
+                      data volume with compute.
+        fixed_steps   every cell gets the same number of optimizer steps, so the
+                      5k cell repeats its data many times and the 100k cell sees
+                      part of its own once. Isolates data diversity at equal
+                      compute, and risks overfitting the small cells.
+        """
+        raw = self.sweep.get("budget") or {}
+        return {
+            "mode": raw.get("mode") or "fixed_epochs",
+            # sweep.epochs is the pre-budget spelling; kept working on purpose.
+            "epochs": int(raw.get("epochs", self.sweep.get("epochs", 1))),
+            "max_steps": raw.get("max_steps", "auto"),
+            "evals_per_run": int(raw.get("evals_per_run", 4)),
+        }
+
+    @property
+    def epochs(self) -> int:
+        return self.budget["epochs"]
+
+    def effective_batch_size(self, model_key: str) -> int:
+        """Rows (or packed blocks) per optimizer step for one arm.
+
+        Single-GPU cells, so this is the arm's configured effective batch with no
+        world-size term.
+        """
+        model = self.raw["models"][model_key]
+        if model["kind"] == CAUSAL_LORA:
+            merged = deep_merge(load_yaml(BASE_TRAINING_CONFIG), model.get("overrides") or {})
+            training = merged["training"]
+            if training.get("effective_batch_size"):
+                return int(training["effective_batch_size"])
+            return int(training["batch_size"]) * int(training["gradient_accumulation_steps"])
+        training = model["training"]
+        return int(training["per_device_batch_size"]) * int(training["gradient_accumulation_steps"])
+
+    def max_steps_for(self, model_key: str) -> int | None:
+        """Optimizer-step cap for one arm, or None in fixed_epochs mode.
+
+        `auto` derives the cap from the SMALLEST volume at the configured epoch
+        count, so every cell gets the compute the smallest cell would have had.
+        For the packed TranslateGemma arm the estimate is an upper bound rather
+        than exact: packing turns rows into fewer, longer blocks, so the same
+        step count covers more epochs than the row arithmetic suggests. Set an
+        explicit integer (or a per-arm mapping) when the budget must be exact.
+        """
+        budget = self.budget
+        if budget["mode"] != "fixed_steps":
+            return None
+        configured = budget["max_steps"]
+        if isinstance(configured, dict):
+            if model_key not in configured:
+                raise ValueError(
+                    f"sweep.budget.max_steps has no entry for model {model_key!r}; "
+                    f"it names {sorted(configured)}"
+                )
+            return int(configured[model_key])
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            return int(configured)
+        train_rows = min(self.volumes) * (1.0 - float(self.data.get("validation_ratio", 0.0)))
+        steps = math.ceil(train_rows / self.effective_batch_size(model_key) * budget["epochs"])
+        return max(1, steps)
+
+    @property
     def gpus(self) -> list[int]:
         return [int(value) for value in self.sweep["gpus"]]
 
@@ -163,7 +235,31 @@ class SweepConfig:
         return path if path.is_absolute() else PROJECT_ROOT / path
 
     @property
+    def run_id(self) -> str:
+        """Directory name separating one budget from another under output_dir.
+
+        The two budget modes produce different adapters and different scores from
+        the same data. Without this they would share job paths, and a fixed_steps
+        run would silently reuse the fixed_epochs run's completed cells. The data
+        stage stays outside this namespace on purpose: both modes read the same
+        subsets, which is what makes them comparable.
+        """
+        if configured := self.sweep.get("run_id"):
+            return _slug(str(configured), "sweep.run_id")
+        budget = self.budget
+        if budget["mode"] == "fixed_epochs":
+            return f"fixed_epochs_e{budget['epochs']}"
+        steps = budget["max_steps"]
+        suffix = steps if isinstance(steps, str) else ("per_model" if isinstance(steps, dict) else steps)
+        return f"fixed_steps_{suffix}"
+
+    @property
     def output_dir(self) -> Path:
+        """Root for this budget's artefacts. `base_output_dir` is shared."""
+        return self.base_output_dir / self.run_id
+
+    @property
+    def base_output_dir(self) -> Path:
         return self.resolve(self.sweep["output_dir"])
 
     @property
@@ -306,8 +402,22 @@ def _validate(config: SweepConfig) -> None:
         raise ValueError("sweep.volumes must be a non-empty list of positive row counts")
     if sorted(config.volumes) != config.volumes:
         raise ValueError("sweep.volumes must be ascending; nested subsets depend on it")
-    if int(config.sweep.get("epochs", 0)) <= 0:
-        raise ValueError("sweep.epochs must be a positive integer")
+    budget = config.budget
+    if budget["mode"] not in BUDGET_MODES:
+        raise ValueError(f"sweep.budget.mode must be one of {list(BUDGET_MODES)}")
+    if budget["epochs"] <= 0:
+        raise ValueError("sweep.budget.epochs must be a positive integer")
+    if budget["evals_per_run"] <= 0:
+        raise ValueError("sweep.budget.evals_per_run must be a positive integer")
+    max_steps = budget["max_steps"]
+    if isinstance(max_steps, dict):
+        if unknown := sorted(set(max_steps) - set(config.raw["models"])):
+            raise ValueError(f"sweep.budget.max_steps names unknown models: {unknown}")
+        for key, value in max_steps.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"sweep.budget.max_steps[{key}] must be a positive integer")
+    elif max_steps != "auto" and not (isinstance(max_steps, int) and not isinstance(max_steps, bool) and max_steps > 0):
+        raise ValueError("sweep.budget.max_steps must be 'auto', a positive integer, or a per-model mapping")
 
     if not config.models:
         raise ValueError("no model in models: is enabled")
@@ -362,6 +472,7 @@ def _validate(config: SweepConfig) -> None:
         _slug(system_id, "system id")
 
 
+BUDGET_MODES = ("fixed_epochs", "fixed_steps")
 COMPOSITION_MODES = ("pool_proportional", "random", "domain_shares")
 
 

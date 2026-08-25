@@ -71,9 +71,15 @@ def show_plan(config) -> None:
     plan.add_column("Jobs", justify="right")
     plan.add_column("Detail")
     systems, test_sets = len(config.systems), len(config.test_sets)
+    budget = config.budget
+    detail = (
+        f"{budget['epochs']} epoch(s) each"
+        if budget["mode"] == "fixed_epochs"
+        else "; ".join(f"{key} capped at {config.max_steps_for(key)} steps" for key in config.models)
+    )
     plan.add_row("finetune", str(len(config.finetune_systems)),
                  f"{len(config.models)} model(s) x {len(config.volumes)} volume(s), "
-                 f"{config.sweep['epochs']} epochs each")
+                 f"budget {budget['mode']}: {detail}")
     plan.add_row("generate", str(systems * test_sets), f"{systems} systems x {test_sets} test sets")
     plan.add_row("score+report", str(2 * test_sets), "single-process per test set (XCOMET + MetricX)")
     plan.add_row("GPU pool", str(len(config.gpus)), f"physical ids {config.gpus}")
@@ -97,7 +103,10 @@ def main() -> None:
     config = load_sweep_config(args.config)
     setup_logging(config.raw, run_name="finetune_benchmark")
     logger.info("Sweep config: [bold]%s[/bold]", config.path)
-    logger.info("Output directory: [bold]%s[/bold]", config.output_dir)
+    logger.info(
+        "Run [bold]%s[/bold] (budget %s) -> [bold]%s[/bold]",
+        config.run_id, config.budget["mode"], config.output_dir,
+    )
 
     if args.stage == "plan":
         show_plan(config)

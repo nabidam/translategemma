@@ -11,16 +11,44 @@
 #       --config scripts/finetune_benchmark/sweep_config.yaml
 sweep:
   output_dir: "logs/finetune_benchmark"
+  # Artefacts land in <output_dir>/<run_id>. Left unset, run_id names the budget
+  # below (fixed_epochs_e1, fixed_steps_auto, ...), so running both budget modes
+  # cannot overwrite or silently reuse each other's cells. The data stage is
+  # shared: both modes train on the same subsets, which is the point.
+  run_id: null
   # Physical GPU IDs the sweep may use. One job per GPU, scheduled as a pool:
   # 8 fine-tunes and every evaluation shard run 4-wide on this host.
   gpus: [4, 5, 6, 7]
   # Fine-tune data volumes, in rows. Subsets are nested (5k is a subset of 10k
   # and so on), so a volume-to-volume delta is data ADDED, not data swapped.
   volumes: [5000, 10000, 50000, 100000]
-  # Fixed for every volume, so a delta reads as "what more data buys".
-  # Training compute therefore scales with the volume; the report states the
-  # GPU-hours each cell actually cost so the confound stays visible.
-  epochs: 3
+  # How much training each cell gets, and therefore what a volume-to-volume
+  # delta means.
+  #
+  #   fixed_epochs  every cell sees its data `epochs` times, so a larger volume
+  #                 also gets proportionally more optimizer steps. Reads as
+  #                 "what does more data buy"; mixes volume with compute, and
+  #                 the report prices each cell in GPU-hours so that is visible.
+  #   fixed_steps   every cell gets the same number of optimizer steps, so the
+  #                 small cells repeat their data and the large ones see part of
+  #                 theirs once. Isolates data diversity at equal compute, and
+  #                 will overfit the small cells — that is the finding, not a bug.
+  #
+  # Run both to separate the two effects: the same data stage feeds them, and
+  # each mode writes to its own output_dir.
+  budget:
+    mode: "fixed_epochs"
+    epochs: 1
+    # fixed_steps only. "auto" derives the cap from the smallest volume at
+    # `epochs` epochs, so every cell gets the compute the smallest cell would
+    # have had. An integer applies to both arms; a mapping sets each arm
+    # separately, e.g. { translategemma: 120, nllb: 700 }. Prefer explicit
+    # values for the TranslateGemma arm: packing turns rows into fewer, longer
+    # blocks, so a row-derived estimate covers more epochs than it looks like.
+    max_steps: "auto"
+    # In fixed_steps mode, eval/checkpoint intervals are derived as
+    # max_steps / evals_per_run, because an epoch boundary may never be reached.
+    evals_per_run: 4
   seed: 42
   # Keep the matrix running when one cell fails (an OOM, a bad path) and mark it
   # failed in the report instead of losing the completed cells.

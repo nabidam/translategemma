@@ -61,6 +61,30 @@ def _metric_columns(config: SweepConfig, frame: pd.DataFrame) -> list[str]:
     return [metric for metric in requested if metric in frame.columns]
 
 
+def _budget_label(config: SweepConfig) -> str:
+    budget = config.budget
+    if budget["mode"] == "fixed_epochs":
+        return f"{budget['epochs']} epoch(s) per cell"
+    caps = ", ".join(f"{key} {config.max_steps_for(key)}" for key in config.models)
+    return f"compute-matched ({caps} optimizer steps)"
+
+
+def _budget_note(config: SweepConfig) -> str:
+    if config.budget["mode"] == "fixed_epochs":
+        return (
+            f"Every cell trained for {config.epochs} epoch(s), so a larger volume also received "
+            "proportionally more optimizer steps. Volume and compute are deliberately not separated; "
+            "the training-cost table shows what each cell actually spent."
+        )
+    return (
+        "Every cell was capped at the same number of optimizer steps "
+        f"({_budget_label(config)}), so compute is held roughly constant and the small volumes revisit "
+        "their data many times. A flat curve here means added diversity did not help at equal compute; "
+        "it does not mean added data never helps, which is what the fixed_epochs run answers. Overfitting "
+        "at the small volumes is expected — read it in the eval_loss column, not as a bug."
+    )
+
+
 # ---------------------------------------------------------------- tables
 def build_master_summary(config: SweepConfig, generate_jobs: dict[str, dict]) -> pd.DataFrame:
     """One row per (test set, system): metric means plus generation throughput."""
@@ -119,7 +143,10 @@ def build_training_cost(config: SweepConfig, finetune_jobs: dict[str, dict]) -> 
                 "volume": system.volume,
                 "volume_label": system.volume_label,
                 "status": job.get("status"),
-                "epochs": int(config.sweep["epochs"]),
+                "budget_mode": config.budget["mode"],
+                "epochs": config.epochs,
+                "max_steps": config.max_steps_for(system.model_key),
+                "steps_run": metrics.get("global_step"),
                 "train_rows": metrics.get("train_rows"),
                 "trainable_parameters": metrics.get("trainable_parameters"),
                 "train_loss": metrics.get("train_loss"),
@@ -184,6 +211,8 @@ def _trainer_state_metrics(directory: Path) -> dict[str, Any]:
             break
     if state.get("best_metric") is not None:
         metrics["eval_loss"] = state["best_metric"]
+    if state.get("global_step") is not None:
+        metrics["global_step"] = state["global_step"]
     return metrics
 
 
@@ -397,9 +426,7 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
             )
 
     conclusion["notes"] += [
-        f"Every cell trained for {config.sweep['epochs']} epochs, so a larger volume also received "
-        "proportionally more optimizer steps. Volume and compute are deliberately not separated; "
-        "the training-cost table shows what each cell actually spent.",
+        _budget_note(config),
         "Training subsets are nested (each volume is a superset of the smaller ones) and were drawn "
         "from a pool with every test document, and its near-duplicates, already removed.",
         "Deltas are paired bootstrap estimates over identical examples; an interval spanning zero "
@@ -626,7 +653,7 @@ def render_html(config: SweepConfig, master: pd.DataFrame, cost: pd.DataFrame, d
         "<h1>Fine-tuning data-volume benchmark</h1>",
         f"<p class='lede'>{html.escape(', '.join(model.get('label', key) for key, model in config.models.items()))}"
         f" · volumes {', '.join(volume_label(volume) for volume in config.volumes)}"
-        f" · {len(config.test_sets)} test set(s) · {config.sweep['epochs']} epochs per cell"
+        f" · {len(config.test_sets)} test set(s) · {_budget_label(config)}"
         f" · generated {generated}</p>",
         _conclusion_html(config, conclusion, deltas),
     ]

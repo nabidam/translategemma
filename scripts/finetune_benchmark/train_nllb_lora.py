@@ -47,7 +47,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--epochs", type=float, required=True)
-    parser.add_argument("--max-steps", type=int, default=None, help="Smoke-test cap on optimizer steps.")
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help="Optimizer-step cap: the compute-matched budget, or a smoke-test limit.",
+    )
+    parser.add_argument(
+        "--eval-save-steps", type=int, default=None,
+        help="Step interval for evaluation and checkpointing. Overrides the config's epoch cadence, "
+             "which a capped run may never reach.",
+    )
     parser.add_argument("--max-examples", type=int, default=None, help="Smoke-test cap on training rows.")
     return parser.parse_args()
 
@@ -145,6 +153,9 @@ def main() -> None:
     if eval_dataset is not None:
         eval_dataset = eval_dataset.map(tokenize, batched=True, remove_columns=remove_columns, desc="Tokenizing validation")
 
+    cadence = "steps" if args.eval_save_steps else training.get("eval_strategy", "epoch")
+    interval = int(args.eval_save_steps or training.get("eval_steps", 200))
+
     arguments = Seq2SeqTrainingArguments(
         output_dir=str(output_dir / "checkpoints"),
         per_device_train_batch_size=int(training["per_device_batch_size"]),
@@ -162,10 +173,13 @@ def main() -> None:
         gradient_checkpointing=bool(training.get("gradient_checkpointing", True)),
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=int(training.get("logging_steps", 25)),
-        eval_strategy="steps" if eval_dataset is not None else "no",
-        eval_steps=int(training.get("eval_steps", 200)),
-        save_strategy="steps" if eval_dataset is not None else "no",
-        save_steps=int(training.get("save_steps", 200)),
+        # Epoch cadence by default; a step cadence when the caller passes one,
+        # because a step-capped run can stop before the first epoch ends and
+        # would otherwise produce no evaluation and no checkpoint at all.
+        eval_strategy=cadence if eval_dataset is not None else "no",
+        eval_steps=interval,
+        save_strategy=cadence if eval_dataset is not None else "no",
+        save_steps=interval,
         save_total_limit=int(training.get("save_total_limit", 1)),
         load_best_model_at_end=eval_dataset is not None,
         metric_for_best_model="eval_loss",
@@ -202,6 +216,7 @@ def main() -> None:
             "train_rows": len(train_dataset),
             "validation_rows": len(eval_dataset) if eval_dataset is not None else 0,
             "epochs": args.epochs,
+            "max_steps": args.max_steps,
             "effective_batch_size": int(training["per_device_batch_size"]) * int(training["gradient_accumulation_steps"]),
             "trainable_parameters": sum(p.numel() for p in trainer.model.parameters() if p.requires_grad),
         }
