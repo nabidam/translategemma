@@ -126,6 +126,53 @@ def _volume_from_label(config: SweepConfig, label: str) -> int:
     return 0
 
 
+def _split_rows(config: SweepConfig, system: System) -> int | None:
+    """Rows in this cell's train split, from split_dataset.py's manifest.
+
+    The authoritative row count, and not the same number the trainer iterates:
+    with packing on, TranslateGemma's Trainer sees packed 2048-token blocks, so
+    roughly six rows arrive per unit.
+    """
+    manifest = config.subset_split_paths(system.volume)["manifest"]
+    if not manifest.is_file():
+        return None
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return ((payload.get("splits") or {}).get("train") or {}).get("rows")
+
+
+def _adapter_parameter_count(adapter_dir: Path) -> int | None:
+    """Trainable parameters, counted from the adapter's own safetensors header.
+
+    Measured rather than reported: train.py's run_metadata.json carries split
+    sizes and package versions but no parameter count, so the column was empty
+    for the whole TranslateGemma arm. The header lists every tensor's shape, so
+    this is exact and reads only a few kilobytes.
+    """
+    path = adapter_dir / "adapter_model.safetensors"
+    if not path.is_file():
+        return None
+    with path.open("rb") as handle:
+        header_length = int.from_bytes(handle.read(8), "little")
+        if not 0 < header_length < path.stat().st_size:
+            return None
+        try:
+            header = json.loads(handle.read(header_length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+    total = 0
+    for name, entry in header.items():
+        if name == "__metadata__" or not isinstance(entry, dict) or "shape" not in entry:
+            continue
+        count = 1
+        for dimension in entry["shape"]:
+            count *= int(dimension)
+        total += count
+    return total or None
+
+
 def build_training_cost(config: SweepConfig, finetune_jobs: dict[str, dict]) -> pd.DataFrame:
     rows = []
     for system in config.finetune_systems:
@@ -135,6 +182,14 @@ def build_training_cost(config: SweepConfig, finetune_jobs: dict[str, dict]) -> 
         hardware = job.get("hardware") or {}
         duration = job.get("duration_seconds") or 0.0
         metrics = _training_metrics(config, system)
+        # Rows come from the split manifest; what the trainer iterated is a
+        # separate number, because packing turns rows into fewer, longer blocks.
+        train_rows = _split_rows(config, system) or metrics.get("train_rows")
+        units_seen = metrics.get("train_rows")
+        steps = metrics.get("global_step")
+        parameters = metrics.get("trainable_parameters") or _adapter_parameter_count(
+            config.adapter_path(system)
+        )
         rows.append(
             {
                 "system_id": system.id,
@@ -146,9 +201,15 @@ def build_training_cost(config: SweepConfig, finetune_jobs: dict[str, dict]) -> 
                 "budget_mode": config.budget["mode"],
                 "epochs": config.epochs,
                 "max_steps": config.max_steps_for(system.model_key),
-                "steps_run": metrics.get("global_step"),
-                "train_rows": metrics.get("train_rows"),
-                "trainable_parameters": metrics.get("trainable_parameters"),
+                "steps_run": steps,
+                "train_rows": train_rows,
+                # Packed blocks for the TranslateGemma arm, rows for NLLB. The
+                # ratio to train_rows is the packing factor, and it is why the
+                # two arms take very different step counts for one epoch of the
+                # same data.
+                "train_units_seen": units_seen,
+                "rows_per_optimizer_step": (train_rows / steps) if train_rows and steps else None,
+                "trainable_parameters": parameters,
                 "train_loss": metrics.get("train_loss"),
                 "eval_loss": metrics.get("eval_loss"),
                 "train_wall_seconds": duration,
@@ -157,8 +218,7 @@ def build_training_cost(config: SweepConfig, finetune_jobs: dict[str, dict]) -> 
                 # kept explicit because the sweep runs four cells at once and the
                 # total below is GPU-hours, not elapsed time.
                 "gpu_hours": duration / 3600,
-                "seconds_per_1k_rows": (duration / (metrics["train_rows"] / 1000))
-                if metrics.get("train_rows") else None,
+                "seconds_per_1k_rows": (duration / (train_rows / 1000)) if train_rows else None,
                 "vram_peak_gib": (hardware.get("vram_peak_mib") or 0) / 1024 or None,
                 "gpu_utilization_average_percent": hardware.get("gpu_utilization_average_percent"),
                 "power_draw_average_watts": hardware.get("power_draw_average_watts"),
@@ -351,8 +411,48 @@ def build_degeneration(config: SweepConfig) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _step_budget_note(cost: pd.DataFrame) -> str | None:
+    """Warn when one epoch means very different step counts per arm.
+
+    Packing turns rows into fewer, longer blocks, so an epoch of the same data
+    is far fewer optimizer updates for a packed arm than for an unpacked one. At
+    the smallest volumes that can be a couple of dozen updates, which is not a
+    converged fine-tune whatever the data volume says.
+    """
+    if cost.empty or "rows_per_optimizer_step" not in cost:
+        return None
+    usable = cost.dropna(subset=["rows_per_optimizer_step", "steps_run"])
+    if usable.empty:
+        return None
+    per_arm = usable.groupby("model_key").agg(
+        rows_per_step=("rows_per_optimizer_step", "median"),
+        fewest_steps=("steps_run", "min"),
+        most_steps=("steps_run", "max"),
+    )
+    detail = "; ".join(
+        f"{key}: {row.rows_per_step:.0f} rows/step, {int(row.fewest_steps)}-{int(row.most_steps)} steps"
+        for key, row in per_arm.iterrows()
+    )
+    note = f"One epoch is a different number of optimizer updates per arm ({detail})."
+    if len(per_arm) > 1:
+        ratio = per_arm["rows_per_step"].max() / max(per_arm["rows_per_step"].min(), 1e-9)
+        if ratio > 1.5:
+            note += (
+                f" The arms differ by {ratio:.1f}x because sequence packing gives one arm several rows per "
+                "unit, so equal data volume is not equal training. Compare cells within an arm freely; read "
+                "across arms with this in mind, or run the fixed_steps budget."
+            )
+    if int(per_arm["fewest_steps"].min()) < 50:
+        note += (
+            f" The smallest cell ran only {int(per_arm['fewest_steps'].min())} optimizer updates, which is "
+            "too few to read as a converged fine-tune; treat that point as a floor, not a measurement."
+        )
+    return note
+
+
 def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataFrame,
-                     marginal: pd.DataFrame, degeneration: pd.DataFrame) -> dict:
+                     marginal: pd.DataFrame, degeneration: pd.DataFrame,
+                     cost: pd.DataFrame | None = None) -> dict:
     """The claims the report is willing to make, each tied to a number."""
     metric = config.report.get("primary_metric", "comet")
     higher_is_better = METRIC_DIRECTIONS.get(metric, "higher") == "higher"
@@ -360,6 +460,8 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
                                   "per_test_set": {}, "notes": [], "degeneration_gate": None}
     if master.empty or metric not in master.columns:
         conclusion["notes"].append(f"No {metric} column available; the ranking sections are empty.")
+        if cost is not None and (step_note := _step_budget_note(cost)):
+            conclusion["notes"].append(step_note)
         return conclusion
 
     for test_set_id, group in master.groupby("test_set"):
@@ -400,6 +502,9 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
                 plateau[model_key] = None if insignificant.empty else insignificant.iloc[0]["to"]
             entry["plateau_after"] = plateau
         conclusion["per_test_set"][test_set_id] = entry
+
+    if cost is not None and (step_note := _step_budget_note(cost)):
+        conclusion["notes"].append(step_note)
 
     threshold = config.report.get("max_degeneration_rate")
     if threshold is not None and not degeneration.empty:
@@ -607,6 +712,9 @@ def _conclusion_html(config: SweepConfig, conclusion: dict, deltas: pd.DataFrame
     parts = ["<h2>Conclusion</h2>"]
     if not conclusion["per_test_set"]:
         parts.append("<p class='empty'>No scored test set yet.</p>")
+        parts.append("<h3>Read these numbers with</h3><ul class='notes'>")
+        parts.extend(f"<li>{html.escape(note)}</li>" for note in conclusion["notes"])
+        parts.append("</ul>")
         return "".join(parts)
     cards = []
     for test_set_id, entry in conclusion["per_test_set"].items():
@@ -714,7 +822,7 @@ def run(config: SweepConfig) -> dict[str, Path]:
     deltas = build_deltas(config, master) if not master.empty else pd.DataFrame()
     marginal = build_marginal_gains(config, master) if not master.empty else pd.DataFrame()
     degeneration = build_degeneration(config)
-    conclusion = build_conclusion(config, master, deltas, marginal, degeneration)
+    conclusion = build_conclusion(config, master, deltas, marginal, degeneration, cost)
 
     directory = config.report_dir
     directory.mkdir(parents=True, exist_ok=True)
