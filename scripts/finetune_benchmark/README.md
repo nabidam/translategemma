@@ -58,7 +58,7 @@ so the two budgets are comparable.
 | --- | --- | --- |
 | `data` | Normalizes the corpus, carves out the 500-row in-domain test set with `build_test_set.py`, builds nested subsets, splits each into train/validation with `split_dataset.py` | CPU, sequential |
 | `finetune` | One LoRA job per (model, volume) cell | one job per GPU, 4-wide |
-| `evaluate` | `generate` per candidate, then `score` and `report` per test set | generation 4-wide; scoring one job per test set |
+| `evaluate` | `generate` per candidate, then `score` (through this directory's MetricX shim) and `report` per test set | generation 4-wide; scoring one job per test set |
 | `report` | Cross-test-set tables, paired-bootstrap deltas, cost, HTML conclusion | CPU |
 
 Three more commands: `plan` prints the matrix and every path without running
@@ -234,6 +234,51 @@ each subset's realized composition.
    or set `models.translategemma.overrides.training.packing: false` and
    `model.attn_implementation: sdpa`. Run the dependency preflight from
    `docs/TRANSLATION_BENCHMARK_RUNBOOK.md` §6 once per new image.
+
+## Two workarounds this directory carries
+
+Both live here rather than as edits to the repository's own scripts.
+
+**MetricX must run with `use_cache=False`.** MetricX builds its decoder with
+`is_encoder_decoder=False`, so with caching on, `MT5Stack` allocates a plain
+`DynamicCache` instead of an `EncoderDecoderCache`; the cross-attention keys are
+appended to the self-attention cache and the forward pass dies in
+`position_bias + causal_mask` with `size of tensor a (266) must match ... b
+(265)`. `evaluate_translations.py` passes the flag;
+`translation_benchmark.metrics` does not. `score.py` replaces that one function
+on the imported module and then runs the benchmark's ordinary scoring stage, so
+no repository file changes and every other metric is computed by the shared
+implementation.
+
+**NLLB-200's `.bin` checkpoints may not load on a current torch.** transformers
+wraps any `torch.load` failure in an unrelated-sounding *"Unable to load weights
+from pytorch checkpoint file ... If you tried to load a PyTorch model from a TF
+2.0 checkpoint"*. With `weights_only=True` the default in torch 2.6+, a
+2022-era pickle can trip the safe unpickler on the production host while loading
+fine on an older staging machine. Convert once, on the machine that can load it:
+
+```bash
+uv run --no-project --with transformers --with torch --with safetensors python -c "
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-3.3B').save_pretrained(
+    'nllb-200-3.3B-st', safe_serialization=True)
+AutoTokenizer.from_pretrained('facebook/nllb-200-3.3B').save_pretrained('nllb-200-3.3B-st')"
+```
+
+Transfer the directory to the offline host and point the arm at the path —
+local directories work everywhere in this pipeline (trainer, benchmark runner,
+preflight):
+
+```yaml
+models:
+  nllb:
+    base_model_id: "/models/nllb-200-3.3B-st"
+```
+
+safetensors also loads faster and `preflight` can verify it exactly (every
+tensor's declared byte range must end on the end of the file). Run `preflight`
+afterwards to confirm the tokenizer travelled with it, including the
+`eng_Latn`/`pes_Arab` language tags.
 
 ## What the design guarantees
 

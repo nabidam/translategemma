@@ -180,6 +180,14 @@ def write_staging_configs(config: SweepConfig) -> dict[str, Path]:
 
 
 def _benchmark_command(config_path: Path, command: str, extra: list[str] | None = None) -> list[str]:
+    if command == "score":
+        # The sweep's own scorer: identical to benchmark_translations.py score
+        # except that MetricX runs with use_cache=False, without which its
+        # forward pass crashes. See scripts/finetune_benchmark/score.py.
+        return [
+            sys.executable, "-m", "scripts.finetune_benchmark.score",
+            "--config", str(config_path), *(extra or []),
+        ]
     return [sys.executable, "benchmark_translations.py", "--config", str(config_path), command, *(extra or [])]
 
 
