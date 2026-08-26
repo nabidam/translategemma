@@ -377,8 +377,26 @@ class SweepConfig:
         return directory / "adapter"
 
 
+BASE_CONFIG_PURPOSE = {
+    BASE_TRAINING_CONFIG: "the TranslateGemma training defaults every cell's config is merged over",
+    BASE_BENCHMARK_CONFIG: "the metric, statistics and report defaults every evaluation is merged over",
+    BASE_TESTSET_CONFIG: "the test-set builder defaults the data stage is merged over",
+}
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as handle:
+    path = Path(path)
+    if not path.is_file():
+        # These are repository files, not generated ones. Missing means the
+        # checkout on this host is incomplete -- which on an air-gapped machine
+        # usually means the source archive predates the file.
+        if purpose := BASE_CONFIG_PURPOSE.get(path):
+            raise FileNotFoundError(
+                f"{path} is missing. It is a tracked repository file and holds {purpose}. "
+                f"Restore it with `git checkout -- {path.name}`, or copy it from the repository."
+            )
+        raise FileNotFoundError(f"{path} does not exist")
+    with path.open(encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
 
 

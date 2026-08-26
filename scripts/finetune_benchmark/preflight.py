@@ -177,6 +177,22 @@ def check_tokenizer(label: str, repo_id: str) -> list[Check]:
     return [Check(label, OK, ", ".join(present))]
 
 
+def check_base_configs() -> list[Check]:
+    """The repository templates every derived config is merged over.
+
+    Checked because the failure mode is late and confusing: the evaluate stage
+    reads benchmark_config.yaml only when it renders its first candidate list,
+    which is after the whole finetune stage has run.
+    """
+    from .config import BASE_CONFIG_PURPOSE
+
+    return [
+        Check(f"template {path.name}", OK if path.is_file() else FAIL,
+              str(path) if path.is_file() else f"missing — holds {purpose}")
+        for path, purpose in BASE_CONFIG_PURPOSE.items()
+    ]
+
+
 def check_data(config: SweepConfig, stage: str) -> list[Check]:
     checks: list[Check] = []
     corpus = config.resolve(config.corpus["csv_path"])
@@ -253,7 +269,9 @@ def check_disk(config: SweepConfig) -> list[Check]:
 
 def run(config: SweepConfig, stage: str = "all") -> list[Check]:
     """Every check for `stage`, printed as a table. Never raises on a FAIL."""
-    checks: list[Check] = [*check_gpus(config), *check_disk(config), *check_data(config, stage)]
+    checks: list[Check] = [
+        *check_base_configs(), *check_gpus(config), *check_disk(config), *check_data(config, stage),
+    ]
     for key, model in config.models.items():
         checks.extend(check_checkpoint(f"model {key}", model["base_model_id"]))
     metrics = (config.evaluation.get("overrides") or {}).get("metrics") or {}
