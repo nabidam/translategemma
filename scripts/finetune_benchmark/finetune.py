@@ -27,6 +27,7 @@ from .config import (
     load_yaml,
     write_yaml,
 )
+from . import preflight
 from .scheduler import Job, logger, run_jobs
 
 
@@ -169,6 +170,7 @@ def build_jobs(config: SweepConfig, systems: list[System] | None = None) -> list
 
 
 def run(config: SweepConfig, force: bool = False, systems: list[System] | None = None) -> dict:
+    preflight.enforce(config, "finetune")
     jobs = build_jobs(config, systems)
     budget = config.budget
     logger.info(

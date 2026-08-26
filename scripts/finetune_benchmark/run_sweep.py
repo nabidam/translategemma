@@ -4,6 +4,7 @@
 Four stages, each resumable and independently runnable:
 
     plan      print the matrix, the job counts and every path, run nothing
+    preflight verify staged checkpoints, test sets, GPUs and disk (offline, seconds)
     assets    (online machine) emit configs for scripts/fetch_offline_assets.py
     data      normalize the corpus, carve out the in-domain test set, build the
               nested training subsets and their train/validation splits
@@ -31,7 +32,7 @@ if __package__ in (None, ""):  # Allow `python scripts/finetune_benchmark/run_sw
     sys.path.insert(0, str(PROJECT_ROOT))
     __package__ = "scripts.finetune_benchmark"
 
-from scripts.finetune_benchmark import data_prep, evaluate, finetune, report  # noqa: E402
+from scripts.finetune_benchmark import data_prep, evaluate, finetune, preflight, report  # noqa: E402
 from scripts.finetune_benchmark.config import load_sweep_config, volume_label  # noqa: E402
 from scripts.finetune_benchmark.scheduler import console, logger  # noqa: E402
 
@@ -43,7 +44,7 @@ STAGES = ("data", "finetune", "evaluate", "report")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stage", choices=[*STAGES, "all", "plan", "assets"])
+    parser.add_argument("stage", choices=[*STAGES, "all", "plan", "assets", "preflight"])
     parser.add_argument("--config", default="scripts/finetune_benchmark/sweep_config.yaml")
     parser.add_argument("--force", action="store_true", help="Redo completed work instead of reusing it.")
     parser.add_argument("--systems", nargs="+", help="Limit the finetune stage to these system ids.")
@@ -110,6 +111,12 @@ def main() -> None:
 
     if args.stage == "plan":
         show_plan(config)
+        return
+    if args.stage == "preflight":
+        failures = [check for check in preflight.run(config, "all") if check.status == preflight.FAIL]
+        if failures:
+            raise SystemExit(f"{len(failures)} preflight check(s) failed.")
+        logger.info("Preflight clean.")
         return
     if args.stage == "assets":
         # Run this on the ONLINE staging machine; it writes configs for

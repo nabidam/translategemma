@@ -61,10 +61,29 @@ so the two budgets are comparable.
 | `evaluate` | `generate` per candidate, then `score` and `report` per test set | generation 4-wide; scoring one job per test set |
 | `report` | Cross-test-set tables, paired-bootstrap deltas, cost, HTML conclusion | CPU |
 
-Two more commands: `plan` prints the matrix and every path without running
-anything, and `assets` (on the **online** machine) writes the configs
-`scripts/fetch_offline_assets.py` needs for this sweep and prints the staging
-command.
+Three more commands: `plan` prints the matrix and every path without running
+anything, `preflight` verifies the run's inputs, and `assets` (on the **online**
+machine) writes the configs `scripts/fetch_offline_assets.py` needs for this
+sweep and prints the staging command.
+
+### Preflight
+
+```bash
+docker compose run --rm trainer python -m scripts.finetune_benchmark.run_sweep preflight
+```
+
+Fully offline, seconds, loads no weights. It checks, per staged checkpoint, that
+every file the shard index names exists, is not a dangling symlink, is not a
+git-lfs pointer, starts with the right magic bytes, and sums to what the index
+declares — plus unfinished `*.incomplete` downloads in the cache. It also
+verifies the COMET encoder repository that `hparams.yaml` names (its absence
+surfaces as an unrelated `AttributeError` deep inside transformers), the MetricX
+tokenizer, the corpus and test-set paths and columns, the subsets, the adapters,
+the GPU ids, and free disk.
+
+This runs automatically at the start of the `finetune` and `evaluate` stages, so
+a half-transferred shard fails in seconds instead of after the queue has spent
+GPU minutes on other cells. Set `sweep.preflight: false` to skip it.
 
 Useful flags: `--force` (redo completed jobs), `--systems translategemma-5k …`,
 `--test-sets flores`, and `--config` for an alternative sweep file.

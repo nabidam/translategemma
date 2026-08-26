@@ -31,6 +31,7 @@ from .config import (
     load_yaml,
     write_yaml,
 )
+from . import preflight
 from .scheduler import Job, logger, run_jobs
 
 GENERATION_PROFILE = "sweep"
@@ -196,6 +197,7 @@ def _job(config: SweepConfig, test_set_id: str, phase: str, name: str, command: 
 
 
 def run(config: SweepConfig, force: bool = False, test_set_ids: list[str] | None = None) -> dict:
+    preflight.enforce(config, "evaluate")
     systems = _available_systems(config)
     if not systems:
         raise RuntimeError("No evaluable system: neither base models nor adapters resolved.")

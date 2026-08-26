@@ -53,6 +53,10 @@ sweep:
   # Keep the matrix running when one cell fails (an OOM, a bad path) and mark it
   # failed in the report instead of losing the completed cells.
   fail_fast: false
+  # Verify staged checkpoints, test sets, GPU ids and disk before the finetune
+  # and evaluate stages queue anything. Local and cheap; a corrupt shard costs
+  # seconds to find here and a queue of half-run cells to find later.
+  preflight: true
   telemetry:
     enabled: true
     interval_seconds: 2.0
