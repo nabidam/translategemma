@@ -193,9 +193,37 @@ def build_jobs(config: SweepConfig, systems: list[System] | None = None) -> list
     return jobs
 
 
+def _log_projected_updates(config: SweepConfig, jobs: list[Job]) -> None:
+    """Warn before training when a cell would get very few optimizer updates.
+
+    rows / effective_batch is an UPPER bound: sequence packing puts several rows
+    in one unit (about six on this corpus), so a packed arm receives that many
+    times fewer updates. A cell of a couple of dozen updates is not a converged
+    fine-tune, and the volume curve then measures step count rather than data.
+    See docs/2026-08-27_finetune_volume_benchmark_methodology.md.
+    """
+    for job in jobs:
+        system = config.system(job.metadata["system_id"])
+        rows = system.volume * (1.0 - float(config.data.get("validation_ratio", 0.0)))
+        batch = config.effective_batch_size(system.model_key)
+        packed = bool(
+            (system.model.get("overrides") or {}).get("training", {}).get("packing")
+        ) if system.kind == CAUSAL_LORA else False
+        upper = int(rows * config.epochs / max(batch, 1))
+        if cap := job.metadata.get("max_steps"):
+            upper = min(upper, cap)
+        note = " (fewer with packing enabled)" if packed else ""
+        message = "%s: at most %d optimizer update(s)%s"
+        if upper < 150:
+            logger.warning(message + " — thin for a converged fine-tune", job.id, upper, note)
+        else:
+            logger.info(message, job.id, upper, note)
+
+
 def run(config: SweepConfig, force: bool = False, systems: list[System] | None = None) -> dict:
     preflight.enforce(config, "finetune")
     jobs = build_jobs(config, systems)
+    _log_projected_updates(config, jobs)
     budget = config.budget
     logger.info(
         "Fine-tuning %d cell(s) across GPUs %s, budget %s (%s)",

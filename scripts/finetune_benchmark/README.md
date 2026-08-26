@@ -33,6 +33,32 @@ docker compose run --rm trainer \
 | `fixed_epochs` (default, 1 epoch) | the same number of passes over its own data | "what does more data buy me" | volume and compute move together; the cost table prices it |
 | `fixed_steps` | the same number of optimizer steps | "what does more *diverse* data buy me at equal compute" | small volumes repeat their data and will overfit — read `eval_loss` |
 
+**`fixed_epochs` is the primary contract for this project.** The question is the
+practical one — a team with 100k rows trains on 100k rows, and the extra compute
+that implies is part of the answer, not a confound to remove. `fixed_steps`
+answers a different question and makes a poor headline: holding updates constant
+removes the effect being measured, and at a shared cap the small cells overfit
+rather than generalise. Run it second, if at all.
+
+### Keep every cell above ~150 optimizer updates
+
+Packing is why this needs saying. TranslateGemma trains packed (~5.9 rows per
+2048-token block on this corpus); NLLB trains unpacked. At the same effective
+batch of 48, one epoch of the same data is **5.5x fewer updates** for the packed
+arm — 18 updates for a 5k cell against NLLB's 100. An 18-update LoRA run is not
+a converged fine-tune, and its rising `train_loss` is a step-count artefact
+rather than a data effect.
+
+```text
+updates ≈ (rows x epochs) / (effective_batch x packing_factor)
+```
+
+`packing_factor` is ~6 for this corpus at `max_length: 2048`, and 1 unpacked. The
+fine-tune stage logs its projected upper bound per cell before training starts,
+and the report states the realised per-arm step counts beside the conclusion.
+Full analysis, with the measured numbers:
+`docs/2026-08-27_finetune_volume_benchmark_methodology.md`.
+
 In `fixed_steps` mode, `max_steps: "auto"` derives the cap from the smallest
 volume at `epochs` epochs; an integer applies to both arms and a mapping
 (`{ translategemma: 120, nllb: 700 }`) sets each arm separately. Prefer explicit
@@ -329,6 +355,11 @@ afterwards to confirm the tokenizer travelled with it, including the
 - **Shared metric implementations.** Scoring goes through
   `translation_benchmark`, so a chrF++ or MetricX number here is the same
   quantity as in any other benchmark run in this repository.
+- **Comparable within an arm; honest across arms.** Two cells of one arm share a
+  recipe, a tokenizer and the same step arithmetic. Across arms the comparison is
+  of two systems as they would actually be built — 12B with 65.5M LoRA parameters
+  and packing against 3.3B with 34.6M and none — not a controlled study of
+  architecture, and the report says so.
 - **Paired statistics.** Deltas are paired bootstrap estimates over identical
   examples with 95% intervals, plus win/tie rates. An interval spanning zero is
   reported as not resolvable rather than dressed up as a win.
