@@ -76,10 +76,14 @@ Fully offline, seconds, loads no weights. It checks, per staged checkpoint, that
 every file the shard index names exists, is not a dangling symlink, is not a
 git-lfs pointer, starts with the right magic bytes, and sums to what the index
 declares — plus unfinished `*.incomplete` downloads in the cache. It also
-verifies the COMET encoder repository that `hparams.yaml` names (its absence
-surfaces as an unrelated `AttributeError` deep inside transformers), the MetricX
-tokenizer, the corpus and test-set paths and columns, the subsets, the adapters,
-the GPU ids, and free disk.
+verifies each model arm's tokenizer/processor beside its weights (vocabulary
+file, `tokenizer_config.json`, `preprocessor_config.json` for the multimodal
+TranslateGemma path, and that the configured NLLB language tags are actually in
+the vocabulary — a converted checkpoint missing them translates into the wrong
+language instead of failing), the COMET encoder repository that `hparams.yaml`
+names (its absence surfaces as an unrelated `AttributeError` deep inside
+transformers), the MetricX tokenizer, the corpus and test-set paths and columns,
+the subsets, the adapters, the GPU ids, and free disk.
 
 This runs automatically at the start of the `finetune` and `evaluate` stages, so
 a half-transferred shard fails in seconds instead of after the queue has spent

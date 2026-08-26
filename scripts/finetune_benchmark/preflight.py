@@ -259,6 +259,80 @@ def check_base_configs() -> list[Check]:
     ]
 
 
+# Any one of these is enough to build a tokenizer; which one depends on whether
+# the repository ships the fast (tokenizers) or the sentencepiece variant.
+VOCAB_FILES = ("tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model", "spiece.model", "vocab.json")
+
+
+def _language_tags_present(snapshot: Path, tags: list[str]) -> tuple[list[str], bool]:
+    """Which of `tags` the tokenizer's added-token files declare, and whether they could be read.
+
+    An NLLB language tag is an added token, so a checkpoint converted or
+    re-saved without them produces text in the wrong language rather than an
+    error. Only the fast tokenizer's JSON exposes them offline; with a
+    sentencepiece-only repository the tags come from the tokenizer class, and
+    nothing here can verify them.
+    """
+    for name in ("tokenizer.json", "added_tokens.json"):
+        path = snapshot / name
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if name == "added_tokens.json":
+            known = set(payload)
+        else:
+            known = {entry.get("content") for entry in payload.get("added_tokens", [])}
+            known |= set((payload.get("model") or {}).get("vocab") or {})
+        return [tag for tag in tags if tag not in known], True
+    return [], False
+
+
+def check_model_tokenizer(label: str, model: dict[str, Any]) -> list[Check]:
+    """The tokenizer/processor each model arm loads, beside its weights.
+
+    Checked separately from the weights because they can be staged separately:
+    a checkpoint converted on another machine, or a partial file selection, can
+    leave loadable weights with no vocabulary next to them.
+    """
+    evaluation = model.get("evaluation") or {}
+    repo = evaluation.get("processor") or evaluation.get("tokenizer") or model["base_model_id"]
+    try:
+        snapshot = _snapshot_dir(str(repo))
+    except Exception as error:  # noqa: BLE001
+        return [Check(label, FAIL, f"{repo} is not staged locally: {type(error).__name__}: {error}")]
+
+    present = [name for name in VOCAB_FILES if (snapshot / name).is_file()]
+    if not present:
+        return [Check(label, FAIL, f"no vocabulary file ({', '.join(VOCAB_FILES)}) under {snapshot}")]
+    checks = [Check(label, OK, f"{', '.join(present)} in {snapshot}")]
+    if not (snapshot / "tokenizer_config.json").is_file():
+        checks.append(Check(label, WARN, "no tokenizer_config.json; the tokenizer class falls back to defaults"))
+    if model["kind"] == CAUSAL_LORA and not (snapshot / "preprocessor_config.json").is_file():
+        # TranslateGemma is multimodal and this pipeline loads AutoProcessor.
+        checks.append(
+            Check(label, WARN, "no preprocessor_config.json; AutoProcessor may fail on a multimodal checkpoint")
+        )
+    tags = [model[key] for key in ("source_lang_token", "target_lang_token") if model.get(key)]
+    if tags:
+        missing, readable = _language_tags_present(snapshot, tags)
+        if missing:
+            checks.append(
+                Check(label, FAIL, f"language tag(s) {missing} are not in the tokenizer's vocabulary — "
+                                   "generation would come out in the wrong language")
+            )
+        elif readable:
+            checks.append(Check(f"{label} tags", OK, ", ".join(tags)))
+        else:
+            checks.append(
+                Check(f"{label} tags", WARN, f"cannot verify {tags} offline: this repository ships no "
+                                             "tokenizer.json or added_tokens.json")
+            )
+    return checks
+
+
 def check_data(config: SweepConfig, stage: str) -> list[Check]:
     checks: list[Check] = []
     corpus = config.resolve(config.corpus["csv_path"])
@@ -340,6 +414,7 @@ def run(config: SweepConfig, stage: str = "all") -> list[Check]:
     ]
     for key, model in config.models.items():
         checks.extend(check_checkpoint(f"model {key}", model["base_model_id"]))
+        checks.extend(check_model_tokenizer(f"tokenizer {key}", model))
     metrics = (config.evaluation.get("overrides") or {}).get("metrics") or {}
     if (comet := metrics.get("comet") or {}).get("enabled"):
         checks.extend(check_comet("comet", comet["model"]))
