@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
              "which a capped run may never reach.",
     )
     parser.add_argument("--max-examples", type=int, default=None, help="Smoke-test cap on training rows.")
+    parser.add_argument(
+        "--resume-from-checkpoint", default=None,
+        help="Resume from this checkpoint directory instead of restarting at step 0.",
+    )
     return parser.parse_args()
 
 
@@ -201,7 +205,9 @@ def main() -> None:
         ),
         processing_class=tokenizer,
     )
-    result = trainer.train()
+    if args.resume_from_checkpoint:
+        logger.info("Resuming from [bold]%s[/bold]", args.resume_from_checkpoint)
+    result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     adapter_dir = output_dir / "adapter"
     trainer.model.save_pretrained(str(adapter_dir))

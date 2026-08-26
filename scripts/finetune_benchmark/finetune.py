@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+from pathlib import Path
 
 from .config import (
     BASE_TRAINING_CONFIG,
@@ -48,6 +49,19 @@ def _schedule_overrides(config: SweepConfig, model_key: str) -> dict:
         return {}
     interval = max(1, math.ceil(max_steps / config.budget["evals_per_run"]))
     return {"eval_steps": interval, "save_steps": interval}
+
+
+def _newest_checkpoint(directory: Path) -> Path | None:
+    """Newest Trainer checkpoint under `directory`, if any.
+
+    Resume is offered only when a checkpoint actually exists: Trainer raises on
+    resume_from_checkpoint=True with an empty output directory, which would turn
+    a retryable cell into a permanently failing one.
+    """
+    checkpoints = [path for path in directory.rglob("checkpoint-*") if path.is_dir()]
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda path: int(path.name.split("-")[-1]))
 
 
 def _causal_command(config: SweepConfig, system: System) -> list[str]:
@@ -83,6 +97,14 @@ def _causal_command(config: SweepConfig, system: System) -> list[str]:
                 "epochs": config.epochs if max_steps is None else max(config.epochs, 1000),
                 "seed": int(config.sweep["seed"]),
                 "load_best_model_at_end": validation is not None,
+                # A killed or crashed cell resumes from its newest checkpoint
+                # instead of restarting at step 0. Only set when one exists.
+                "resume_from_checkpoint": bool(_newest_checkpoint(output_dir)),
+                # Touching this file ends the cell cleanly at the next checked
+                # step: it evaluates, saves, and runs Trainer's end-of-training
+                # path, so sft_final is written. Killing the process instead
+                # loses everything since the last save.
+                "stop_file": str(output_dir / "STOP"),
                 **schedule,
             },
             "evaluation": {"run_after_training": False},
@@ -125,6 +147,8 @@ def _seq2seq_command(config: SweepConfig, system: System) -> list[str]:
     ]
     if float(config.data["validation_ratio"]) > 0:
         command += ["--validation", str(splits["validation"])]
+    if checkpoint := _newest_checkpoint(config.finetune_output_dir(system)):
+        command += ["--resume-from-checkpoint", str(checkpoint)]
     if max_steps is not None:
         command += ["--max-steps", str(max_steps)]
         interval = max(1, math.ceil(max_steps / config.budget["evals_per_run"]))

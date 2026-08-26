@@ -106,6 +106,34 @@ Nothing is lost and nothing silently disappears:
   the cell, re-run `evaluate`, and it scores the full set (scoring is redone
   because its own job result is absent, while completed generations are reused).
 
+### Stopping a run
+
+Do **not** Ctrl+C a running sweep: the trainers are children of the same process
+group, so they take the signal too, and with an epoch save cadence a long cell
+loses everything since its last save.
+
+To end one cell cleanly, touch its stop file — Trainer then evaluates, saves, and
+runs its normal end-of-training path, so `sft_final` is written:
+
+```bash
+touch logs/finetune_benchmark/<run_id>/finetune/translategemma-100k/STOP
+```
+
+A cell that was killed or crashed anyway is resumed from its newest checkpoint on
+the next run, rather than restarting at step 0. For a long single-epoch cell,
+give it intermediate checkpoints to resume from:
+
+```yaml
+models:
+  translategemma:
+    overrides:
+      training:
+        evaluation_strategy: "steps"
+        save_strategy: "steps"
+        eval_steps: 200
+        save_steps: 200
+```
+
 To redo exactly one cell:
 
 ```bash
