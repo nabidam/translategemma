@@ -745,4 +745,13 @@ def run(config: SweepConfig) -> dict[str, Path]:
     logger.info("Report written to [bold]%s[/bold]", paths["html"])
     for name, path in paths.items():
         logger.info("  %-16s %s", name, path)
+    if master.empty:
+        # The artefacts are still written -- an empty report is a legitimate
+        # thing to look at -- but "Report written" must not read as success when
+        # no test set has scores behind it.
+        raise RuntimeError(
+            "No scored test set: every table in the report is empty. The evaluate stage's score phase "
+            f"has not produced {config.evaluation_dir}/<test_set>/system_summary.csv. Re-run the "
+            "evaluate stage; collected translations are reused."
+        )
     return paths

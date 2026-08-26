@@ -280,24 +280,34 @@ def run(config: SweepConfig, force: bool = False, test_set_ids: list[str] | None
 
     # Scoring loads XCOMET and MetricX, so it wants a GPU of its own; one job per
     # test set keeps them running side by side.
-    for phase in ("score", "report"):
-        jobs = [
-            _job(
-                config, test_set_id, phase, "all",
-                _benchmark_command(
-                    config_paths[test_set_id], phase,
-                    ["--candidates", *candidate_ids] if phase == "score" else None,
-                ),
-                {"candidates": candidate_ids},
-            )
-            for test_set_id, candidate_ids in scorable.items()
-        ]
-        if not jobs:
-            continue
-        logger.info("Running %s for %d test set(s)", phase, len(jobs))
-        results.update(run_jobs(jobs, config.gpus, telemetry, force=force, fail_fast=fail_fast))
-        if any(results.get(job.id, {}).get("status") != "ok" for job in jobs):
-            logger.error("A %s job failed; the report stage will only cover completed test sets.", phase)
+    score_jobs = [
+        _job(
+            config, test_set_id, "score", "all",
+            _benchmark_command(config_paths[test_set_id], "score", ["--candidates", *candidate_ids]),
+            {"candidates": candidate_ids},
+        )
+        for test_set_id, candidate_ids in scorable.items()
+    ]
+    if score_jobs:
+        logger.info("Running score for %d test set(s)", len(score_jobs))
+        results.update(run_jobs(score_jobs, config.gpus, telemetry, force=force, fail_fast=fail_fast))
+
+    # Only test sets that actually scored get a report: the benchmark's report
+    # stage reads scores.csv and friends, so running it after a failed scoring
+    # job produces nothing but a second, more confusing traceback.
+    scored = [job.metadata["test_set"] for job in score_jobs if results.get(job.id, {}).get("status") == "ok"]
+    if unscored := [test_set_id for test_set_id in scorable if test_set_id not in scored]:
+        logger.error(
+            "Scoring failed for %s; skipping their reports. Fix the cause and re-run this stage — "
+            "the collected translations are reused.", unscored,
+        )
+    report_jobs = [
+        _job(config, test_set_id, "report", "all", _benchmark_command(config_paths[test_set_id], "report"), {})
+        for test_set_id in scored
+    ]
+    if report_jobs:
+        logger.info("Running report for %d test set(s)", len(report_jobs))
+        results.update(run_jobs(report_jobs, config.gpus, telemetry, force=force, fail_fast=fail_fast))
 
     path = config.output_dir / "evaluate_stage.json"
     path.parent.mkdir(parents=True, exist_ok=True)
