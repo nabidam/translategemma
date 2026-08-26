@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,48 @@ def _weight_files(snapshot: Path) -> tuple[list[Path], int | None]:
     return found, None
 
 
+def _check_safetensors(path: Path, size: int) -> str | None:
+    """Validate a safetensors file end to end without reading a tensor.
+
+    The header declares every tensor's byte range, so the largest end offset must
+    land exactly on the end of the file. That catches a truncated tail, which a
+    magic-byte check at the head cannot see.
+    """
+    with path.open("rb") as handle:
+        header_length = int.from_bytes(handle.read(8), "little")
+        if not 0 < header_length < size:
+            return f"safetensors header length {header_length} is impossible for a {size}-byte file"
+        try:
+            header = json.loads(handle.read(header_length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            return f"safetensors header is not readable JSON ({type(error).__name__})"
+    ends = [
+        entry["data_offsets"][1]
+        for entry in header.values()
+        if isinstance(entry, dict) and "data_offsets" in entry
+    ]
+    if not ends:
+        return "safetensors header declares no tensors"
+    expected = 8 + header_length + max(ends)
+    if expected != size:
+        return f"declares {expected} bytes of tensor data but the file is {size} — truncated or padded"
+    return None
+
+
+def _check_torch_archive(path: Path, head: bytes) -> str | None:
+    """Validate a torch .bin: right container, and not cut short."""
+    if not head.startswith(TORCH_MAGIC):
+        # transformers wraps any torch.load failure in an unrelated-sounding
+        # "Unable to load weights ... TF 2.0 checkpoint?" OSError, so naming the
+        # real problem here saves a long detour.
+        return f"not a torch archive (starts with {head[:4]!r}) — re-stage this shard"
+    if head.startswith(b"PK\x03\x04") and not zipfile.is_zipfile(path):
+        # is_zipfile reads the end-of-central-directory record, so this is a tail
+        # check and costs one seek regardless of file size.
+        return "zip archive has no readable central directory — truncated transfer"
+    return None
+
+
 def _check_weight_file(path: Path) -> str | None:
     """Return a problem description, or None when the file looks loadable."""
     if not path.exists():
@@ -89,15 +132,11 @@ def _check_weight_file(path: Path) -> str | None:
             return f"git-lfs pointer, not the weights ({size} bytes)"
         return f"only {size} bytes — truncated transfer or stub"
     with resolved.open("rb") as handle:
-        header = handle.read(8)
+        head = handle.read(8)
     if path.suffix == ".safetensors":
-        header_length = int.from_bytes(header, "little")
-        if not 0 < header_length < size:
-            return f"safetensors header length {header_length} is impossible for a {size}-byte file"
-    elif path.suffix == ".bin" and not header.startswith(TORCH_MAGIC):
-        # Exactly the 2026-08-26 failure: transformers unpickles the shard and
-        # reports an unrelated-sounding "load from a TF 2.0 checkpoint?" error.
-        return f"not a torch archive (starts with {header[:4]!r}) — re-stage this shard"
+        return _check_safetensors(resolved, size)
+    if path.suffix == ".bin":
+        return _check_torch_archive(resolved, head)
     return None
 
 
@@ -121,12 +160,22 @@ def check_checkpoint(label: str, repo_id: str) -> list[Check]:
             Check(label, FAIL, "; ".join(f"{name}: {problem}" for name, problem in problems[:4]))
         ]
     actual = sum(path.resolve().stat().st_size for path in files)
-    if total_size and actual < 0.9 * total_size:
+    detail = f"{len(files)} weight file(s), {_human(actual)}, {snapshot}"
+    if total_size and actual < 0.5 * total_size:
         return checks + [
             Check(label, FAIL, f"weights total {_human(actual)} but the index declares "
                                f"{_human(total_size)} — incomplete transfer")
         ]
-    return checks + [Check(label, OK, f"{len(files)} weight file(s), {_human(actual)}, {snapshot}")]
+    if total_size and actual < 0.95 * total_size:
+        # Not a failure on its own. An index counts every name in its weight_map,
+        # while tied weights (NLLB shares one embedding across three names) are
+        # stored once, so the declared total legitimately exceeds the files. Each
+        # file has already been validated end to end above.
+        return checks + [
+            Check(label, WARN, f"{detail}; index declares {_human(total_size)} — expected when weights "
+                               f"are tied, since each file passed its own integrity check")
+        ]
+    return checks + [Check(label, OK, detail)]
 
 
 def check_comet(label: str, repo_id: str) -> list[Check]:
