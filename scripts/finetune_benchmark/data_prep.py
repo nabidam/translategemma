@@ -88,7 +88,9 @@ def normalize_corpus(config: SweepConfig, force: bool = False) -> Path:
             "id": frame[columns["id"]],
             "en": frame[columns["source"]].fillna("").str.strip(),
             "fa": frame[columns["target"]].fillna("").str.strip(),
-            "domain": frame[columns["domain"]].fillna("unknown"),
+            # Stripped: a trailing space in one row's domain label would
+            # otherwise become a separate domain in every quota and slice table.
+            "domain": frame[columns["domain"]].fillna("unknown").astype(str).str.strip(),
         }
     )
     before = len(normalized)
@@ -267,19 +269,82 @@ def _domain_orders(pool: pd.DataFrame, seed: int, stratified: bool) -> dict[str,
     return orders
 
 
+def _fold(value: str) -> str:
+    """Case- and whitespace-insensitive key for matching a domain label."""
+    return " ".join(str(value).split()).casefold()
+
+
+def _match_domains(requested: list[str], pool: pd.DataFrame, config: SweepConfig) -> dict[str, str]:
+    """Map each configured domain name to the label the train pool actually uses.
+
+    Exact matches win. A name that differs only in case or surrounding
+    whitespace is matched and logged, because "Computer Science" versus
+    "computer science " is a typo in the config, not a different domain.
+    Anything still unmatched is an error -- and the message distinguishes the two
+    causes, which need different fixes: a wrong label, or a domain that exists in
+    the corpus but was entirely quarantined into the test-set holdout.
+    """
+    pool_labels = [str(value) for value in pool["domain"].dropna().unique()]
+    by_fold: dict[str, list[str]] = {}
+    for label in pool_labels:
+        by_fold.setdefault(_fold(label), []).append(label)
+
+    mapping: dict[str, str] = {}
+    unmatched: list[str] = []
+    for name in requested:
+        if name in pool_labels:
+            mapping[name] = name
+            continue
+        candidates = by_fold.get(_fold(name), [])
+        if len(candidates) == 1:
+            logger.warning(
+                "data.composition domain %r matched the train pool label %r (case/whitespace only). "
+                "Fix the config to match exactly.", name, candidates[0],
+            )
+            mapping[name] = candidates[0]
+        elif len(candidates) > 1:
+            raise ValueError(
+                f"data.composition domain {name!r} is ambiguous: the train pool has {candidates}. "
+                "Use the exact label."
+            )
+        else:
+            unmatched.append(name)
+    if not unmatched:
+        return mapping
+
+    corpus_labels: list[str] = []
+    corpus_csv = config.work_dir / "corpus_normalized.csv"
+    if corpus_csv.exists():
+        corpus_labels = [
+            str(value)
+            for value in pd.read_csv(corpus_csv, usecols=["domain"], dtype=str)["domain"].dropna().unique()
+        ]
+    held_out = [name for name in unmatched if any(_fold(name) == _fold(label) for label in corpus_labels)]
+    if held_out:
+        raise ValueError(
+            f"Domain(s) {held_out} exist in the corpus but have no rows left in the train pool: every "
+            "document of theirs went into the in-domain test set's document-level holdout. Lower "
+            "data.in_domain_test.overrides.selection.min_per_domain (or raise max_test_documents) and "
+            f"rebuild the test set with --force, or drop them from data.composition. Train pool labels: "
+            f"{sorted(pool_labels)}"
+        )
+    raise ValueError(
+        f"data.composition names domain(s) {unmatched} that do not exist. Train pool labels: "
+        f"{sorted(pool_labels)}"
+        + (f"; corpus labels: {sorted(corpus_labels)}" if corpus_labels else "")
+        + ". Labels are compared exactly (case and inner whitespace included)."
+    )
+
+
 def _resolve_shares(config: SweepConfig, pool: pd.DataFrame, volume: int) -> dict[str, float]:
-    """Target domain shares for one volume, as an explicit mapping."""
+    """Target domain shares for one volume, keyed by the pool's own labels."""
     composition = config.composition
     shares = config.composition_shares(volume)
     if composition["mode"] == "random" and not shares:
         return {ALL_DOMAINS: 1.0}
     if shares:
-        if unknown := sorted(set(shares) - set(pool["domain"].unique())):
-            raise ValueError(
-                f"data.composition names domains {unknown} that do not exist in the train pool. "
-                f"Available: {sorted(pool['domain'].unique())}"
-            )
-        return dict(shares)
+        mapping = _match_domains(list(shares), pool, config)
+        return {mapping[name]: float(share) for name, share in shares.items()}
     counts = pool["domain"].value_counts(normalize=True)
     return {str(domain): float(share) for domain, share in counts.items()}
 
