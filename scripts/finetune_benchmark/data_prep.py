@@ -442,6 +442,38 @@ def _select_subset(
     return pd.concat(frames, ignore_index=True), quotas
 
 
+def _subset_spec(config: SweepConfig, pool_csv: Path, pool_rows: int, volume: int) -> dict:
+    """Identity of a subset: everything that changes which rows it holds."""
+    return {
+        "volume": volume,
+        "seed": int(config.sweep["seed"]),
+        "validation_ratio": float(config.data["validation_ratio"]),
+        "composition_mode": config.composition["mode"],
+        "shares": config.composition_shares(volume),
+        "pool": {"path": str(pool_csv), "rows": pool_rows},
+    }
+
+
+def _subset_is_current(paths: dict[str, Path], spec: dict, validation_ratio: float) -> bool:
+    """Whether an existing subset was built from this exact specification.
+
+    Existence alone is not enough: editing data.composition (or the seed, or the
+    validation ratio) after a first run would otherwise reuse the old rows
+    silently, and every later number would describe a mix nobody configured.
+    """
+    if not paths["train"].exists():
+        return False
+    if validation_ratio > 0 and not paths["validation"].exists():
+        return False
+    spec_path = paths["train"].parent / "subset_spec.json"
+    if not spec_path.exists():
+        return False
+    try:
+        return json.loads(spec_path.read_text(encoding="utf-8")) == spec
+    except json.JSONDecodeError:
+        return False
+
+
 def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> dict[int, dict[str, Path]]:
     """Write nested train/validation splits for every configured volume."""
     columns = _training_data_columns()
@@ -476,11 +508,15 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
     for volume in config.volumes:
         paths = config.subset_split_paths(volume)
         results[volume] = paths
-        if paths["train"].exists() and not force and (
-            paths["validation"].exists() or config.data["validation_ratio"] == 0
-        ):
+        spec = _subset_spec(config, pool_csv, len(pool), volume)
+        if not force and _subset_is_current(paths, spec, float(config.data["validation_ratio"])):
             logger.info("Reusing subset %s", paths["train"].parent)
             continue
+        if paths["train"].exists() and not force:
+            logger.warning(
+                "Rebuilding subset %s: it was built from a different specification (composition, seed, "
+                "validation ratio or train pool changed).", paths["train"].parent,
+            )
         subset, quotas = _select_subset(config, pool, orders, by_document, volume)
         realized = subset["domain"].value_counts(normalize=True).round(4).to_dict()
         subset_jsonl = _write_sft_jsonl(subset, config, columns, config.subset_dir(volume) / "subset.jsonl")
@@ -495,6 +531,9 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
             "subset_path": str(subset_jsonl),
         }
         _split_subset(config, subset_jsonl, volume)
+        (config.subset_dir(volume) / "subset_spec.json").write_text(
+            json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         logger.info(
             "Volume %s: %d rows, %d documents, domains %s -> %s",
             volume_label(volume), len(subset), subset["document_id"].nunique(), realized, paths["train"],
