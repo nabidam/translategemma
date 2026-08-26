@@ -124,6 +124,15 @@ each subset's realized composition.
        on_shortfall: "error"   # or redistribute
    ```
 
+   `unit` decides what a quota is filled from: `row` (default) shuffles the
+   domain's rows and takes a prefix, so the composition is exact and the subset
+   is as document-diverse as the pool allows; `document` takes whole documents,
+   keeping a subset's rows contiguous inside their sources. With few, very large
+   documents the difference is large — on a 12-document pool a 5k subset touches
+   all 12 documents under `row` and 4 under `document`. Both are exact on shares
+   and both stay nested; the test set's documents are already out of the pool, so
+   this is a diversity choice, not a contamination one.
+
    Shares must sum to 1 and name domains that exist in the **train pool**. A
    domain small enough that the document-level holdout consumes all of it has no
    pool rows left, and the data stage says so; withhold it from the test set
@@ -180,9 +189,12 @@ each subset's realized composition.
 - **No contamination.** The test set is selected first; every document it touches
   and every near-duplicate of its rows leaves the training pool before a single
   subset is drawn.
-- **Nested volumes.** 5k ⊂ 10k ⊂ 50k ⊂ 100k, from one domain-balanced document
+- **Nested volumes.** 5k ⊂ 10k ⊂ 50k ⊂ 100k, from one fixed per-domain draw
   order. A step along the curve is data *added*, so the marginal-gain table
   means what it says.
+- **Exact composition.** Each domain's quota is filled only from that domain's
+  rows, so the realized shares equal the configured ones even when one document
+  carries several domains — which is the normal case here.
 - **A stated budget.** `fixed_epochs` mixes volume with compute on purpose and
   the report prices each cell in GPU-hours; `fixed_steps` holds compute roughly
   constant instead. Whichever ran, the report's notes say which and how to read

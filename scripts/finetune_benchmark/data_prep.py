@@ -26,6 +26,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -389,20 +390,32 @@ ALL_DOMAINS = "__all__"
 EMPTY = pd.DataFrame()
 
 
-def _domain_orders(pool: pd.DataFrame, seed: int, stratified: bool) -> dict[str, list[str]]:
-    """One fixed, shuffled document order per domain (or one global order).
+def _domain_orders(pool: pd.DataFrame, seed: int, stratified: bool, unit: str = "row"):
+    """One fixed, shuffled draw order per domain (or one global order).
 
     Fixed is the whole point: every volume takes a longer prefix of the same
     order, which is what makes the subsets nested. `stratified=False` collapses
     all domains into one bucket, i.e. a purely random draw.
+
+    unit="row" shuffles the domain's ROWS, so a quota is filled from as many
+    documents as the pool offers — the composition is exact and each subset is
+    as document-diverse as the data allows. unit="document" shuffles documents
+    instead and takes them whole, which keeps a subset's rows contiguous inside
+    their source documents; with few, very large documents that makes a small
+    subset come from only a handful of them.
     """
     rng = np.random.default_rng(seed)
-    orders: dict[str, list[str]] = {}
+    orders: dict[str, Any] = {}
     groups = pool.groupby("domain", sort=True) if stratified else [(ALL_DOMAINS, pool)]
     for domain, group in groups:
-        documents = group["document_id"].drop_duplicates().to_numpy()
-        rng.shuffle(documents)
-        orders[str(domain)] = [str(document) for document in documents]
+        if unit == "row":
+            positions = group.index.to_numpy().copy()
+            rng.shuffle(positions)
+            orders[str(domain)] = positions
+        else:
+            documents = group["document_id"].drop_duplicates().to_numpy()
+            rng.shuffle(documents)
+            orders[str(domain)] = [str(document) for document in documents]
     return orders
 
 
@@ -586,23 +599,31 @@ def _take_rows(
 def _select_subset(
     config: SweepConfig,
     pool: pd.DataFrame,
-    orders: dict[str, list[str]],
-    groups: dict[tuple[str, str], pd.DataFrame],
+    orders: dict[str, Any],
+    groups: dict[tuple[str, str], pd.DataFrame] | None,
     volume: int,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Fill each domain's row quota from that domain's own fixed draw order."""
+    unit = config.composition["unit"]
     shares = _resolve_shares(config, pool, volume)
-    available = {
-        bucket: int(sum(len(groups.get((bucket, document), EMPTY)) for document in documents))
-        for bucket, documents in orders.items()
-    }
+    if unit == "row":
+        available = {bucket: int(len(order)) for bucket, order in orders.items()}
+    else:
+        available = {
+            bucket: int(sum(len(groups.get((bucket, document), EMPTY)) for document in documents))
+            for bucket, documents in orders.items()
+        }
     quotas = _quotas(shares, volume, available, config.composition["on_shortfall"])
     frames: list[pd.DataFrame] = []
     for bucket, quota in sorted(quotas.items()):
         if quota <= 0:
             continue
         if bucket not in orders:
-            raise ValueError(f"No documents for domain {bucket!r} in the train pool")
-        frames.extend(_take_rows(orders[bucket], groups, bucket, quota))
+            raise ValueError(f"No rows for domain {bucket!r} in the train pool")
+        if unit == "row":
+            frames.append(pool.loc[orders[bucket][:quota]])
+        else:
+            frames.extend(_take_rows(orders[bucket], groups, bucket, quota))
     return pd.concat(frames, ignore_index=True), quotas
 
 
@@ -612,11 +633,13 @@ def _subset_spec(config: SweepConfig, pool_csv: Path, pool_rows: int, volume: in
         # Bumped when the selector's behaviour changes, so subsets built by an
         # earlier version are rebuilt instead of silently reused. v2: per-domain
         # quotas take only that domain's rows from a mixed-domain document.
-        "builder_version": 2,
+        # v3: draw unit is configurable and defaults to rows.
+        "builder_version": 3,
         "volume": volume,
         "seed": int(config.sweep["seed"]),
         "validation_ratio": float(config.data["validation_ratio"]),
         "composition_mode": config.composition["mode"],
+        "draw_unit": config.composition["unit"],
         "shares": config.composition_shares(volume),
         "pool": {"path": str(pool_csv), "rows": pool_rows},
     }
@@ -658,18 +681,21 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
         )
 
     composition = config.composition
+    unit = composition["unit"]
     stratified = composition["mode"] != "random" or bool(composition["per_volume"])
-    orders = _domain_orders(pool, int(config.sweep["seed"]), stratified)
+    # Positional index, so a row order can address rows through pool.loc.
+    pool = pool.reset_index(drop=True)
+    orders = _domain_orders(pool, int(config.sweep["seed"]), stratified, unit)
     if composition["per_volume"]:
         logger.warning(
             "data.composition.per_volume is set, so the volumes target different compositions and are NOT "
             "nested. A volume-to-volume delta then mixes 'more data' with 'different data'."
         )
     logger.info(
-        "Train pool: %d rows, %d documents, composition mode '%s'",
-        len(pool), pool["document_id"].nunique(), composition["mode"],
+        "Train pool: %d rows, %d documents, composition mode '%s', draw unit '%s'",
+        len(pool), pool["document_id"].nunique(), composition["mode"], unit,
     )
-    groups = _document_groups(pool, stratified)
+    groups = _document_groups(pool, stratified) if unit == "document" else None
     mixed = int((pool.groupby("document_id")["domain"].nunique() > 1).sum())
     if mixed:
         logger.info(
@@ -699,6 +725,7 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
             "rows": len(subset),
             "documents": int(subset["document_id"].nunique()),
             "composition_mode": composition["mode"],
+            "draw_unit": unit,
             "target_row_quotas": quotas,
             "realized_domain_shares": realized,
             "domain_rows": subset["domain"].value_counts().to_dict(),

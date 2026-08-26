@@ -120,6 +120,19 @@ data:
   # the data stage says so in the log when it does.
   composition:
     mode: "pool_proportional"
+    # What a quota is filled from.
+    #
+    #   row       shuffle the domain's rows and take a prefix (default). The
+    #             composition is exact and a subset is as document-diverse as
+    #             the pool allows — the right choice when the corpus has few,
+    #             very large documents, where whole-document draws would make a
+    #             small subset come from a handful of them.
+    #   document  shuffle documents and take them whole, so a subset's rows stay
+    #             contiguous inside their source documents.
+    #
+    # Either way the test set's documents are already out of the pool, so this
+    # is a diversity choice, not a contamination one.
+    unit: "row"
     # Used by mode: domain_shares. Labels must match the corpus domain column
     # exactly; shares must sum to 1.
     domain_shares:

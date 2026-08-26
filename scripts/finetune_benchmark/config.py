@@ -124,6 +124,7 @@ class SweepConfig:
                 for volume, shares in (raw.get("per_volume") or {}).items()
             },
             "on_shortfall": raw.get("on_shortfall") or "error",
+            "unit": raw.get("unit") or "row",
         }
 
     def composition_shares(self, volume: int) -> dict[str, float] | None:
@@ -503,6 +504,8 @@ def _validate_composition(config: SweepConfig) -> None:
         raise ValueError(f"data.composition.mode must be one of {list(COMPOSITION_MODES)}")
     if composition["on_shortfall"] not in {"error", "redistribute"}:
         raise ValueError("data.composition.on_shortfall must be 'error' or 'redistribute'")
+    if composition["unit"] not in {"row", "document"}:
+        raise ValueError("data.composition.unit must be 'row' or 'document'")
     if composition["mode"] == "domain_shares":
         _validate_shares(composition["domain_shares"], "data.composition.domain_shares")
     for volume, shares in composition["per_volume"].items():
