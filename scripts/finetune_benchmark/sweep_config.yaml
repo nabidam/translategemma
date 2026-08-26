@@ -328,6 +328,13 @@ report:
     enabled: true
     rows_per_test_set: 40
     seed: 42
+    # Narrow the export to the comparison actually in dispute. Ten systems x 40
+    # rows x 3 test sets is 1,200 blinded rows, which nobody reads; two systems
+    # on one test set is 80. Empty means every system and every test set.
+    #   systems: ["translategemma-base", "translategemma-100k"]
+    #   test_sets: ["flores"]
+    systems: []
+    test_sets: []
   # Energy is estimated from sampled power draw; on a shared host the power a
   # concurrent job draws is not attributed away from this one.
   electricity_price_per_kwh: null

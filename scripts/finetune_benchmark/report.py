@@ -494,13 +494,27 @@ def build_conclusion(config: SweepConfig, master: pd.DataFrame, deltas: pd.DataF
             entry["best_per_family"] = family_best
         if not marginal.empty:
             steps = marginal[(marginal["test_set"] == test_set_id)]
-            plateau = {}
+            plateau, trend = {}, {}
             for model_key, family in steps.groupby("model_key"):
                 # The first step whose interval spans zero is where more data
                 # stopped paying, on this test set, at this sample size.
                 insignificant = family[~family["significant_95"]]
                 plateau[model_key] = None if insignificant.empty else insignificant.iloc[0]["to"]
+                # Direction matters as much as significance: a curve where every
+                # step is significant and every step is unfavourable has not
+                # "kept paying", it is regressing, and saying otherwise inverts
+                # the finding. Fine-tuning on one domain does this to a strong
+                # base model's general-domain scores.
+                favourable = family["delta"] > 0 if higher_is_better else family["delta"] < 0
+                significant = family["significant_95"]
+                if (significant & ~favourable).all() and significant.any():
+                    trend[model_key] = "regressing"
+                elif (significant & favourable).all() and significant.any():
+                    trend[model_key] = "improving"
+                else:
+                    trend[model_key] = "mixed"
             entry["plateau_after"] = plateau
+            entry["trend"] = trend
         conclusion["per_test_set"][test_set_id] = entry
 
     if cost is not None and (step_note := _step_budget_note(cost)):
@@ -558,14 +572,26 @@ def build_human_review(config: SweepConfig) -> tuple[pd.DataFrame, pd.DataFrame]
     if not settings.get("enabled", True):
         return pd.DataFrame(), pd.DataFrame()
     rows_per_test_set = int(settings.get("rows_per_test_set", 40))
+    # A full ten-system export is 1,200 rows, which nobody reads. Narrow it to
+    # the comparison actually in dispute, e.g. base against the largest volume.
+    wanted_systems = [str(value) for value in (settings.get("systems") or [])]
+    wanted_test_sets = [str(value) for value in (settings.get("test_sets") or [])]
     rng = np.random.default_rng(int(settings.get("seed", config.sweep["seed"])))
     review_rows, key_rows = [], []
     for test_set in config.test_sets:
+        if wanted_test_sets and test_set["id"] not in wanted_test_sets:
+            continue
         outputs_path = config.evaluation_dir / test_set["id"] / "all_model_outputs.csv"
         if not outputs_path.exists():
             continue
         frame = pd.read_csv(outputs_path, dtype={"example_id": str})
         columns = [column for column in frame.columns if column.startswith("translation__")]
+        if wanted_systems:
+            columns = [column for column in columns if column[len("translation__"):] in wanted_systems]
+            if missing := set(wanted_systems) - {column[len("translation__"):] for column in columns}:
+                logger.warning(
+                    "Human review: %s has no output for %s", test_set["id"], sorted(missing)
+                )
         if not columns:
             continue
         group_column = "domain" if "domain" in frame.columns else None
@@ -734,8 +760,16 @@ def _conclusion_html(config: SweepConfig, conclusion: dict, deltas: pd.DataFrame
                 f"Δ{metric} {best['delta_vs_base']:+.4f} vs its base "
                 f"(95% CI {best['ci95'][0]:+.4f} … {best['ci95'][1]:+.4f}, <span class='{marker}'>{verdict}</span>)</li>"
             )
+        trends = entry.get("trend") or {}
         for model_key, plateau in (entry.get("plateau_after") or {}).items():
-            if plateau:
+            trend = trends.get(model_key)
+            if trend == "regressing":
+                parts.append(
+                    f"<li><b>{html.escape(model_key)}</b>: <span class='bad'>every step up in data volume "
+                    f"made {metric} significantly worse on this test set</span> — the curve is regressing, "
+                    "not plateauing. Expected when specialising a strong base model on one domain.</li>"
+                )
+            elif plateau:
                 parts.append(
                     f"<li><b>{html.escape(model_key)}</b>: the volume curve stops paying at "
                     f"<code>{html.escape(str(plateau))}</code> — that step's interval spans zero.</li>"
