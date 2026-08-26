@@ -105,23 +105,90 @@ def normalize_corpus(config: SweepConfig, force: bool = False) -> Path:
     return output
 
 
+def _testset_spec(config: SweepConfig, corpus_csv: Path, corpus_rows: int) -> dict:
+    """Identity of the in-domain test set: everything that changes which rows it holds."""
+    settings = config.data["in_domain_test"]
+    return {
+        "size": int(settings["size"]),
+        "exclude_domains": sorted(config.excluded_test_domains),
+        "overrides": settings.get("overrides") or {},
+        "id_separator": config.corpus["id_separator"],
+        "corpus": {"path": str(corpus_csv), "rows": corpus_rows},
+    }
+
+
+def _excluded_domain_labels(config: SweepConfig, corpus: pd.DataFrame) -> list[str]:
+    """Resolve configured exclusions to the corpus's own labels."""
+    requested = config.excluded_test_domains
+    if not requested:
+        return []
+    labels = [str(value) for value in corpus["domain"].dropna().unique()]
+    by_fold = {_fold(label): label for label in labels}
+    resolved, missing = [], []
+    for name in requested:
+        if name in labels:
+            resolved.append(name)
+        elif match := by_fold.get(_fold(name)):
+            logger.warning(
+                "data.in_domain_test.exclude_domains entry %r matched the corpus label %r "
+                "(case/whitespace only).", name, match,
+            )
+            resolved.append(match)
+        else:
+            missing.append(name)
+    if missing:
+        raise ValueError(
+            f"data.in_domain_test.exclude_domains names {missing}, which are not corpus domains. "
+            f"Available: {sorted(labels)}"
+        )
+    return resolved
+
+
 def build_in_domain_test_set(config: SweepConfig, corpus_csv: Path, force: bool = False) -> tuple[Path, Path]:
-    """Return (test_csv, train_pool_csv), running build_test_set.py when needed."""
+    """Return (test_csv, train_pool_csv), running build_test_set.py when needed.
+
+    Domains in data.in_domain_test.exclude_domains are withheld from the builder
+    and appended to the train pool afterwards. That exists for a specific,
+    common shape: a domain small enough that the document-level holdout consumes
+    all of it, leaving it with no training rows at all. Keeping it out of the
+    test set is the only way to keep it trainable — its quality is then measured
+    on NTREX/FLORES and by the other domains' in-domain rows, not by its own.
+    """
     settings = config.data["in_domain_test"]
     if settings["mode"] == "existing":
         return _use_existing_test_set(config, corpus_csv, force)
 
     test_path, pool_path = config.in_domain_test_path, config.train_pool_csv
+    corpus = pd.read_csv(corpus_csv, dtype=str)
+    spec = _testset_spec(config, corpus_csv, len(corpus))
+    spec_path = config.testset_build_dir / "testset_spec.json"
     if test_path.exists() and pool_path.exists() and not force:
-        logger.info("Reusing in-domain test set %s and train pool %s", test_path, pool_path)
-        return test_path, pool_path
+        stored = json.loads(spec_path.read_text(encoding="utf-8")) if spec_path.exists() else None
+        if stored == spec:
+            logger.info("Reusing in-domain test set %s and train pool %s", test_path, pool_path)
+            return test_path, pool_path
+        logger.warning(
+            "Rebuilding the in-domain test set: it was built from a different specification "
+            "(size, excluded domains, builder overrides or corpus changed)."
+        )
+
+    excluded = _excluded_domain_labels(config, corpus)
+    builder_input = corpus_csv
+    if excluded:
+        kept = corpus[~corpus["domain"].isin(excluded)]
+        builder_input = config.work_dir / "corpus_for_testset.csv"
+        kept.to_csv(builder_input, index=False)
+        logger.info(
+            "Withholding %d rows in domain(s) %s from the test-set builder; they stay fully available "
+            "for training.", len(corpus) - len(kept), excluded,
+        )
 
     # Forced, not configurable: the sweep's contract is 500 test rows, no dev
     # split, and a train pool written where the subset builder looks for it.
     overrides = deep_merge(
         settings.get("overrides") or {},
         {
-            "input": {"csv_path": str(corpus_csv), "id_separator": config.corpus["id_separator"],
+            "input": {"csv_path": str(builder_input), "id_separator": config.corpus["id_separator"],
                       "source_lang_col": "en", "target_lang_col": "fa"},
             "selection": {"total_size": int(settings["size"])},
             "splits": {"dev_test_split": False},
@@ -147,7 +214,48 @@ def build_in_domain_test_set(config: SweepConfig, corpus_csv: Path, force: bool 
     )
     if not test_path.exists() or not pool_path.exists():
         raise RuntimeError(f"build_test_set.py did not produce {test_path} and {pool_path}")
+    if excluded:
+        _restore_excluded_domains(config, corpus, excluded, test_path, pool_path)
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_path.write_text(json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8")
     return test_path, pool_path
+
+
+def _restore_excluded_domains(
+    config: SweepConfig, corpus: pd.DataFrame, excluded: list[str], test_path: Path, pool_path: Path
+) -> None:
+    """Append the withheld domains' rows to the train pool.
+
+    The document-level guarantee is preserved explicitly: a document that also
+    contributed a test row (possible when one document carries rows of more than
+    one domain) is dropped again. What is NOT re-run for these rows is the
+    embedding near-duplicate purge, which needs the builder's embedding matrix;
+    they contributed no test rows, so only a cross-domain duplicate could leak,
+    and the document check above already covers the same-document case.
+    """
+    separator = config.corpus["id_separator"]
+    pool = pd.read_csv(pool_path, dtype=str)
+    test = pd.read_csv(test_path, dtype=str)
+    held_documents = set(test["document_id"].astype(str)) if "document_id" in test.columns else {
+        str(value).split(separator)[0] for value in test["id"]
+    }
+    extra = corpus[corpus["domain"].isin(excluded)].copy()
+    extra["document_id"] = extra["id"].astype(str).str.split(separator).str[0]
+    overlapping = extra["document_id"].isin(held_documents)
+    if int(overlapping.sum()):
+        logger.warning(
+            "Dropping %d withheld row(s) whose document also contributed a test row.",
+            int(overlapping.sum()),
+        )
+    extra = extra[~overlapping]
+    combined = pd.concat([pool, extra[[column for column in pool.columns if column in extra.columns]]],
+                         ignore_index=True)
+    combined = combined.drop_duplicates(subset=["id"])
+    combined.to_csv(pool_path, index=False)
+    logger.info(
+        "Train pool: %d rows after restoring %d withheld row(s) in %s. Domains now: %s",
+        len(combined), len(extra), excluded, combined["domain"].value_counts().to_dict(),
+    )
 
 
 def _use_existing_test_set(config: SweepConfig, corpus_csv: Path, force: bool) -> tuple[Path, Path]:

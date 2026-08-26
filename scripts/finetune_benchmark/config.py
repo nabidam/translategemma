@@ -104,6 +104,11 @@ class SweepConfig:
         return self.raw["evaluation"]
 
     @property
+    def excluded_test_domains(self) -> list[str]:
+        """Domains withheld from the in-domain test set, hence fully trainable."""
+        return [str(value) for value in (self.data["in_domain_test"].get("exclude_domains") or [])]
+
+    @property
     def composition(self) -> dict[str, Any]:
         """Domain composition settings, with every optional key defaulted.
 
@@ -457,6 +462,11 @@ def _validate(config: SweepConfig) -> None:
         raise ValueError("data.in_domain_test.existing_path is required in 'existing' mode")
     if in_domain["mode"] == "build" and int(in_domain.get("size", 0)) <= 0:
         raise ValueError("data.in_domain_test.size must be positive in 'build' mode")
+    excluded = in_domain.get("exclude_domains")
+    if excluded is not None and (
+        not isinstance(excluded, list) or any(not isinstance(value, str) or not value.strip() for value in excluded)
+    ):
+        raise ValueError("data.in_domain_test.exclude_domains must be a list of non-empty domain names")
 
     ratio = float(config.data.get("validation_ratio", 0.0))
     if not 0.0 <= ratio < 1.0:

@@ -80,6 +80,13 @@ data:
     mode: "build" # "build" runs build_test_set.py; "existing" uses existing_path.
     existing_path: null
     size: 500
+    # Domains withheld from the test set, and therefore fully available for
+    # training. Use this for a domain small enough that the document-level
+    # holdout would consume all of it: its rows would otherwise be unavailable
+    # both for training and for any meaningful in-domain measurement. Its
+    # quality is then read from NTREX/FLORES instead.
+    #   exclude_domains: ["general"]
+    exclude_domains: []
     # Merged over testset_config.yaml. selection.total_size and the dev split
     # are forced by the sweep (500 rows, test only), so do not set them here.
     overrides:

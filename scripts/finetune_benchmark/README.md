@@ -124,7 +124,22 @@ each subset's realized composition.
        on_shortfall: "error"   # or redistribute
    ```
 
-   Shares must sum to 1 and name domains that exist in the corpus. The realized
+   Shares must sum to 1 and name domains that exist in the **train pool**. A
+   domain small enough that the document-level holdout consumes all of it has no
+   pool rows left, and the data stage says so; withhold it from the test set
+   instead so it stays trainable:
+
+   ```yaml
+   data:
+     in_domain_test:
+       exclude_domains: ["general"]
+   ```
+
+   Its rows are appended back to the train pool (documents that contributed a
+   test row are still excluded), and its quality is then read from NTREX/FLORES
+   rather than from in-domain rows of its own. Alternatives: drop it from
+   `domain_shares`, or `on_shortfall: redistribute` to fill its quota from the
+   other domains. The realized
    shares of every volume land in
    `data/finetune_benchmark/subsets/subset_manifest.json`. Composition is shared
    by all volumes so the subsets stay nested; `per_volume` overrides one volume
