@@ -61,6 +61,12 @@ def _candidate(config: SweepConfig, system: System) -> dict[str, Any]:
     for key in ("revision", "processor", "tokenizer"):
         if value := evaluation.get(key):
             candidate[key] = value
+    # Per-arm decoding settings, merged over the shared profile by the benchmark.
+    # A 3.3B seq2seq and a 12B decoder do not want the same batch size on the
+    # same card. NOTE: this lands in the candidate, whose hash decides output
+    # reuse, so adding or changing it forces that candidate to regenerate.
+    if generation := evaluation.get("generation"):
+        candidate["generation"] = dict(generation)
     if not system.is_base:
         candidate["adapter"] = str(config.adapter_path(system))
     return candidate
@@ -104,7 +110,15 @@ def write_benchmark_config(config: SweepConfig, test_set: dict[str, Any], system
                         "columns": {"id": "id", "source": "en", "reference": "fa", "domain": "domain"},
                     },
                 },
-                "generation_profiles": {GENERATION_PROFILE: dict(config.evaluation["generation"])},
+                # Per-test-set overrides live in the profile rather than in the
+                # candidates, so raising a batch size for one test set does not
+                # invalidate outputs already collected for the others.
+                "generation_profiles": {
+                    GENERATION_PROFILE: {
+                        **config.evaluation["generation"],
+                        **(test_set.get("generation") or {}),
+                    }
+                },
             },
         ),
     )

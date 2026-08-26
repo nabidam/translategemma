@@ -250,6 +250,37 @@ on the imported module and then runs the benchmark's ordinary scoring stage, so
 no repository file changes and every other metric is computed by the shared
 implementation.
 
+The replacement also **batches** MetricX, which the benchmark's version does not
+(`padding=False`, one row per forward — a known gap in
+`docs/EVALUATION_RUNBOOK.md`). Rows are tokenized individually so the trailing
+EOS is dropped before padding, length-sorted to keep padding small, and restored
+to the caller's order; `metrics.metricx.batch_size: 1` reproduces the original
+behaviour exactly.
+
+### Tuning generation
+
+Batch 8 peaked at ~33 GiB on a 140 GiB H200, so there is a lot of headroom.
+Overrides go in two places, and the difference matters for reuse:
+
+```yaml
+evaluation:
+  generation: { batch_size: 8, max_new_tokens: 512 }   # shared baseline
+test_sets:
+  - id: "flores"
+    generation: { max_new_tokens: 256 }                # into the profile: safe
+models:
+  nllb:
+    evaluation:
+      generation: { batch_size: 96 }                   # into the candidate: forces regeneration
+```
+
+A per-test-set override lands in the shared generation profile, which is not part
+of a candidate's identity hash — existing outputs stay valid. A per-arm override
+lands in the candidate itself, so that candidate regenerates. Starting points:
+TranslateGemma 12B at 32 (~24 GiB weights plus ~0.6 GiB KV per sequence), NLLB
+3.3B at 96. Check `hit_max_new_tokens` in the report before lowering
+`max_new_tokens` for a test set.
+
 **NLLB-200's `.bin` checkpoints may not load on a current torch.** transformers
 wraps any `torch.load` failure in an unrelated-sounding *"Unable to load weights
 from pytorch checkpoint file ... If you tried to load a PyTorch model from a TF

@@ -42,8 +42,43 @@ from translation_benchmark import metrics as benchmark_metrics  # noqa: E402
 from translation_benchmark.config import load_benchmark_config  # noqa: E402
 
 
+def _metricx_batches(
+    frame: pd.DataFrame, tokenizer: Any, max_length: int, batch_size: int
+) -> Any:
+    """Yield (indices, encodings) for length-sorted batches of scoring inputs.
+
+    Each row is tokenized on its own so the trailing EOS can be dropped —
+    MetricX-24 is trained without it — and only then padded, which is the order
+    upstream's own collator uses. Padding to the batch maximum after sorting by
+    length keeps the padded waste small; the caller restores the original order.
+    """
+    texts = [
+        f"source: {row.source} candidate: {row.translation} reference: {row.reference}"
+        for row in frame.itertuples()
+    ]
+    encoded = [tokenizer(text, truncation=True, max_length=max_length)["input_ids"][:-1] for text in texts]
+    order = sorted(range(len(encoded)), key=lambda index: len(encoded[index]))
+    pad_id = tokenizer.pad_token_id or 0
+    for start in range(0, len(order), batch_size):
+        indices = order[start:start + batch_size]
+        width = max(len(encoded[index]) for index in indices)
+        yield (
+            indices,
+            [encoded[index] + [pad_id] * (width - len(encoded[index])) for index in indices],
+            [[1] * len(encoded[index]) + [0] * (width - len(encoded[index])) for index in indices],
+        )
+
+
 def add_metricx_scores(frame: pd.DataFrame, settings: dict[str, Any]) -> pd.DataFrame:
-    """MetricX-24 segment scores (lower is better), one forward pass per row."""
+    """MetricX-24 segment scores (lower is better), batched.
+
+    The benchmark's implementation scores one example per forward pass
+    (`padding=False`, a single-row loop), which `docs/EVALUATION_RUNBOOK.md`
+    lists as a known gap: nothing amortises a 3.7B checkpoint over the test set.
+    With a batch and an attention mask the same scores come out of far fewer
+    forward passes. Set metrics.metricx.batch_size to tune it; 1 reproduces the
+    original row-at-a-time behaviour exactly.
+    """
     import torch
     from metricx24.models import MT5ForRegression
     from transformers import AutoTokenizer
@@ -53,22 +88,30 @@ def add_metricx_scores(frame: pd.DataFrame, settings: dict[str, Any]) -> pd.Data
     model = MT5ForRegression.from_pretrained(
         settings.get("model", "google/metricx-24-hybrid-large-v2p6"), dtype="auto"
     ).to(device).eval()
-    scores: list[float] = []
     max_length = int(settings.get("max_length", 1536))
+    batch_size = max(1, int(settings.get("batch_size", 16)))
     total = len(frame)
-    logger.info("MetricX: scoring %d rows on %s with %s", total, device, settings.get("model"))
+    logger.info(
+        "MetricX: scoring %d rows on %s with %s (batch %d)",
+        total, device, settings.get("model"), batch_size,
+    )
+    scores = [float("nan")] * total
+    done = 0
     with torch.inference_mode():
-        for position, row in enumerate(frame.itertuples(), start=1):
-            text = f"source: {row.source} candidate: {row.translation} reference: {row.reference}"
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length, padding=False)
-            # MetricX-24 is trained without the trailing EOS token.
-            inputs = {key: value[:, :-1].to(device) for key, value in inputs.items()}
-            # The one-line difference from the benchmark's implementation. See
-            # this module's docstring for why it is required rather than an
-            # optimisation.
-            scores.append(float(model(**inputs, use_cache=False).predictions.item()))
-            if position % 250 == 0 or position == total:
-                logger.info("MetricX: %d/%d rows", position, total)
+        for indices, input_ids, attention_mask in _metricx_batches(frame, tokenizer, max_length, batch_size):
+            # use_cache=False is required, not an optimisation: see the module
+            # docstring. The decoder runs a single dummy step, so there is
+            # nothing for a cache to accelerate.
+            predictions = model(
+                input_ids=torch.tensor(input_ids, device=device),
+                attention_mask=torch.tensor(attention_mask, device=device),
+                use_cache=False,
+            ).predictions
+            for position, index in enumerate(indices):
+                scores[index] = float(predictions[position].item())
+            done += len(indices)
+            if done % (batch_size * 10) < batch_size or done == total:
+                logger.info("MetricX: %d/%d rows", done, total)
     result = frame.copy()
     result["metricx"] = scores
     del model, tokenizer

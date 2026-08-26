@@ -268,6 +268,17 @@ evaluation:
     # the most source it can see; the hit_max_new_tokens metric shows whether
     # the output side was the binding constraint instead.
     max_source_tokens: 1024
+  # Optional overrides. Per test set they go into the shared generation profile,
+  # so changing one test set does not invalidate outputs already collected for
+  # the others. Per model arm (models.<key>.evaluation.generation) they land in
+  # the candidate itself, whose hash decides output reuse — setting one there
+  # forces that candidate to regenerate.
+  #
+  # Sensible starting points on a 140 GiB H200, where batch 8 peaked at ~33 GiB:
+  #   TranslateGemma 12B  batch_size 32   (~24 GiB weights + ~0.6 GiB KV/sequence)
+  #   NLLB-200 3.3B       batch_size 96   (~7 GiB weights, small KV)
+  # Short single-sentence sets (FLORES, NTREX) also do not need 512 new tokens;
+  # check hit_max_new_tokens in the report before lowering it.
   # Merged over benchmark_config.yaml's metrics/statistics/report sections, so
   # a number here is comparable with a number from a plain benchmark run.
   overrides:
@@ -285,6 +296,12 @@ evaluation:
         model: "google/metricx-24-hybrid-xl-v2p6-bfloat16"
         tokenizer: "google/mt5-xl"
         max_length: 1536
+        # Read only by this directory's scorer. The benchmark's own
+        # implementation scores one row per forward pass, which
+        # docs/EVALUATION_RUNBOOK.md lists as a known gap; score.py batches
+        # (identical scores, far fewer forwards). 16 is comfortable for the XL
+        # checkpoint on an H200; 1 reproduces the row-at-a-time behaviour.
+        batch_size: 16
     statistics:
       bootstrap_samples: 2000
       seed: 42
