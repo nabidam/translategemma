@@ -276,6 +276,16 @@ on the imported module and then runs the benchmark's ordinary scoring stage, so
 no repository file changes and every other metric is computed by the shared
 implementation.
 
+**Scoring stages are cached per row.** `score_candidates` computes transparent
+metrics, then COMET, then MetricX inside one function, and `pipeline.score`
+writes nothing until all three return — so a MetricX crash discarded a completed
+XCOMET pass over every candidate. `score.py` wraps the COMET and MetricX stages
+in a per-row cache (`.cache_comet_scores.csv`, `.cache_metricx_scores.csv` beside
+the run's output), and MetricX writes its cache per batch. A re-run recomputes
+only what is genuinely missing. The cache key includes a digest of the scored
+translation, so a regenerated candidate cannot inherit scores for text that no
+longer exists.
+
 The replacement also **batches** MetricX, which the benchmark's version does not
 (`padding=False`, one row per forward — a known gap in
 `docs/EVALUATION_RUNBOOK.md`). Rows are tokenized individually so the trailing
