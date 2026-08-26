@@ -386,6 +386,7 @@ def _read_any(path: Path) -> pd.DataFrame:
 
 
 ALL_DOMAINS = "__all__"
+EMPTY = pd.DataFrame()
 
 
 def _domain_orders(pool: pd.DataFrame, seed: int, stratified: bool) -> dict[str, list[str]]:
@@ -536,12 +537,39 @@ def _quotas(shares: dict[str, float], volume: int, available: dict[str, int], on
     return quotas
 
 
-def _take_rows(documents: list[str], by_document: dict[str, pd.DataFrame], target: int) -> list[pd.DataFrame]:
-    """Prefix of `documents` holding exactly `target` rows (last one truncated)."""
+def _document_groups(pool: pd.DataFrame, stratified: bool) -> dict[tuple[str, str], pd.DataFrame]:
+    """Pool rows keyed by (domain bucket, document).
+
+    Keyed by BOTH, not by document alone. A document here can carry rows of more
+    than one domain -- the corpus labels domains per row, and this corpus has very
+    few, very large documents -- so a per-domain quota filled with whole
+    documents would drag another domain's rows in with it and the realized mix
+    would not be the configured one.
+    """
+    if not stratified:
+        return {
+            (ALL_DOMAINS, str(document)): group
+            for document, group in pool.groupby("document_id", sort=False)
+        }
+    return {
+        (str(domain), str(document)): group
+        for (domain, document), group in pool.groupby(["domain", "document_id"], sort=False)
+    }
+
+
+def _take_rows(
+    documents: list[str],
+    groups: dict[tuple[str, str], pd.DataFrame],
+    bucket: str,
+    target: int,
+) -> list[pd.DataFrame]:
+    """Prefix of `documents` holding exactly `target` rows of `bucket`."""
     picked: list[pd.DataFrame] = []
     rows = 0
     for document in documents:
-        group = by_document[document]
+        group = groups.get((bucket, document))
+        if group is None or group.empty:
+            continue
         if rows + len(group) > target:
             # Truncating one document keeps the cell at exactly `target` rows.
             # Deterministic (sorted by id), and harmless for nesting: volumes are
@@ -559,28 +587,32 @@ def _select_subset(
     config: SweepConfig,
     pool: pd.DataFrame,
     orders: dict[str, list[str]],
-    by_document: dict[str, pd.DataFrame],
+    groups: dict[tuple[str, str], pd.DataFrame],
     volume: int,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     shares = _resolve_shares(config, pool, volume)
     available = {
-        domain: int(sum(len(by_document[document]) for document in documents))
-        for domain, documents in orders.items()
+        bucket: int(sum(len(groups.get((bucket, document), EMPTY)) for document in documents))
+        for bucket, documents in orders.items()
     }
     quotas = _quotas(shares, volume, available, config.composition["on_shortfall"])
     frames: list[pd.DataFrame] = []
-    for domain, quota in sorted(quotas.items()):
+    for bucket, quota in sorted(quotas.items()):
         if quota <= 0:
             continue
-        if domain not in orders:
-            raise ValueError(f"No documents for domain {domain!r} in the train pool")
-        frames.extend(_take_rows(orders[domain], by_document, quota))
+        if bucket not in orders:
+            raise ValueError(f"No documents for domain {bucket!r} in the train pool")
+        frames.extend(_take_rows(orders[bucket], groups, bucket, quota))
     return pd.concat(frames, ignore_index=True), quotas
 
 
 def _subset_spec(config: SweepConfig, pool_csv: Path, pool_rows: int, volume: int) -> dict:
     """Identity of a subset: everything that changes which rows it holds."""
     return {
+        # Bumped when the selector's behaviour changes, so subsets built by an
+        # earlier version are rebuilt instead of silently reused. v2: per-domain
+        # quotas take only that domain's rows from a mixed-domain document.
+        "builder_version": 2,
         "volume": volume,
         "seed": int(config.sweep["seed"]),
         "validation_ratio": float(config.data["validation_ratio"]),
@@ -637,7 +669,13 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
         "Train pool: %d rows, %d documents, composition mode '%s'",
         len(pool), pool["document_id"].nunique(), composition["mode"],
     )
-    by_document = {str(document): group for document, group in pool.groupby("document_id", sort=False)}
+    groups = _document_groups(pool, stratified)
+    mixed = int((pool.groupby("document_id")["domain"].nunique() > 1).sum())
+    if mixed:
+        logger.info(
+            "%d document(s) carry rows of more than one domain; per-domain quotas take only the rows of "
+            "the domain they are filling, so a document may contribute to two of them.", mixed,
+        )
 
     results: dict[int, dict[str, Path]] = {}
     manifest: dict[str, dict] = {}
@@ -653,7 +691,7 @@ def build_subsets(config: SweepConfig, pool_csv: Path, force: bool = False) -> d
                 "Rebuilding subset %s: it was built from a different specification (composition, seed, "
                 "validation ratio or train pool changed).", paths["train"].parent,
             )
-        subset, quotas = _select_subset(config, pool, orders, by_document, volume)
+        subset, quotas = _select_subset(config, pool, orders, groups, volume)
         realized = subset["domain"].value_counts(normalize=True).round(4).to_dict()
         subset_jsonl = _write_sft_jsonl(subset, config, columns, config.subset_dir(volume) / "subset.jsonl")
         manifest[volume_label(volume)] = {
