@@ -60,6 +60,21 @@ def _snapshot_dir(repo_id: str) -> Path:
     return Path(snapshot_download(repo_id, local_files_only=True))
 
 
+def _repo_cache_dir(snapshot: Path) -> Path | None:
+    """The hub cache directory owning `snapshot`, or None for a plain directory.
+
+    Only a hub snapshot lives at <cache>/models--org--name/snapshots/<sha>, and
+    only that layout has sibling blobs worth scanning for unfinished downloads.
+    A locally staged checkpoint directory has no such parent, and walking up from
+    one would scan an unrelated tree — for example every other model under
+    /models, whose stale leftovers have nothing to do with this checkpoint.
+    """
+    if len(snapshot.parents) < 2:
+        return None
+    candidate = snapshot.parents[1]
+    return candidate if candidate.name.startswith("models--") else None
+
+
 def _weight_files(snapshot: Path) -> tuple[list[Path], int | None]:
     """Weight files a checkpoint declares, plus the total_size its index claims."""
     for name in WEIGHT_INDEX_FILES:
@@ -147,10 +162,12 @@ def check_checkpoint(label: str, repo_id: str) -> list[Check]:
         return [Check(label, FAIL, f"{repo_id} is not staged locally: {type(error).__name__}: {error}")]
 
     checks: list[Check] = []
-    if incomplete := sorted(snapshot.parent.parent.rglob("*.incomplete")):
-        checks.append(
-            Check(label, FAIL, f"unfinished download(s) in the cache: {[path.name for path in incomplete[:3]]}")
-        )
+    if repo_cache := _repo_cache_dir(snapshot):
+        if incomplete := sorted(repo_cache.rglob("*.incomplete")):
+            checks.append(
+                Check(label, FAIL, f"{len(incomplete)} unfinished download(s) under {repo_cache}: "
+                                   f"{[path.name for path in incomplete[:2]]}")
+            )
     files, total_size = _weight_files(snapshot)
     if not files:
         return checks + [Check(label, FAIL, f"no weight files under {snapshot}")]
