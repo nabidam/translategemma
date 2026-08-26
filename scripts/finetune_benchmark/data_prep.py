@@ -21,6 +21,7 @@ state (build_test_set.py seeds a module-level RNG in main()).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -56,6 +57,14 @@ def _training_data_columns() -> dict[str, str]:
         "source_lang": data_cfg["source_lang_column"],
         "target_lang": data_cfg["target_lang_column"],
     }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _run(command: list[str], log_path: Path) -> None:
@@ -300,15 +309,33 @@ def prepare_test_sets(config: SweepConfig, force: bool = False) -> dict[str, Pat
     paths: dict[str, Path] = {}
     for test_set in config.test_sets:
         output = directory / f"{test_set['id']}.csv"
+        spec_path = directory / f"{test_set['id']}.spec.json"
         paths[test_set["id"]] = output
-        if output.exists() and not force:
-            logger.info("Reusing prepared test set %s", output)
-            continue
         source = config.test_set_path(test_set)
         if not source.exists():
             raise FileNotFoundError(
                 f"Test set {test_set['id']!r} not found at {source}. Set test_sets[].enabled: false "
                 "to exclude it, or correct its path."
+            )
+        # Content-addressed, not existence-checked. The in-domain source is
+        # rebuilt whenever its own specification changes, and an external file
+        # can be corrected in place; either way the prepared copy that the
+        # benchmark actually scores must not be the previous one.
+        spec = {
+            "source": str(source),
+            "sha256": _file_sha256(source),
+            "columns": test_set["columns"],
+            "default_domain": test_set.get("default_domain"),
+            "max_examples": test_set.get("max_examples"),
+        }
+        if output.exists() and not force:
+            stored = json.loads(spec_path.read_text(encoding="utf-8")) if spec_path.exists() else None
+            if stored == spec:
+                logger.info("Reusing prepared test set %s", output)
+                continue
+            logger.warning(
+                "Rebuilding prepared test set %s: %s changed since it was prepared.",
+                output, source,
             )
         columns = test_set["columns"]
         frame = _read_any(source)
@@ -342,6 +369,7 @@ def prepare_test_sets(config: SweepConfig, force: bool = False) -> dict[str, Pat
         if maximum := test_set.get("max_examples"):
             prepared = prepared.head(int(maximum))
         prepared.to_csv(output, index=False)
+        spec_path.write_text(json.dumps(spec, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("Prepared test set %s: %d rows -> %s", test_set["id"], len(prepared), output)
     return paths
 

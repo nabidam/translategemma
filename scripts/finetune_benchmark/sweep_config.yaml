@@ -85,8 +85,11 @@ data:
     # holdout would consume all of it: its rows would otherwise be unavailable
     # both for training and for any meaningful in-domain measurement. Its
     # quality is then read from NTREX/FLORES instead.
-    #   exclude_domains: ["general"]
-    exclude_domains: []
+    # "general" is withheld: it is small enough that the document-level holdout
+    # consumed every one of its documents, leaving it untrainable. Its rows are
+    # appended back to the train pool, and its quality is read from NTREX/FLORES
+    # rather than from in-domain rows of its own.
+    exclude_domains: ["general"]
     # Merged over testset_config.yaml. selection.total_size and the dev split
     # are forced by the sweep (500 rows, test only), so do not set them here.
     overrides:
