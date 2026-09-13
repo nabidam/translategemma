@@ -1,8 +1,8 @@
 """
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
-description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating, and returns large translations as a chat file attachment instead of making the base model re-emit them.
-version: 2.2.0
+description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating, and returns large translations as a downloadable chat file attachment (stored in OpenWebUI file storage) instead of making the base model re-emit them.
+version: 2.3.0
 license: MIT
 requirements: requests, pydantic
 """
@@ -521,6 +521,53 @@ class Tools:
 
     # ---------------------------------------------------------- attachments
 
+    @staticmethod
+    async def _upload_translation_file(translation: str, name: str, user_id: str):
+        """Store the translation in OpenWebUI's own file storage.
+
+        Returns the FileModel record, or None when storage is unavailable
+        (the caller then falls back to a content-only attachment). No RAG
+        processing happens — the translation is never embedded into any
+        knowledge collection, it is a plain downloadable file.
+        """
+        try:
+            import io
+            import uuid
+
+            from open_webui.models.files import FileForm, Files
+            from open_webui.storage.provider import Storage
+        except Exception:
+            return None
+        try:
+            file_id = str(uuid.uuid4())
+            tags = {
+                "OpenWebUI-User-Id": str(user_id),
+                "OpenWebUI-File-Id": file_id,
+            }
+            contents, file_path = await asyncio.to_thread(
+                Storage.upload_file,
+                io.BytesIO(translation.encode("utf-8")),
+                f"{file_id}_{name}",
+                tags,
+            )
+            return await Files.insert_new_file(
+                str(user_id),
+                FileForm(
+                    id=file_id,
+                    filename=name,
+                    path=file_path,
+                    data={"content": translation, "status": "completed"},
+                    meta={
+                        "name": name,
+                        "content_type": "text/markdown",
+                        "size": len(contents),
+                        "data": {},
+                    },
+                ),
+            )
+        except Exception:
+            return None
+
     async def _attach_translation_file(
         self,
         translation: str,
@@ -531,6 +578,7 @@ class Tools:
         __chat_id__: Optional[str],
         __message_id__: Optional[str],
         __event_emitter__: Optional[Callable[[dict], Any]],
+        __user__: Optional[dict],
     ) -> str:
         """Deliver a large translation to the user as a chat file attachment.
 
@@ -540,21 +588,39 @@ class Tools:
         cost a full re-generation). So the translation goes to the chat as a
         file — the same mechanism OpenWebUI's own generate_image tool uses —
         and the model gets a short instruction to acknowledge, not repeat.
+
+        When possible the translation is stored as a real OpenWebUI file
+        (file storage + DB record): the chat chip's modal then previews the
+        markdown and the file name is a link to /files/{id}/content, which
+        the browser downloads. Without storage access it degrades to a
+        content-only entry (preview only).
         """
         name = f"translation-{tgt}.md"
         if file_names:
             base = str(file_names[0]).rsplit(".", 1)[0]
             if base and not base.startswith(("http", "data:")):
                 name = f"{base}.translated.{tgt}.md"
-        encoded = base64.b64encode(translation.encode("utf-8")).decode("ascii")
+
+        user_id = str((__user__ or {}).get("id") or "")
+        record = await self._upload_translation_file(translation, name, user_id) if user_id else None
+
         file_entry = {
             "type": "file",
             "name": name,
-            "url": f"data:text/markdown;charset=utf-8;base64,{encoded}",
-            "content": translation,
             "content_type": "text/markdown",
             "size": len(translation.encode("utf-8")),
         }
+        if record is not None:
+            # url is the file id: FileItem/FileItemModal resolve
+            # /files/{id}/content (Content-Disposition: attachment for
+            # non-text/plain types -> the browser downloads the file).
+            file_entry["id"] = record.id
+            file_entry["url"] = record.id
+            file_entry["file"] = record.model_dump()
+        else:
+            encoded = base64.b64encode(translation.encode("utf-8")).decode("ascii")
+            file_entry["url"] = f"data:text/markdown;charset=utf-8;base64,{encoded}"
+            file_entry["content"] = translation
 
         # Persist the attachment to the chat message so it survives reloads.
         # Best effort: a failure here must not fail the translation itself.
@@ -806,6 +872,7 @@ class Tools:
                     __chat_id__,
                     __message_id__,
                     __event_emitter__,
+                    __user__,
                 )
             return result
 

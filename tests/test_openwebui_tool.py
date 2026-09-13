@@ -722,3 +722,86 @@ class TestLargeTranslationAttachment:
         assert persisted["message_id"] == "msg-456"
         assert persisted["files"][0]["name"] == "paper.translated.fa.md"
         assert persisted["files"][0]["content"] == big
+
+    def test_attachment_stored_as_real_downloadable_file(self, monkeypatch):
+        # With OpenWebUI storage available, the translation must become a real
+        # file (Storage + Files DB) so the chat chip can download it via
+        # /files/{id}/content — a bare data-URI entry has no download path.
+        module = _load_tool(monkeypatch)
+        calls = []
+        big = "long translation body " * 700
+        _make_capturing_backend(module, calls, translation=big)
+
+        uploaded = {}
+
+        class FakeFileForm:
+            def __init__(self, **kwargs):
+                uploaded["form"] = kwargs
+
+        class FakeRecord:
+            @property
+            def id(self):
+                return uploaded["form"]["id"]
+
+            def model_dump(self):
+                return {
+                    "id": uploaded["form"]["id"],
+                    "filename": uploaded["form"]["filename"],
+                    "data": uploaded["form"]["data"],
+                    "meta": uploaded["form"]["meta"],
+                }
+
+        class FakeFiles:
+            @staticmethod
+            async def insert_new_file(user_id, form_data, db=None):
+                uploaded["user_id"] = user_id
+                return FakeRecord()
+
+        class FakeStorage:
+            @staticmethod
+            def upload_file(fileobj, filename, tags):
+                data = fileobj.read()
+                uploaded["bytes"] = data
+                uploaded["filename"] = filename
+                uploaded["tags"] = tags
+                return data, f"/tmp/uploads/{filename}"
+
+        files_mod = types.ModuleType("open_webui.models.files")
+        files_mod.Files = FakeFiles
+        files_mod.FileForm = FakeFileForm
+        storage_mod = types.ModuleType("open_webui.storage.provider")
+        storage_mod.Storage = FakeStorage
+        models_mod = types.ModuleType("open_webui.models")
+        storage_pkg = types.ModuleType("open_webui.storage")
+        open_webui_mod = types.ModuleType("open_webui")
+        monkeypatch.setitem(sys.modules, "open_webui", open_webui_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models", models_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models.files", files_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.storage", storage_pkg)
+        monkeypatch.setitem(sys.modules, "open_webui.storage.provider", storage_mod)
+
+        events, emit = self._events()
+        _run(
+            module,
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __user__={"id": "user-1"},
+            __event_emitter__=emit,
+        )
+        # Stored in file storage with the real translation bytes.
+        assert uploaded["bytes"] == big.encode("utf-8")
+        assert uploaded["filename"].endswith("_translation-fa.md")
+        file_id = uploaded["form"]["id"]
+        assert uploaded["tags"]["OpenWebUI-File-Id"] == file_id
+        assert uploaded["form"]["data"]["content"] == big
+        assert uploaded["form"]["data"]["status"] == "completed"
+        assert uploaded["form"]["meta"]["content_type"] == "text/markdown"
+        assert uploaded["user_id"] == "user-1"
+        # The chat entry references the file id (downloadable), not a data URI.
+        file_event = [e for e in events if e.get("type") == "chat:message:files"]
+        entry = file_event[0]["data"]["files"][0]
+        assert entry["id"] == file_id
+        assert entry["url"] == file_id
+        assert not entry["url"].startswith("data:")
+        assert entry["file"]["meta"]["content_type"] == "text/markdown"
