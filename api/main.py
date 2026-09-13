@@ -176,7 +176,15 @@ async def translate(
     if not text:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "text is empty.")
     resolved = _resolve(prompt, settings)
-    translations = await _translate(engine, [text], resolved)
+    try:
+        translations = await _translate(engine, [text], resolved)
+    except RuntimeError as error:
+        # Upstream failure (vLLM rejected, timed out, or returned a
+        # malformed answer). Surface the message: the caller (e.g. the
+        # OpenWebUI tool) relays it verbatim, which beats a generic 500
+        # whose traceback only exists in the container log.
+        logger.exception("Translation failed.")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error))
     return TranslationResponse(
         translation=translations[0],
         system=resolved.system,
@@ -200,7 +208,11 @@ async def translate_batch(
     if any(not text for text in texts):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "texts contains an empty item.")
     resolved = _resolve(prompt, settings)
-    translations = await _translate(engine, texts, resolved)
+    try:
+        translations = await _translate(engine, texts, resolved)
+    except RuntimeError as error:
+        logger.exception("Batch translation failed.")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error))
     return BatchTranslationResponse(
         translations=translations,
         system=resolved.system,

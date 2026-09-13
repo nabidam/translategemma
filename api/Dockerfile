@@ -58,4 +58,11 @@ EXPOSE 8000
 # vLLM server and TG_BASE_MODEL_ID at a mounted copy of the checkpoint it
 # serves (read for the tokenizer and chat template only), and set HF_HOME /
 # HUGGINGFACE_HUB_CACHE in compose when running offline.
-CMD ["fastapi", "run", "main.py", "--host", "0.0.0.0", "--port", "8000"]
+#
+# Plain uvicorn, single worker, no auto-reload. `fastapi run` is a dev-mode
+# runner: it spawns a reload supervisor that shares stdout with the worker,
+# which tears the container's json-file log (docker logs then dies with
+# "invalid character '\x00' looking for beginning of value") and can restart
+# the worker mid-request. The heavy lifting is vLLM's; this CPU gateway wants
+# no reload and no extra workers.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -2,7 +2,7 @@
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
 description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt.
-version: 2.1.0
+version: 2.1.1
 license: MIT
 requirements: requests, pydantic
 """
@@ -118,8 +118,8 @@ class Tools:
             description="Default target language ISO code (e.g. fa, en, de, fr, ru)",
         )
         MAX_NEW_TOKENS: int = Field(
-            default=2048,
-            description="Maximum new tokens per segment",
+            default=512,
+            description="Maximum new tokens per segment (one sentence; 512 is the gateway default and 4x less KV-cache pressure than 2048 on long documents)",
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,

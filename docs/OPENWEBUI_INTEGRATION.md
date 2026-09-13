@@ -106,7 +106,7 @@ Navigate in OpenWebUI to **Workspace → Tools → Add Tool (`+`)**, name it `tr
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
 description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt.
-version: 2.1.0
+version: 2.1.1
 license: MIT
 requirements: requests, pydantic
 """
@@ -222,8 +222,8 @@ class Tools:
             description="Default target language ISO code (e.g. fa, en, de, fr, ru)",
         )
         MAX_NEW_TOKENS: int = Field(
-            default=2048,
-            description="Maximum new tokens per segment",
+            default=512,
+            description="Maximum new tokens per segment (one sentence; 512 is the gateway default and 4x less KV-cache pressure than 2048 on long documents)",
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,
@@ -941,10 +941,13 @@ root cause of "long text gets shortened" and "markdown says no content".
      cap, no model copy).
    - *Output side* still passes through the base model, which must re-emit the
      translation. If a very long translation is cut off at the **end**, raise
-     the base model's max output tokens (model params → `max_tokens`, or the
-     provider's max completion tokens) so the relay has room. The gateway
-     itself never truncates; `MAX_NEW_TOKENS` (2048) is per sentence-segment,
-     not per document.
+      the base model's max output tokens (model params → `max_tokens`, or the
+      provider's max completion tokens) so the relay has room. The gateway
+      itself never truncates; `MAX_NEW_TOKENS` (512, the gateway default) is
+      per sentence-segment, not per document. If a single unsegmentable chunk
+      is genuinely longer than 512 output tokens, raise the tool's
+      `MAX_NEW_TOKENS` valve — but know that every extra token of headroom is
+      KV-cache pressure on vLLM for *every* segment of the document.
 
 ---
 
@@ -1077,6 +1080,7 @@ the fix each relies on:
 | 6 | Model asks "full, part, or summary?" | The base chat model, not the tool, adds clarifying questions and offers options | Section-3 system prompt now forbids questions/options and mandates full-content translation; swap to a strictly-instruct-following base model if it persists |
 | 7 | File sent, model asks "what to do?" | A file-only message (no instruction) is ambiguous to the base model, so it asks instead of acting | System prompt defines file-attached = a complete translate instruction, default target Persian (fa); model must call `translate()` with empty `text` immediately |
 | 8 | The **system prompt** gets translated instead of the document | v2.0's "leave `text` empty" rule pushes the model into the tool's self-resolution; when the file content is absent (focused mode / still extracting) the old history fallback scanned *every* message and returned the system prompt as the source | v2.1 fallback **skips `system`/`developer`/`tool`/`function` roles** and never re-selects a prior `translate` relay; if no real source exists it returns an explicit "file has no readable text yet / use full-context upload mode" error instead of guessing. Also adds a raw on-disk read for text-like files (.md/.txt/…) when extraction hasn't written `data.content` yet |
+| 9 | Long document → `Gateway Error (500): Internal Server Error` | `/translate` had no error handler: any upstream failure (vLLM 400 "prompt too long" on a giant unsegmentable chunk; a chunk exceeding `vllm_timeout` under KV pressure from 2048 tokens × hundreds of concurrent segments; API-container OOM) surfaced as a generic 500 whose traceback only lived in a log the container itself corrupted (`fastapi run` = dev mode, reload supervisor shares stdout → torn json-file log) | Gateway now answers **502 with the actual upstream error text** (visible in the chat); Dockerfile runs production `uvicorn` (no reload → intact logs, no mid-request restarts); tool `MAX_NEW_TOKENS` default 2048 → 512 per segment (4× less KV demand). Rebuild both images to apply |
 
 ### Quick checks when something regresses
 
