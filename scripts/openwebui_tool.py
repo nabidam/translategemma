@@ -1,13 +1,14 @@
 """
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
-description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt.
-version: 2.1.1
+description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating, and returns large translations as a chat file attachment instead of making the base model re-emit them.
+version: 2.2.0
 license: MIT
 requirements: requests, pydantic
 """
 
 import asyncio
+import base64
 import os
 import re
 from typing import Any, Callable, List, Optional
@@ -20,6 +21,21 @@ _TEXT_LIKE_EXT = (
     ".htm", ".xml", ".rst", ".yaml", ".yml", ".ini", ".log",
 )
 _MAX_RAW_READ_BYTES = 20 * 1024 * 1024
+
+# Non-translatable artifacts. OCR-generated markdown (pymupdf4llm, docling,
+# tesseract post-processing) routinely embeds full base64 image payloads
+# inline. Sent to the MT model they are "translated" into garbage, blow the
+# token count up by orders of magnitude, and the inflated translation then
+# overflows the base model's context on the way back. Stripped before the
+# gateway call, in the tool that knows it is handling documents.
+_DATA_URI_RE = re.compile(r"data:[A-Za-z0-9/+.=-]+;base64,[A-Za-z0-9+/=\s]+")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+# Collapse the space runs left where tags/blobs were stripped, without
+# touching line-start indentation (code blocks).
+_SPACE_RUN_RE = re.compile(r"(?<=\S)[ \t]{2,}(?=\S)")
 
 
 _REFERENTIAL = {
@@ -124,6 +140,16 @@ class Tools:
         TIMEOUT_SECONDS: int = Field(
             default=300,
             description="Timeout in seconds for long documents",
+        )
+        RELAY_MAX_CHARS: int = Field(
+            default=8000,
+            description=(
+                "Translations longer than this many characters are returned to the "
+                "user as a chat file attachment instead of being re-emitted by the "
+                "base model. The base model would otherwise have to copy the whole "
+                "translation into its reply, which overflows its own context window "
+                "and is slow. 0 disables the attachment (always relay inline)."
+            ),
         )
 
     class UserValves(BaseModel):
@@ -471,6 +497,101 @@ class Tools:
                 return remainder, "conversation history"
         return "", ""
 
+    # ------------------------------------------------------------ sanitise
+
+    @staticmethod
+    def _sanitize_document(text: str) -> str:
+        """Remove non-translatable artifacts from a document before translation.
+
+        Order matters: data URIs first (they can contain anything, including
+        angle brackets that would confuse the tag stripping), then markdown
+        images (keeping the alt text, which *is* translatable), then HTML
+        comments and tags (keeping inner text). Collapses blank runs. Returns
+        the cleaned text; may be empty when the input was only images/binary.
+        """
+        if not text:
+            return ""
+        text = _DATA_URI_RE.sub(" ", text)
+        text = _MD_IMAGE_RE.sub(lambda m: m.group(1).strip(), text)
+        text = _HTML_COMMENT_RE.sub(" ", text)
+        text = _HTML_TAG_RE.sub(" ", text)
+        text = _BLANK_RUN_RE.sub("\n\n", text)
+        text = _SPACE_RUN_RE.sub(" ", text)
+        return text.strip()
+
+    # ---------------------------------------------------------- attachments
+
+    async def _attach_translation_file(
+        self,
+        translation: str,
+        file_names: list,
+        src: str,
+        tgt: str,
+        word_count: int,
+        __chat_id__: Optional[str],
+        __message_id__: Optional[str],
+        __event_emitter__: Optional[Callable[[dict], Any]],
+    ) -> str:
+        """Deliver a large translation to the user as a chat file attachment.
+
+        The base model must not re-emit a document-sized translation: the
+        tool result becomes part of its prompt, and the reply would have to
+        copy the whole thing back out. Both overflow its context window (and
+        cost a full re-generation). So the translation goes to the chat as a
+        file — the same mechanism OpenWebUI's own generate_image tool uses —
+        and the model gets a short instruction to acknowledge, not repeat.
+        """
+        name = f"translation-{tgt}.md"
+        if file_names:
+            base = str(file_names[0]).rsplit(".", 1)[0]
+            if base and not base.startswith(("http", "data:")):
+                name = f"{base}.translated.{tgt}.md"
+        encoded = base64.b64encode(translation.encode("utf-8")).decode("ascii")
+        file_entry = {
+            "type": "file",
+            "name": name,
+            "url": f"data:text/markdown;charset=utf-8;base64,{encoded}",
+            "content": translation,
+            "content_type": "text/markdown",
+            "size": len(translation.encode("utf-8")),
+        }
+
+        # Persist the attachment to the chat message so it survives reloads.
+        # Best effort: a failure here must not fail the translation itself.
+        chat_id = str(__chat_id__ or "")
+        if (
+            chat_id
+            and str(__message_id__)
+            and not chat_id.startswith(("temp:", "channel:"))
+        ):
+            try:
+                from open_webui.models.chats import Chats
+
+                saved = await Chats.add_message_files_by_id_and_message_id(
+                    chat_id, str(__message_id__), [file_entry]
+                )
+                if saved:
+                    file_entry = saved[0]
+            except Exception:
+                pass
+
+        if __event_emitter__:
+            try:
+                await __event_emitter__(
+                    {"type": "chat:message:files", "data": {"files": [file_entry]}}
+                )
+            except Exception:
+                pass
+
+        return (
+            f"Translation complete: {word_count} words, {src} to {tgt}. The full "
+            f"translation is already attached to the chat as the file '{name}' and "
+            "is visible to the user. Your reply must be a single short sentence "
+            "acknowledging that the translation is ready and attached (for "
+            "example: 'Done - the full translation is attached.'). NEVER restate, "
+            "quote, summarize, or repeat any of the translated content."
+        )
+
     # ------------------------------------------------------------- translate
 
     async def translate(
@@ -482,6 +603,8 @@ class Tools:
         __messages__: Optional[list] = None,
         __files__: Optional[list] = None,
         __user__: Optional[dict] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
         """
@@ -491,7 +614,7 @@ class Tools:
         :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
         :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
         :param split_sentences: Whether to split long documents into sentences for concurrent batching.
-        :return: Translated text.
+        :return: Translated text. Translations longer than the RELAY_MAX_CHARS valve are returned as a chat file attachment (with a short acknowledgement for the model) instead of the full text.
         """
         # 1. Attached files on the CURRENT message (full text, no viewer caps).
         file_parts = []
@@ -568,6 +691,17 @@ class Tools:
                 "Error: No text or file content found to translate. "
                 "Upload a file (with full-context upload mode), paste the text, "
                 "or point at a specific earlier message."
+            )
+
+        # OCR markdown and scraped pages carry non-translatable payloads
+        # (base64 image data, HTML). Translating them produces garbage and
+        # inflates the token count until the relay back through the base
+        # model overflows its context window.
+        resolved = self._sanitize_document(resolved)
+        if not resolved:
+            return (
+                "Error: The content contains no translatable text (only images, "
+                "binary data, or markup). Nothing was sent to the translator."
             )
 
         src, tgt = self._resolve_languages(source_lang, target_lang, __user__)
@@ -656,6 +790,22 @@ class Tools:
                             "done": True,
                         },
                     }
+                )
+            if (
+                self.valves.RELAY_MAX_CHARS > 0
+                and result
+                and not result.startswith(("Error:", "Gateway Error", "vLLM Error"))
+                and len(result) > self.valves.RELAY_MAX_CHARS
+            ):
+                return await self._attach_translation_file(
+                    result,
+                    file_names,
+                    src,
+                    tgt,
+                    word_count,
+                    __chat_id__,
+                    __message_id__,
+                    __event_emitter__,
                 )
             return result
 

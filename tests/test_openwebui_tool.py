@@ -507,3 +507,218 @@ class TestLanguages:
         )
         assert calls[0]["source_lang"] == "en"
         assert calls[0]["target_lang"] == "fa"
+
+
+class TestSanitization:
+    """OCR markdown carries base64 image payloads and HTML; sending them to
+    the MT model produces garbage and overflows the relay back through the
+    base model. They must be stripped before the gateway call."""
+
+    def test_base64_data_uri_stripped(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        _make_capturing_backend(module, calls)
+        blob = "iVBORw0KGgoAAAANSUhEUg" * 50
+        text = f"First paragraph about the method.\n\n![figure](data:image/png;base64,{blob})\n\nSecond paragraph about the results."
+        _run(module, text=text, __messages__=[], __files__=[])
+        sent = calls[0]["text"]
+        assert "iVBORw0KGgo" not in sent
+        assert "data:image" not in sent
+        assert "First paragraph about the method." in sent
+        assert "Second paragraph about the results." in sent
+
+    def test_image_alt_text_kept(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        _make_capturing_backend(module, calls)
+        blob = "AAAA" * 20
+        _run(
+            module,
+            text=f"The plot below. ![Training loss curve](data:image/png;base64,{blob}) It declines steadily.",
+            __messages__=[],
+            __files__=[],
+        )
+        sent = calls[0]["text"]
+        assert "Training loss curve" in sent
+        assert "It declines steadily." in sent
+        assert "base64" not in sent
+
+    def test_html_comments_and_tags_stripped(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        _make_capturing_backend(module, calls)
+        text = "<!-- OCR confidence 0.99 --><p>The <b>model</b> achieves state-of-the-art results.</p>"
+        _run(module, text=text, __messages__=[], __files__=[])
+        assert calls[0]["text"] == "The model achieves state-of-the-art results."
+
+    def test_image_only_document_errors_without_gateway_call(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        _make_capturing_backend(module, calls)
+        blob = "iVBORw0KGgo" * 100
+        # Empty alt text -> nothing translatable remains after stripping.
+        out = _run(
+            module,
+            text=f"![](data:image/png;base64,{blob})",
+            __messages__=[],
+            __files__=[],
+        )
+        assert out.startswith("Error: The content contains no translatable text")
+        assert calls == []
+
+    def test_image_with_alt_keeps_only_alt(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        _make_capturing_backend(module, calls)
+        blob = "iVBORw0KGgo" * 100
+        _run(
+            module,
+            text=f"![Figure 1: The plot](data:image/png;base64,{blob}) and the caption continues.",
+            __messages__=[],
+            __files__=[],
+        )
+        sent = calls[0]["text"]
+        assert "Figure 1: The plot" in sent
+        assert "and the caption continues." in sent
+        assert "iVBORw0KGgo" not in sent
+
+
+class TestLargeTranslationAttachment:
+    """Large translations must not be relayed through the base model (it would
+    re-emit the whole document, overflowing its context). They are delivered
+    as a chat file attachment, the way OpenWebUI's own generate_image tool
+    delivers images."""
+
+    @staticmethod
+    def _events():
+        events = []
+
+        async def emit(event):
+            events.append(event)
+
+        return events, emit
+
+    def test_large_translation_attached_not_relayed(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        big = "پاراگراف ترجمه شده. " * 500  # ~9000 chars, above the 8000 default
+        _make_capturing_backend(module, calls, translation=big)
+        events, emit = self._events()
+        out = _run(
+            module,
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __event_emitter__=emit,
+        )
+        # The model gets an acknowledgement, not the translation.
+        assert big not in out
+        assert "attached" in out.lower()
+        assert "NEVER restate" in out
+        file_event = [e for e in events if e.get("type") == "chat:message:files"]
+        assert len(file_event) == 1
+        entry = file_event[0]["data"]["files"][0]
+        assert entry["content"] == big
+        assert entry["type"] == "file"
+        assert entry["name"].endswith(".translated.fa.md") or entry["name"].startswith("translation-")
+        assert entry["url"].startswith("data:text/markdown")
+        assert ";base64," in entry["url"]
+
+    def test_small_translation_relayed_inline(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        small = "This is a short translation."
+        _make_capturing_backend(module, calls, translation=small)
+        events, emit = self._events()
+        out = _run(
+            module,
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __event_emitter__=emit,
+        )
+        assert out == small
+        assert not [e for e in events if e.get("type") == "chat:message:files"]
+
+    def test_error_never_attached(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        upstream_error = "vLLM rejected the request (400): prompt too long. " * 300
+        calls = []
+
+        class _BoomResp:
+            status_code = 502
+            text = upstream_error
+
+            def json(self):
+                raise RuntimeError("no json on errors")
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(dict(json))
+            return _BoomResp()
+
+        module.requests.post = fake_post
+        events, emit = self._events()
+        out = _run(
+            module,
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __event_emitter__=emit,
+        )
+        assert out == f"Gateway Error (502): {upstream_error}"
+        assert not [e for e in events if e.get("type") == "chat:message:files"]
+
+    def test_attachment_persisted_to_chat_message(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        big = "long translation body " * 700
+        _make_capturing_backend(module, calls, translation=big)
+
+        persisted = {}
+
+        class FakeChats:
+            @staticmethod
+            async def add_message_files_by_id_and_message_id(chat_id, message_id, files):
+                persisted["chat_id"] = chat_id
+                persisted["message_id"] = message_id
+                persisted["files"] = files
+                return files
+
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = FakeChats
+        models_mod = types.ModuleType("open_webui.models")
+        open_webui_mod = types.ModuleType("open_webui")
+        monkeypatch.setitem(sys.modules, "open_webui", open_webui_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models", models_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models.chats", chats_mod)
+
+        events, emit = self._events()
+        _run(
+            module,
+            text="translate this",
+            __messages__=[
+                {"role": "user", "content": "translate this"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "c", "function": {"name": "translate", "arguments": "{}"}}],
+                },
+            ],
+            # Readable file: its name feeds the attachment filename.
+            __files__=[
+                {
+                    "id": "f1",
+                    "name": "paper.md",
+                    "type": "file",
+                    "url": "f1",
+                    "file": {"data": {"content": "A source document with plenty of real words to translate properly."}},
+                }
+            ],
+            __chat_id__="chat-123",
+            __message_id__="msg-456",
+            __event_emitter__=emit,
+        )
+        assert persisted["chat_id"] == "chat-123"
+        assert persisted["message_id"] == "msg-456"
+        assert persisted["files"][0]["name"] == "paper.translated.fa.md"
+        assert persisted["files"][0]["content"] == big
