@@ -163,6 +163,7 @@ async def model_info(
         max_new_tokens=settings.max_new_tokens,
         do_sample=settings.do_sample,
         batch_size=settings.batch_size,
+        max_context_tokens=engine.max_context_tokens,
     )
 
 

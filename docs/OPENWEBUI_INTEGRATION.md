@@ -939,15 +939,22 @@ root cause of "long text gets shortened" and "markdown says no content".
 4. **Long documents end-to-end:**
    - *Input side* is safe: the tool sends the full text (no `view_file` 10k
      cap, no model copy).
-   - *Output side* still passes through the base model, which must re-emit the
-     translation. If a very long translation is cut off at the **end**, raise
+    - *Mid side* (the gateway) is bounded: with `split_sentences` it chunks the
+      document into units that always fit the vLLM window — sentence (pysbd) →
+      paragraph/line (languages pysbd lacks a model for) → hard token-boundary
+      slices — then greedily packs whole sentences into budget-sized chunks.
+      An oversized document now degrades to *more chunks*, never a 400. The
+      chunk budget is `min(context − max_new_tokens − reserve,
+      max_new_tokens // 2)`, so a chunk's translation also cannot be silently
+      clipped at the stop (a `finish_reason: length` hit is logged and means
+      `MAX_NEW_TOKENS` should go up for that pair).
+    - *Output side* still passes through the base model, which must re-emit the
+      translation. If a very long translation is cut off at the **end**, raise
       the base model's max output tokens (model params → `max_tokens`, or the
-      provider's max completion tokens) so the relay has room. The gateway
-      itself never truncates; `MAX_NEW_TOKENS` (512, the gateway default) is
-      per sentence-segment, not per document. If a single unsegmentable chunk
-      is genuinely longer than 512 output tokens, raise the tool's
-      `MAX_NEW_TOKENS` valve — but know that every extra token of headroom is
-      KV-cache pressure on vLLM for *every* segment of the document.
+      provider's max completion tokens) so the relay has room. `MAX_NEW_TOKENS`
+      (512, the gateway default) is per chunk, not per document; every extra
+      token of headroom is KV-cache pressure on vLLM for *every* chunk of the
+      document, so raise it only if the gateway log reports clipped chunks.
 
 ---
 
@@ -1081,6 +1088,7 @@ the fix each relies on:
 | 7 | File sent, model asks "what to do?" | A file-only message (no instruction) is ambiguous to the base model, so it asks instead of acting | System prompt defines file-attached = a complete translate instruction, default target Persian (fa); model must call `translate()` with empty `text` immediately |
 | 8 | The **system prompt** gets translated instead of the document | v2.0's "leave `text` empty" rule pushes the model into the tool's self-resolution; when the file content is absent (focused mode / still extracting) the old history fallback scanned *every* message and returned the system prompt as the source | v2.1 fallback **skips `system`/`developer`/`tool`/`function` roles** and never re-selects a prior `translate` relay; if no real source exists it returns an explicit "file has no readable text yet / use full-context upload mode" error instead of guessing. Also adds a raw on-disk read for text-like files (.md/.txt/…) when extraction hasn't written `data.content` yet |
 | 9 | Long document → `Gateway Error (500): Internal Server Error` | `/translate` had no error handler: any upstream failure (vLLM 400 "prompt too long" on a giant unsegmentable chunk; a chunk exceeding `vllm_timeout` under KV pressure from 2048 tokens × hundreds of concurrent segments; API-container OOM) surfaced as a generic 500 whose traceback only lived in a log the container itself corrupted (`fastapi run` = dev mode, reload supervisor shares stdout → torn json-file log) | Gateway now answers **502 with the actual upstream error text** (visible in the chat); Dockerfile runs production `uvicorn` (no reload → intact logs, no mid-request restarts); tool `MAX_NEW_TOKENS` default 2048 → 512 per segment (4× less KV demand). Rebuild both images to apply |
+| 10 | vLLM 400: `maximum context length is N … request has M input tokens` | The document (or pysbd's "whole text is one segment" fallback for a language it has no model for — e.g. `pt`/`tr`/`ko`) reached `/completions` as one over-context prompt; `split_sentences` split by sentence but never bounded chunk size to the window | The gateway now chunks **budget-aware**: `min(context − max_new_tokens − 256, max_new_tokens // 2)` source tokens per chunk, sentence → paragraph/line → hard token-boundary slices, greedily re-packed. The window is auto-probed from vLLM `/v1/models` (or set `TG_MAX_CONTEXT_TOKENS`). An oversized document now degrades to more chunks, never a 400 |
 
 ### Quick checks when something regresses
 

@@ -30,6 +30,7 @@ in-process engine needed is gone.
 import asyncio
 import logging
 import random
+import re
 
 import httpx
 from anyio import to_thread
@@ -41,6 +42,14 @@ logger = logging.getLogger("translategemma.api")
 
 # Backoff base for retried requests, in seconds.
 _RETRY_BACKOFF_S = 0.5
+
+# Reserve of tokens above prompt + max_new_tokens: the rendered chat template
+# plus boundary slack when packed sentences re-tokenise.
+_CONTEXT_RESERVE_TOKENS = 256
+# Used when the upstream does not report its context length. Deliberately
+# small: it only has to keep prompt + max_new_tokens legal, and the output
+# budget (max_new_tokens // 2) is the tighter bound in practice.
+_MAX_CONTEXT_FALLBACK = 8192
 
 
 class SentenceSplitter:
@@ -61,18 +70,103 @@ class SentenceSplitter:
         segments = [segment.strip() for segment in segmenter.segment(text)]
         return [segment for segment in segments if segment] or [text]
 
+    def segmenter(self, language: str):
+        """The pysbd segmenter for `language`, or None when pysbd lacks one.
+
+        Exposed so the budget-aware chunker can reuse the same per-language
+        cache instead of building a second set of segmenters.
+        """
+        return self._segmenter(language)
+
     def _segmenter(self, language: str):
         if language not in self._segmenters:
-            import pysbd
-
+            try:
+                import pysbd
+            except ImportError:
+                logger.warning(
+                    "pysbd is not installed; falling back to paragraph/line "
+                    "chunking for language %r.",
+                    language,
+                )
+                self._segmenters[language] = None
+                return None
             try:
                 self._segmenters[language] = pysbd.Segmenter(language=language, clean=False)
             except ValueError:
                 logger.warning(
-                    "pysbd has no model for language %r; translating the text unsplit.", language
+                    "pysbd has no model for language %r; falling back to "
+                    "paragraph/line chunking.",
+                    language,
                 )
                 self._segmenters[language] = None
         return self._segmenters[language]
+
+
+# ---------------------------------------------------------------------------
+# Budget-aware chunking.
+#
+# vLLM rejects a request whose prompt plus max_new_tokens exceeds the model's
+# context length, and a segment whose translation outgrows max_new_tokens is
+# silently clipped at the stop. Both are properties of the *chunk*, so the
+# chunk size must be bounded before dispatch. The hierarchy mirrors the
+# proven quick_pipeline chunker (paragraph -> sentence -> hard slice) and the
+# greedy sentence packing it uses, with the budget expressed in tokens:
+#
+#   1. pysbd sentences for the source language;
+#   2. paragraph and line boundaries when pysbd has no model for the language
+#      (its fallback of "the whole text is one segment" is exactly how a
+#      long document becomes a single over-context prompt);
+#   3. hard slices at token boundaries for a unit that still exceeds the
+#      budget (a punctuation-free wall of text, a table row, a code block).
+#
+# The pure helpers below carry the logic; the tokenizer only measures and
+# decodes, which keeps the packing testable without one.
+# ---------------------------------------------------------------------------
+
+
+def pack_units(units: list[str], costs: list[int], limit: int) -> list[list[int]]:
+    """Greedily pack unit indices into groups whose summed cost stays <= limit.
+
+    A unit that alone exceeds `limit` is emitted as its own group (the caller
+    pre-splits such units; if one slips through it is still isolated, so no
+    *packed* group ever crosses the limit). Empty units are dropped. Joining
+    the packed units is the caller's job.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_cost = 0
+    for index, (unit, cost) in enumerate(zip(units, costs)):
+        if not unit:
+            continue
+        if cost > limit:
+            if current:
+                groups.append(current)
+                current, current_cost = [], 0
+            groups.append([index])
+            continue
+        if current and current_cost + cost > limit:
+            groups.append(current)
+            current, current_cost = [], 0
+        current.append(index)
+        current_cost += cost
+    if current:
+        groups.append(current)
+    return groups
+
+
+def fallback_units(text: str) -> list[str]:
+    """Paragraph/line units for languages pysbd has no model for."""
+    units = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        units.extend(line.strip() for line in paragraph.splitlines() if line.strip())
+    return units
+
+
+def token_windows(token_ids: list[int], limit: int) -> list[list[int]]:
+    """Slice a token sequence into windows of at most `limit` tokens."""
+    return [
+        token_ids[start : start + limit] for start in range(0, len(token_ids), limit)
+    ]
 
 
 class _TokenizerProcessor:
@@ -122,6 +216,7 @@ class TranslationEngine:
         self.splitter = SentenceSplitter()
         self.processor = None
         self.stop_token_ids = []
+        self.max_context_tokens = 0
         self._client: httpx.AsyncClient | None = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
 
@@ -161,6 +256,12 @@ class TranslationEngine:
         headers = {"Content-Type": "application/json"}
         if settings.vllm_api_key:
             headers["Authorization"] = f"Bearer {settings.vllm_api_key}"
+
+        # Resolved once at startup: chunk sizes are derived from it, and a
+        # request that ignores it dies with a 400 deep in a long document.
+        self.max_context_tokens = self._detect_max_context_tokens(headers)
+        logger.info("Upstream max context length: %d tokens.", self.max_context_tokens)
+
         self._client = httpx.AsyncClient(
             base_url=settings.vllm_base_url,
             timeout=settings.vllm_timeout,
@@ -190,6 +291,114 @@ class TranslationEngine:
         """Which vLLM answered the request, in the shape /model-info reports."""
         return f"vllm:{self.settings.vllm_base_url}"
 
+    # --------------------------------------------------------------- chunking
+
+    def _detect_max_context_tokens(self, headers: dict) -> int:
+        """The upstream's context length: configured, or probed, or a safe floor.
+
+        vLLM reports ``max_model_len`` on /v1/models; a probe that fails or a
+        server that omits the field must not break startup, so it degrades to
+        ``_MAX_CONTEXT_FALLBACK`` (small on purpose -- see the constant).
+        """
+        configured = self.settings.max_context_tokens
+        if configured > 0:
+            return configured
+        try:
+            response = httpx.get(
+                f"{self.settings.vllm_base_url}/models",
+                headers=headers,
+                timeout=10.0,
+            )
+            if response.status_code == 200:
+                data = response.json().get("data") or []
+                for model in data:
+                    length = model.get("max_model_len")
+                    if isinstance(length, int) and length > 0:
+                        return length
+        except Exception as error:
+            logger.warning(
+                "Could not probe the upstream's max context length (%s); "
+                "using %d.",
+                error,
+                _MAX_CONTEXT_FALLBACK,
+            )
+        return _MAX_CONTEXT_FALLBACK
+
+    def _source_budget(self, max_new_tokens: int) -> int:
+        """Max source tokens per chunk, under both ceilings that can bite.
+
+        * The *context* ceiling: the rendered prompt (source plus template
+          overhead) plus the whole output must fit the upstream window.
+        * The *output* ceiling: a chunk whose translation outgrows
+          ``max_new_tokens`` is clipped at the stop, mid-sentence. Cross-
+          language output is at most a small multiple of the source token
+          count, so capping the source at half the output budget keeps normal
+          pairs (e.g. EN->FA, where the target runs longer) safely unclipped
+          while a pathologically long single sentence is still sliced.
+        """
+        context_room = self.max_context_tokens - max_new_tokens - _CONTEXT_RESERVE_TOKENS
+        budget = min(context_room, max_new_tokens // 2)
+        # Never so small that a whole word no longer fits: a floor keeps the
+        # hard-slicer from emitting empty windows on a tiny context.
+        return max(budget, 16)
+
+    def _chunk_text(
+        self, text: str, language: str, source_budget: int
+    ) -> list[str]:
+        """Split one text into chunks whose source stays within `source_budget`.
+
+        Sentence-level (pysbd) when the language is covered, paragraph/line
+        otherwise, then hard-sliced at token boundaries as a last resort, then
+        greedily re-packed so a chunk carries as many whole sentences as the
+        budget allows. Packing (rather than one prompt per sentence) is what
+        quick_pipeline does, and it both cuts the request count and gives the
+        model neighbouring context for a better translation.
+        """
+        if not text.strip():
+            return []
+
+        segmenter = self.splitter.segmenter(language)
+        if segmenter is not None:
+            units = [u.strip() for u in segmenter.segment(text) if u.strip()]
+        else:
+            units = fallback_units(text)
+        if not units:
+            return [text]
+
+        tokenizer = self.processor.tokenizer
+        # Tokenize all units in one call: the fast tokenizer batches in C, and
+        # per-unit Python calls would dominate on a long document.
+        unit_ids = tokenizer(units, add_special_tokens=False)["input_ids"]
+
+        flat_units: list[str] = []
+        flat_costs: list[int] = []
+        for unit, ids in zip(units, unit_ids):
+            if len(ids) <= source_budget:
+                flat_units.append(unit)
+                flat_costs.append(len(ids))
+                continue
+            # One unit over budget: slice at token boundaries so a slice never
+            # cuts a token, then let the packer group the slices like any other
+            # units. Decoding a slice and re-encoding it in _encode can shift a
+            # token or two at the seam; _CONTEXT_RESERVE_TOKENS absorbs that.
+            for window in token_windows(ids, source_budget):
+                flat_units.append(tokenizer.decode(window).strip())
+                flat_costs.append(len(window))
+        flat_units = [u for u in flat_units if u]
+        flat_costs = [c for c, u in zip(flat_costs, flat_units) if u]
+
+        return [
+            " ".join(flat_units[index] for index in group)
+            for group in pack_units(flat_units, flat_costs, source_budget)
+        ]
+
+    def _chunk_texts(
+        self, texts: list[str], language: str, source_budget: int
+    ) -> list[list[str]]:
+        """_chunk_text for a list of texts, preserving order. Sync on purpose:
+        it runs in a worker thread via to_thread from translate()."""
+        return [self._chunk_text(text, language, source_budget) for text in texts]
+
     # ------------------------------------------------------------- translate
 
     async def translate(
@@ -203,10 +412,12 @@ class TranslationEngine:
     ) -> list[str]:
         """Translate texts, preserving order. One output per input.
 
-        With split_sentences, each text is segmented, every segment of every
-        text is sent to the shared upstream, and the segments are rejoined per
+        With split_sentences, each text is chunked to fit the upstream context
+        window and the output budget (see _chunk_text), every chunk of every
+        text is sent to the shared upstream, and the chunks are rejoined per
         text. That keeps the server busy even when one request carries a single
-        long document.
+        long document, and an oversized document degrades to more chunks
+        instead of a 400.
         """
         if not self.is_loaded:
             raise RuntimeError("Gateway is not ready.")
@@ -217,7 +428,13 @@ class TranslationEngine:
             )
 
         if split_sentences:
-            segments_per_text = [self.splitter.split(text, source_lang) for text in texts]
+            source_budget = self._source_budget(max_new_tokens)
+            # Segmentation, tokenization and packing are pure CPU work that
+            # scales with the document, so they run off the event loop, as
+            # _encode does.
+            segments_per_text = await to_thread.run_sync(
+                self._chunk_texts, texts, source_lang, source_budget
+            )
         else:
             segments_per_text = [[text] for text in texts]
 
@@ -346,8 +563,23 @@ class TranslationEngine:
             )
         # Order is not part of the OpenAI contract; index is.
         texts = [""] * len(prompt_ids)
+        clipped = 0
         for choice in choices:
             texts[int(choice["index"])] = choice.get("text", "")
+            if choice.get("finish_reason") == "length":
+                clipped += 1
+        if clipped:
+            # The chunk's translation hit max_new_tokens: the end of the
+            # translation is missing, silently. The budget in _source_budget
+            # exists to prevent this; a hit means a pair expands more than
+            # expected, and MAX_NEW_TOKENS should go up.
+            logger.warning(
+                "%d of %d segments hit max_new_tokens=%d and are clipped; "
+                "raise MAX_NEW_TOKENS for this language pair.",
+                clipped,
+                len(prompt_ids),
+                max_new_tokens,
+            )
         # Deliberately not stripped, as the harness does not strip. Trailing
         # whitespace is the visible signature of an unstopped decoder (70% of
         # rows in the 2026-08-10 run); trimming it here would hide a regression

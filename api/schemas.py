@@ -36,9 +36,11 @@ class TranslationOptions(BaseModel):
     split_sentences: bool | None = Field(
         default=None,
         description=(
-            "Split the input into sentences with pysbd, translate each, and rejoin. "
-            "Defaults to TG_SPLIT_SENTENCES. Leave off for single segments: the "
-            "adapter was trained on whole segments."
+            "Chunk the input into sentences (pysbd) packed into budget-sized "
+            "units, translate each, and rejoin. Chunks are bounded by the "
+            "upstream context window and the output budget, so an oversized "
+            "document is always legal. Defaults to TG_SPLIT_SENTENCES. Leave "
+            "off for single segments: the adapter was trained on whole segments."
         ),
     )
 
@@ -139,3 +141,7 @@ class ModelInfoResponse(BaseModel):
     max_new_tokens: int
     do_sample: bool
     batch_size: int
+    # The upstream context length the chunks are bounded by (probed, configured,
+    # or the conservative fallback). Reported so a 400 "request has N input
+    # tokens" can be checked against it at a glance.
+    max_context_tokens: int

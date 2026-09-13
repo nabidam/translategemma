@@ -129,6 +129,16 @@ class Settings(BaseSettings):
     # occupy the single GPU worker indefinitely.
     max_batch_items: int = Field(default=128, gt=0)
 
+    # --- Context window -----------------------------------------------------
+    # The vLLM upstream's maximum context length, in tokens. Every prompt the
+    # gateway sends must satisfy prompt_tokens + max_new_tokens <= this, or
+    # vLLM rejects the request with a 400. 0 = auto-detect from the upstream's
+    # /v1/models at startup, falling back to a conservative 8192 when the
+    # endpoint does not report it (the chunk size is then bounded by the
+    # output budget, which is the tighter constraint in practice). Setting a
+    # positive value skips detection.
+    max_context_tokens: int = Field(default=0, ge=0)
+
     # --- Sentence splitting (optional, off by default) --------------------
     # TranslateGemma was fine-tuned on whole segments, so splitting is opt-in:
     # useful for long free text, off-distribution for short ones.
