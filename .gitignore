@@ -37,6 +37,8 @@ __pycache__/
 # Local/reference design documents used during implementation review.
 docs/refs/
 docs/MULTI_GPU_TRAINING.md
+# Research journal for the OpenWebUI integration (internal investigation notes).
+docs/OPENWEBUI_INTEGRATION_RESEARCH.md
 docs/EVALUATION_BACKLOG.md
 docs/EVALUATION_METRICS_EXPLAINED.md
 docs/GLOSSARY_FA.md

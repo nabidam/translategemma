@@ -679,7 +679,7 @@ class Tools:
         :param text: Text to translate. For uploaded files and references like 'this' or 'the above', leave it empty or pass 'this' — the tool locates the document/message itself. Pass inline/pasted text here verbatim. `/translate [src] [tgt] ...` is also accepted.
         :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
         :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
-        :param split_sentences: Whether to split long documents into sentences for concurrent batching.
+        :param split_sentences: Whether to chunk long documents structure-preservingly (blocks/lines/sentences) for concurrent batching.
         :return: Translated text. Translations longer than the RELAY_MAX_CHARS valve are returned as a chat file attachment (with a short acknowledgement for the model) instead of the full text.
         """
         # 1. Attached files on the CURRENT message (full text, no viewer caps).
@@ -776,7 +776,7 @@ class Tools:
             split_sentences = len(resolved) > 250 or "\n" in resolved
 
         word_count = len(resolved.split())
-        mode_desc = "with sentence-splitting" if split_sentences else "direct"
+        mode_desc = "with structure-preserving splitting" if split_sentences else "direct"
         if source == "attached file" and file_names:
             source_desc = f"file: {', '.join(file_names[:2])}"
         else:

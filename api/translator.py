@@ -103,63 +103,159 @@ class SentenceSplitter:
 
 
 # ---------------------------------------------------------------------------
-# Budget-aware chunking.
+# Structure-preserving, budget-aware chunking.
 #
 # vLLM rejects a request whose prompt plus max_new_tokens exceeds the model's
 # context length, and a segment whose translation outgrows max_new_tokens is
 # silently clipped at the stop. Both are properties of the *chunk*, so the
-# chunk size must be bounded before dispatch. The hierarchy mirrors the
-# proven quick_pipeline chunker (paragraph -> sentence -> hard slice) and the
-# greedy sentence packing it uses, with the budget expressed in tokens:
+# chunk size must be bounded before dispatch.
 #
-#   1. pysbd sentences for the source language;
-#   2. paragraph and line boundaries when pysbd has no model for the language
-#      (its fallback of "the whole text is one segment" is exactly how a
-#      long document becomes a single over-context prompt);
-#   3. hard slices at token boundaries for a unit that still exceeds the
-#      budget (a punctuation-free wall of text, a table row, a code block).
+# On top of the budget, a markdown/PDF document has structure the translation
+# must keep: blank lines, headings, list items, table rows, code fences. The
+# old pipeline (flat sentence list, rejoined with " ") destroyed all of it --
+# the output was one line. The rule here is that the separators are *data*:
 #
-# The pure helpers below carry the logic; the tokenizer only measures and
-# decodes, which keeps the packing testable without one.
+#   * the document is split into blocks on blank lines, each block carrying
+#     the exact original text that follows it;
+#   * a block that fits the budget is ONE unit (a paragraph -- or a small
+#     list, heading, or table -- translates as a whole, which is also the
+#     best unit for MT quality);
+#   * a block over budget is split: structural blocks (list/table/heading/
+#     quote lines) line-by-line, prose by pysbd sentences with the gaps taken
+#     from the original text, lines when pysbd lacks the language;
+#   * a unit still over budget is hard-sliced at token boundaries;
+#   * code fences (```/~~~) and $$ math blocks are verbatim -- never sent to
+#     the model at all;
+#   * consecutive units whose original separator is plain whitespace are
+#     greedily packed into one prompt (fewer requests, neighbouring context);
+#     a prompt never spans a paragraph break;
+#   * rejoining is exact: "".join(translation + original_separator).
+#
+# The pure helpers carry the logic; the tokenizer only measures and decodes,
+# which keeps them testable without one.
 # ---------------------------------------------------------------------------
 
+# A blank-line run: two or more newlines with anything-but-newline between.
+_BLOCK_SEP_RE = re.compile(r"(\n\s*\n)")
+# A block that opens a fenced code block or a display-math block: its content
+# is not natural language and translating it is garbage in, garbage out.
+_FENCE_OPEN_RE = re.compile(r"^\s*(```|~~~)")
+_MATH_BLOCK_RE = re.compile(r"^\s*\$\$")
+# A line that is a list item, heading, quote, or table row.
+_STRUCT_LINE_RE = re.compile(r"^\s*(?:#{1,6}\s|[>*+-]\s|\d+[.)]\s|\|)")
+# A thematic break (---, ***, ___): structure, not text.
+_HR_LINE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+# A separator made of horizontal whitespace only: the units on either side
+# pack into one prompt and the model's output rejoins unambiguously.
+_WS_SEPARABLE_RE = re.compile(r"^[\t ]*$")
 
-def pack_units(units: list[str], costs: list[int], limit: int) -> list[list[int]]:
-    """Greedily pack unit indices into groups whose summed cost stays <= limit.
 
-    A unit that alone exceeds `limit` is emitted as its own group (the caller
-    pre-splits such units; if one slips through it is still isolated, so no
-    *packed* group ever crosses the limit). Empty units are dropped. Joining
-    the packed units is the caller's job.
+def split_blocks(text: str) -> list[tuple[str, str]]:
+    """Split into (content, trailing_separator) pairs.
+
+    `trailing_separator` is the blank-line run that follows the content (''
+    for the last piece). `"".join(content + sep)` reproduces `text` exactly,
+    which is the invariant the whole structure-preserving rejoin rests on.
     """
-    groups: list[list[int]] = []
-    current: list[int] = []
-    current_cost = 0
-    for index, (unit, cost) in enumerate(zip(units, costs)):
-        if not unit:
-            continue
-        if cost > limit:
-            if current:
-                groups.append(current)
-                current, current_cost = [], 0
-            groups.append([index])
-            continue
-        if current and current_cost + cost > limit:
-            groups.append(current)
-            current, current_cost = [], 0
-        current.append(index)
-        current_cost += cost
-    if current:
-        groups.append(current)
-    return groups
+    parts = _BLOCK_SEP_RE.split(text)
+    blocks = []
+    for i in range(0, len(parts) - 1, 2):
+        blocks.append((parts[i], parts[i + 1]))
+    if len(parts) % 2 == 1:
+        blocks.append((parts[-1], ""))
+    return blocks
 
 
-def fallback_units(text: str) -> list[str]:
-    """Paragraph/line units for languages pysbd has no model for."""
-    units = []
-    for paragraph in re.split(r"\n\s*\n", text):
-        units.extend(line.strip() for line in paragraph.splitlines() if line.strip())
+def _block_is_verbatim(content: str) -> bool:
+    """Fenced code and display math translate to garbage; keep them as-is."""
+    stripped = content.lstrip()
+    return stripped.startswith("```") or stripped.startswith("~~~") or stripped.startswith("$$")
+
+
+def _block_is_structured(lines: list[str]) -> bool:
+    """True when every non-empty line is a list/table/heading/quote/hr line."""
+    non_empty = [line for line in lines if line.strip()]
+    return bool(non_empty) and all(
+        _STRUCT_LINE_RE.match(line) or _HR_LINE_RE.match(line) for line in non_empty
+    )
+
+
+def _sentence_units(content: str, sentences: list[str]) -> list[tuple[str, str]]:
+    """(sentence, original trailing gap) pairs for an over-budget prose block.
+
+    The gap is taken from the content between consecutive sentence positions,
+    so rejoining reproduces the original whitespace. When a sentence cannot
+    be located (pysbd normalised it) the gap degrades to '' and the sentence
+    still translates.
+    """
+    positions: list[tuple[str, int, int]] = []
+    pos = 0
+    for sent in sentences:
+        idx = content.find(sent, pos)
+        if idx < 0:
+            idx = pos
+        positions.append((sent, idx, idx + len(sent)))
+        pos = idx + len(sent)
+    units: list[tuple[str, str]] = []
+    for i, (sent, _start, end) in enumerate(positions):
+        next_start = positions[i + 1][1] if i + 1 < len(positions) else len(content)
+        units.append((sent, content[end:next_start]))
     return units
+
+
+def group_units(
+    units: list[dict], costs: list[int], limit: int
+) -> list[dict]:
+    """Group units into prompts, preserving structure.
+
+    `units` are dicts {'text', 'sep', 'verbatim', 'packable'} where 'sep' is
+    the exact original text following the unit; `costs` are per-unit token
+    counts (text + separator). Returns a list of groups, each
+    {'prompt', 'sep', 'verbatim'}:
+
+    * prompt is the model input -- units joined by their ORIGINAL separators,
+      excluding the group's last unit's trailing separator (the rejoin owns
+      it);
+    * sep is the separator the rejoin appends after the translation;
+    * a verbatim or non-packable unit is a group by itself, so a prompt never
+      spans a paragraph break;
+    * consecutive packable units are greedily packed while their summed cost
+      stays <= limit (the prompt excludes the last separator, so the bound is
+      conservative).
+
+    Rejoin contract: `"".join(group_output + group["sep"])` reconstructs the
+    document with only the unit texts replaced by their translations.
+    """
+    groups: list[dict] = []
+    current: dict | None = None
+    current_cost = 0
+
+    def _flush():
+        nonlocal current, current_cost
+        if current is not None:
+            groups.append(current)
+            current, current_cost = None, 0
+
+    for unit, cost in zip(units, costs):
+        if unit["verbatim"] or not unit["packable"]:
+            _flush()
+            groups.append(
+                {"prompt": unit["text"], "sep": unit["sep"], "verbatim": unit["verbatim"]}
+            )
+            continue
+        if current is None or current_cost + cost > limit:
+            _flush()
+            current = {"prompt": unit["text"], "sep": unit["sep"], "verbatim": False}
+            current_cost = cost
+        else:
+            # The text between the group's last unit and this one is the
+            # last unit's own trailing separator (units are consecutive in
+            # the original). It is whitespace-only: packable.
+            current["prompt"] += current["sep"] + unit["text"]
+            current["sep"] = unit["sep"]
+            current_cost += cost
+    _flush()
+    return groups
 
 
 def token_windows(token_ids: list[int], limit: int) -> list[list[int]]:
@@ -342,62 +438,120 @@ class TranslationEngine:
         # hard-slicer from emitting empty windows on a tiny context.
         return max(budget, 16)
 
-    def _chunk_text(
-        self, text: str, language: str, source_budget: int
-    ) -> list[str]:
-        """Split one text into chunks whose source stays within `source_budget`.
+    def _fit_unit(
+        self,
+        text: str,
+        sep: str,
+        text_cost: int,
+        source_budget: int,
+        tokenizer,
+    ) -> list[dict]:
+        """Units for one line/sentence, hard-sliced at token boundaries when
+        it alone exceeds the budget. Slices are packable: their mutual
+        separator is empty, so joining them in one prompt rejoins
+        unambiguously. Decoding a slice and re-encoding it in _encode can
+        shift a token or two at the seam; _CONTEXT_RESERVE_TOKENS absorbs it.
+        """
+        packable = _WS_SEPARABLE_RE.match(sep) is not None
+        if text_cost <= source_budget:
+            return [{"text": text, "sep": sep, "verbatim": False, "packable": packable}]
+        # A bare string tokenizes to a one-element batch; [0] is the id list.
+        windows = token_windows(
+            tokenizer([text], add_special_tokens=False)["input_ids"][0], source_budget
+        )
+        out: list[dict] = []
+        for k, window in enumerate(windows):
+            # Not stripped: a real tokenizer rides the seam space on the last
+            # token of a slice, and stripping it would glue the next slice's
+            # first word onto this one. Whitespace-only slices are dropped.
+            decoded = tokenizer.decode(window)
+            if not decoded.strip():
+                continue
+            out.append(
+                {
+                    "text": decoded,
+                    "sep": sep if k == len(windows) - 1 else "",
+                    "verbatim": False,
+                    "packable": True,
+                }
+            )
+        return out or [{"text": text, "sep": sep, "verbatim": False, "packable": packable}]
 
-        Sentence-level (pysbd) when the language is covered, paragraph/line
-        otherwise, then hard-sliced at token boundaries as a last resort, then
-        greedily re-packed so a chunk carries as many whole sentences as the
-        budget allows. Packing (rather than one prompt per sentence) is what
-        quick_pipeline does, and it both cuts the request count and gives the
-        model neighbouring context for a better translation.
+    def _structure_text(self, text: str, language: str, source_budget: int) -> list[dict]:
+        """Structure-preserving units for one text (see module header).
+
+        Blocks are the primary unit so a paragraph translates as a whole;
+        only an over-budget block descends to lines or sentences. Every unit
+        carries the exact original text that follows it, so the rejoin is an
+        exact reconstruction with only the unit texts replaced.
         """
         if not text.strip():
             return []
 
-        segmenter = self.splitter.segmenter(language)
-        if segmenter is not None:
-            units = [u.strip() for u in segmenter.segment(text) if u.strip()]
-        else:
-            units = fallback_units(text)
-        if not units:
-            return [text]
-
         tokenizer = self.processor.tokenizer
-        # Tokenize all units in one call: the fast tokenizer batches in C, and
-        # per-unit Python calls would dominate on a long document.
-        unit_ids = tokenizer(units, add_special_tokens=False)["input_ids"]
+        segmenter = self.splitter.segmenter(language)
+        units: list[dict] = []
 
-        flat_units: list[str] = []
-        flat_costs: list[int] = []
-        for unit, ids in zip(units, unit_ids):
-            if len(ids) <= source_budget:
-                flat_units.append(unit)
-                flat_costs.append(len(ids))
+        def _line_units(lines: list[str], trailing_sep: str):
+            line_ids = tokenizer(lines, add_special_tokens=False)["input_ids"]
+            for j, (line, lids) in enumerate(zip(lines, line_ids)):
+                line_sep = "\n" if j < len(lines) - 1 else trailing_sep
+                if not line.strip():
+                    units.append({"text": line, "sep": line_sep, "verbatim": True, "packable": True})
+                elif _HR_LINE_RE.match(line):
+                    units.append({"text": line, "sep": line_sep, "verbatim": True, "packable": False})
+                else:
+                    units.extend(self._fit_unit(line, line_sep, len(lids), source_budget, tokenizer))
+
+        for content, sep in split_blocks(text):
+            if not content.strip():
+                # A blank-line run (or leading blank): structure, kept as-is.
+                units.append({"text": content, "sep": sep, "verbatim": True, "packable": True})
                 continue
-            # One unit over budget: slice at token boundaries so a slice never
-            # cuts a token, then let the packer group the slices like any other
-            # units. Decoding a slice and re-encoding it in _encode can shift a
-            # token or two at the seam; _CONTEXT_RESERVE_TOKENS absorbs that.
-            for window in token_windows(ids, source_budget):
-                flat_units.append(tokenizer.decode(window).strip())
-                flat_costs.append(len(window))
-        flat_units = [u for u in flat_units if u]
-        flat_costs = [c for c, u in zip(flat_costs, flat_units) if u]
+            if content.startswith("\n"):
+                # A soft line break before the paragraph: structure, not text.
+                units.append({"text": "\n", "sep": "", "verbatim": True, "packable": True})
+                content = content[1:]
+                if not content.strip():
+                    units.append({"text": "", "sep": sep, "verbatim": True, "packable": True})
+                    continue
+            if _block_is_verbatim(content):
+                units.append({"text": content, "sep": sep, "verbatim": True, "packable": False})
+                continue
+            ids = tokenizer([content], add_special_tokens=False)["input_ids"][0]
+            if len(ids) <= source_budget:
+                units.append(
+                    {
+                        "text": content,
+                        "sep": sep,
+                        "verbatim": False,
+                        "packable": _WS_SEPARABLE_RE.match(sep) is not None,
+                    }
+                )
+                continue
+            lines = content.split("\n")
+            if _block_is_structured(lines):
+                _line_units(lines, sep)
+                continue
+            sentences = (
+                [s.strip() for s in segmenter.segment(content) if s.strip()]
+                if segmenter is not None
+                else []
+            )
+            if sentences:
+                sent_ids = tokenizer(sentences, add_special_tokens=False)["input_ids"]
+                for (sent, gap), sids in zip(_sentence_units(content, sentences), sent_ids):
+                    units.extend(self._fit_unit(sent, gap, len(sids), source_budget, tokenizer))
+            else:
+                _line_units(lines, sep)
+        return units
 
-        return [
-            " ".join(flat_units[index] for index in group)
-            for group in pack_units(flat_units, flat_costs, source_budget)
-        ]
-
-    def _chunk_texts(
+    def _structure_texts(
         self, texts: list[str], language: str, source_budget: int
-    ) -> list[list[str]]:
-        """_chunk_text for a list of texts, preserving order. Sync on purpose:
-        it runs in a worker thread via to_thread from translate()."""
-        return [self._chunk_text(text, language, source_budget) for text in texts]
+    ) -> list[list[dict]]:
+        """_structure_text for a list of texts, preserving order. Sync on
+        purpose: it runs in a worker thread via to_thread from translate()."""
+        return [self._structure_text(text, language, source_budget) for text in texts]
 
     # ------------------------------------------------------------- translate
 
@@ -412,12 +566,14 @@ class TranslationEngine:
     ) -> list[str]:
         """Translate texts, preserving order. One output per input.
 
-        With split_sentences, each text is chunked to fit the upstream context
-        window and the output budget (see _chunk_text), every chunk of every
-        text is sent to the shared upstream, and the chunks are rejoined per
-        text. That keeps the server busy even when one request carries a single
-        long document, and an oversized document degrades to more chunks
-        instead of a 400.
+        With split_sentences, each text is chunked structure-preservingly to
+        fit the upstream context window and the output budget (see
+        _structure_text / group_units): blocks and their original separators
+        become budget-bounded prompts, verbatim blocks (code fences, math)
+        skip the model, and the translations are rejoined with the original
+        separators so markdown structure survives. That keeps the server busy
+        even when one request carries a single long document, and an oversized
+        document degrades to more chunks instead of a 400.
         """
         if not self.is_loaded:
             raise RuntimeError("Gateway is not ready.")
@@ -432,23 +588,56 @@ class TranslationEngine:
             # Segmentation, tokenization and packing are pure CPU work that
             # scales with the document, so they run off the event loop, as
             # _encode does.
-            segments_per_text = await to_thread.run_sync(
-                self._chunk_texts, texts, source_lang, source_budget
+            units_per_text = await to_thread.run_sync(
+                self._structure_texts, texts, source_lang, source_budget
             )
+            tokenizer = self.processor.tokenizer
+            # One batched pass per text measures every unit and separator.
+            groups_per_text = []
+            for units in units_per_text:
+                if not units:
+                    groups_per_text.append([])
+                    continue
+                text_ids = tokenizer(
+                    [u["text"] for u in units], add_special_tokens=False
+                )["input_ids"]
+                sep_ids = tokenizer(
+                    [u["sep"] for u in units], add_special_tokens=False
+                )["input_ids"]
+                costs = [len(t) + len(s) for t, s in zip(text_ids, sep_ids)]
+                groups_per_text.append(group_units(units, costs, source_budget))
         else:
-            segments_per_text = [[text] for text in texts]
+            # Explicit opt-out (the benchmark contract): one prompt per text,
+            # whatever its size.
+            groups_per_text = [
+                [{"prompt": text, "sep": "", "verbatim": False}] for text in texts
+            ]
 
-        flat_segments = [segment for segments in segments_per_text for segment in segments]
+        flat_segments = [
+            group["prompt"]
+            for groups in groups_per_text
+            for group in groups
+            if not group["verbatim"]
+        ]
         flat_translations = await self._generate(
             flat_segments, system, source_lang, target_lang, max_new_tokens
         )
 
+        # Rejoin exactly: each group's output plus its original trailing
+        # separator. Verbatim groups (code fences, math, blank runs) pass
+        # through untouched.
         translations = []
         cursor = 0
-        for segments in segments_per_text:
-            chunk = flat_translations[cursor : cursor + len(segments)]
-            cursor += len(segments)
-            translations.append(" ".join(part for part in chunk if part))
+        for groups in groups_per_text:
+            parts = []
+            for group in groups:
+                if group["verbatim"]:
+                    parts.append(group["prompt"])
+                else:
+                    parts.append(flat_translations[cursor])
+                    cursor += 1
+                parts.append(group["sep"])
+            translations.append("".join(parts))
         return translations
 
     async def _generate(

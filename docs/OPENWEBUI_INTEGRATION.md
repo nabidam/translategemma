@@ -3,11 +3,11 @@
 This guide details how to integrate the fine-tuned and merged **TranslateGemma-27B** model (served with vLLM on an offline host) into **OpenWebUI v0.11.3**, with complete support for:
 1. **Official multimodal template compliance** and stop-token preservation (`[1, 106]`).
 2. **Context resolution** (e.g., *"translate this"*, *"translate the above message"*).
-3. **Document & file translation** (handling full file uploads with automatic sentence-split batching).
+3. **Document & file translation** (handling full file uploads with structure-preserving chunked batching).
 4. **Interactive `/translate` slash command** with default language fallback.
 
 > **Verified against the OpenWebUI v0.11.3 source.** The tool in section 2 is
-> version 2.2.0 and is the canonical copy kept in `scripts/openwebui_tool.py`
+> version 2.3.0 and is the canonical copy kept in `scripts/openwebui_tool.py`
 > (tests: `tests/test_openwebui_tool.py`). It is written for how v0.11.3
 > *actually* delivers file content to tools (see section 5), which differs from
 > older OpenWebUI versions:
@@ -54,7 +54,7 @@ Standard OpenWebUI chat endpoints pass only a flat string (`{"role": "user", "co
 │  │   previous translation is never re-selected as a source           │  │
 │  │ - Strips non-translatable OCR artifacts (base64 images, HTML)     │  │
 │  │ - Long results attach to the chat as a file (RELAY_MAX_CHARS)     │  │
-│  │ - Auto sentence-splitting: split_sentences=True (>250 chars)      │  │
+│  │ - Structure-preserving split: split_sentences=True (>250 chars)   │  │
 │  │ - Sends live progress status chips via __event_emitter__          │  │
 │  └─────────────────────────────────┬─────────────────────────────────┘  │
 └────────────────────────────────────┼────────────────────────────────────┘
@@ -63,7 +63,7 @@ Standard OpenWebUI chat endpoints pass only a flat string (`{"role": "user", "co
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ translategemma-api Gateway (:8000/translate)                            │
 │ - Validates inputs (source_lang, target_lang, text)                     │
-│ - Splits long documents into sentences using pysbd                      │
+│ - Structure-preserving chunking: blocks -> lines -> sentences           │
 │ - Renders official SFT Jinja template via prompting.py                  │
 │ - Resolves stop token IDs: [1, 106] (<end_of_turn>)                     │
 │ - Sets greedy decoding: temperature=0.0, top_p=1.0, top_k=-1            │
@@ -91,7 +91,7 @@ This v2.3.0 tool implementation includes:
 - **v0.11.3 message-format aware**: handles list-of-parts message content, `<attached_files>`/`<file id=...>` tags, RAG `<context>`/`<source>` blocks, and the fact that the last message at call time is the assistant `tool_call`.
 - **OCR artifact stripping (v2.2)**: before the gateway call, the resolved text is cleaned of non-translatable payloads — base64 image data-URIs, markdown images (alt text kept), HTML comments and tags (inner text kept). OCR-generated markdown embeds image data inline; "translating" it produced garbage and inflated the token count until the relay back through the base model overflowed its context window. A document that is images/binary only now returns an explicit "no translatable text" error.
 - **Large results as downloadable chat files (v2.2, storage in v2.3)**: translations longer than the `RELAY_MAX_CHARS` valve (default 8000 chars) are attached to the chat as a file via OpenWebUI's own `chat:message:files` mechanism (persisted to the message via `Chats.add_message_files_by_id_and_message_id`), and the base model receives a one-line acknowledgement instruction instead of the document-sized text — the model never reads or re-emits it. The translation is stored as a **real OpenWebUI file** (`Storage.upload_file` + `Files.insert_new_file`, no RAG processing), so the chat chip previews the markdown and its name is a working link to `/files/{id}/content` — i.e. the file can actually be **downloaded**. Without storage access it degrades to a content-only (preview-only) entry.
-- **Automatic Sentence Splitting**: For inputs exceeding 250 characters or containing newlines, it automatically sets `split_sentences: True`. The backend gateway uses `pysbd` to segment the document into sentences and translates them concurrently in vLLM's continuous batching engine.
+- **Structure-preserving chunking**: For inputs exceeding 250 characters or containing newlines, it automatically sets `split_sentences: True`. The gateway splits the document into **blocks** (paragraphs, headings, list/table lines) and keeps the original separators as data: a block that fits the token budget translates as a whole unit (also the best unit for MT quality), an over-budget block descends to lines (structural blocks) or `pysbd` sentences with their original gaps (prose), and a unit still over budget is hard-sliced at token boundaries. Code fences (```/~~~) and `$$` math blocks pass through **verbatim** — they never reach the model. Rejoining is exact (`translated unit + original separator`), so the output keeps the input's markdown structure instead of collapsing to one line.
 - **User & Global Valves**: Preserves default language fallbacks (`en` ➔ `fa`).
 
 **Resolution order** (first match wins):
@@ -787,7 +787,7 @@ class Tools:
         :param text: Text to translate. For uploaded files and references like 'this' or 'the above', leave it empty or pass 'this' — the tool locates the document/message itself. Pass inline/pasted text here verbatim. `/translate [src] [tgt] ...` is also accepted.
         :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
         :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
-        :param split_sentences: Whether to split long documents into sentences for concurrent batching.
+        :param split_sentences: Whether to chunk long documents structure-preservingly (blocks/lines/sentences) for concurrent batching.
         :return: Translated text. Translations longer than the RELAY_MAX_CHARS valve are returned as a chat file attachment (with a short acknowledgement for the model) instead of the full text.
         """
         # 1. Attached files on the CURRENT message (full text, no viewer caps).
@@ -884,7 +884,7 @@ class Tools:
             split_sentences = len(resolved) > 250 or "\n" in resolved
 
         word_count = len(resolved.split())
-        mode_desc = "with sentence-splitting" if split_sentences else "direct"
+        mode_desc = "with structure-preserving splitting" if split_sentences else "direct"
         if source == "attached file" and file_names:
             source_desc = f"file: {', '.join(file_names[:2])}"
         else:
@@ -1158,11 +1158,17 @@ root cause of "long text gets shortened" and "markdown says no content".
      *current* message; the tool reads each file's stored `data.content`
      in-process (the same text `view_file` shows, but without its 10k cap).
 
-3. **High-Throughput Sentence Splitting:**
+3. **High-Throughput, Structure-Preserving Chunking:**
    The tool automatically activates `split_sentences: True` when texts exceed
-   250 characters. The FastAPI gateway segments the document with `pysbd`,
-   dispatches segments concurrently to vLLM's continuous batching engine, and
-   rejoins the translated segments in order.
+   250 characters. The FastAPI gateway splits the document into blocks and
+   carries each original separator as data: blocks that fit the token budget
+   are whole units, over-budget blocks descend to lines (structural) or
+   `pysbd` sentences (prose) with their original gaps, and any remaining
+   over-budget unit is hard-sliced at token boundaries. Consecutive units
+   separated by plain whitespace are packed into one prompt (fewer requests,
+   neighbouring context); a prompt never spans a paragraph break. Code fences
+   and `$$` math are verbatim. The translated units are rejoined with their
+   original separators in order, so markdown structure survives.
 
  4. **Long documents end-to-end:**
     - *Input side* is safe: the tool sends the full text (no `view_file` 10k
@@ -1172,11 +1178,14 @@ root cause of "long text gets shortened" and "markdown says no content".
       payloads inline, and "translating" them produces garbage and inflates
       the token count until the return path overflows. A document that is
       images/binary only returns an explicit "no translatable text" error.
-    - *Mid side* (the gateway) is bounded: with `split_sentences` it chunks the
-      document into units that always fit the vLLM window — sentence (pysbd) →
-      paragraph/line (languages pysbd lacks a model for) → hard token-boundary
-      slices — then greedily packs whole sentences into budget-sized chunks.
-      An oversized document now degrades to *more chunks*, never a 400. The
+    - *Mid side* (the gateway) is bounded and structure-preserving: with
+      `split_sentences` it splits the document into blocks and carries each
+      original separator as data — block (whole) → line (structural block) →
+      sentence (pysbd; original gaps) → line (languages pysbd lacks a model
+      for) → hard token-boundary slices — then packs consecutive
+      whitespace-separated units into budget-sized prompts. An oversized
+      document degrades to *more chunks*, never a 400, and the rejoin keeps
+      the input's blank lines, headings, list lines, and code fences intact. The
       chunk budget is `min(context − max_new_tokens − reserve,
       max_new_tokens // 2)`, so a chunk's translation also cannot be silently
       clipped at the stop (a `finish_reason: length` hit is logged and means
@@ -1330,7 +1339,9 @@ the fix each relies on:
 | 8 | The **system prompt** gets translated instead of the document | v2.0's "leave `text` empty" rule pushes the model into the tool's self-resolution; when the file content is absent (focused mode / still extracting) the old history fallback scanned *every* message and returned the system prompt as the source | v2.1 fallback **skips `system`/`developer`/`tool`/`function` roles** and never re-selects a prior `translate` relay; if no real source exists it returns an explicit "file has no readable text yet / use full-context upload mode" error instead of guessing. Also adds a raw on-disk read for text-like files (.md/.txt/…) when extraction hasn't written `data.content` yet |
 | 9 | Long document → `Gateway Error (500): Internal Server Error` | `/translate` had no error handler: any upstream failure (vLLM 400 "prompt too long" on a giant unsegmentable chunk; a chunk exceeding `vllm_timeout` under KV pressure from 2048 tokens × hundreds of concurrent segments; API-container OOM) surfaced as a generic 500 whose traceback only lived in a log the container itself corrupted (`fastapi run` = dev mode, reload supervisor shares stdout → torn json-file log) | Gateway now answers **502 with the actual upstream error text** (visible in the chat); Dockerfile runs production `uvicorn` (no reload → intact logs, no mid-request restarts); tool `MAX_NEW_TOKENS` default 2048 → 512 per segment (4× less KV demand). Rebuild both images to apply |
 | 10 | vLLM 400: `maximum context length is N … request has M input tokens` | The document (or pysbd's "whole text is one segment" fallback for a language it has no model for — e.g. `pt`/`tr`/`ko`) reached `/completions` as one over-context prompt; `split_sentences` split by sentence but never bounded chunk size to the window | The gateway now chunks **budget-aware**: `min(context − max_new_tokens − 256, max_new_tokens // 2)` source tokens per chunk, sentence → paragraph/line → hard token-boundary slices, greedily re-packed. The window is auto-probed from vLLM `/v1/models` (or set `TG_MAX_CONTEXT_TOKENS`). An oversized document now degrades to more chunks, never a 400 |
-| 11 | OCR markdown → garbage words in the output, and the chat then shows the **base model's** own context error (`maximum context length is 262144 … 262145 input tokens`) with no translation shown | Two compounding bugs: (a) OCR markdown embeds full **base64 image payloads** inline — the v2.1 tool sent them to the MT model, which "translated" the blobs into garbage (the split/wrong words); (b) the inflated translation came back as the tool result, which the **base model** must re-emit into its reply — that re-emit overflows the base model's own context window (a different, larger vLLM than the gateway's) and the error replaces the translation | v2.2 tool **strips** base64 data-URIs, markdown images (keeping alt text), HTML comments/tags (keeping inner text) *before* the gateway call — a document that is only images/binary now returns an explicit "no translatable text" error instead of garbage. And translations longer than the `RELAY_MAX_CHARS` valve (default 8000) are stored as a real OpenWebUI file and returned as a **downloadable chat file attachment** (the same `chat:message:files` mechanism OpenWebUI's own `generate_image` uses; `v2.3` adds the file-storage step so the chip previews and the name links to `/files/{id}/content`), with the base model given a one-line acknowledgement instruction it must follow — the model never reads or re-types the document-sized result |
+| 11 | OCR markdown → garbage words in the output, and the chat then shows the **base model's** own context error (`maximum context length is 262144 … 262145 input tokens`) with no translation shown | Two compounding bugs: (a) OCR markdown embeds full **base64 image payloads** inline — the v2.1 tool sent them to the MT model, which "translated" the blobs into garbage (the split/wrong words); (b) the inflated translation came back as the tool result, which the **base model** must re-emit into its reply — that re-emit overflows the base model's own context window (a different, larger vLLM than the gateway's) and the error replaces the translation | v2.2 tool **strips** base64 data-URIs, markdown images (keeping alt text), HTML comments/tags (keeping inner text) *before* the gateway call — a document that is only images/binary now returns an explicit "no translatable text" error instead of garbage. And translations longer than the `RELAY_MAX_CHARS` valve (default 8000) are stored as a real OpenWebUI file and returned as a **downloadable chat file attachment** (the same `chat:message:files` mechanism OpenWebUI's own `generate_image` uses; `v2.3` adds the file-storage step so the chip previews and the name links to `/files/{id}/content`),  with the base model given a one-line acknowledgement instruction it must follow — the model never reads or re-types the document-sized result |
+ | 12 | Multi-line markdown input → **one-line** output (all structure gone) | The old chunker flattened the document to a flat sentence list (pysbd drops every newline; the line fallback strips lines) and rejoined translations with `" "`, destroying every paragraph break, heading, and list marker before/after the model saw it | The gateway now chunks **structure-preserving**: blocks (paragraphs/headings/list/table lines) are the unit, each carries its exact original separator, code fences and `$$` math pass through verbatim, and the rejoin is `translated unit + original separator` — so the output keeps the input's markdown layout. A prompt never spans a paragraph break |
+
 
 ### Quick checks when something regresses
 

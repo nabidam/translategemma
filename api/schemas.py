@@ -36,11 +36,13 @@ class TranslationOptions(BaseModel):
     split_sentences: bool | None = Field(
         default=None,
         description=(
-            "Chunk the input into sentences (pysbd) packed into budget-sized "
-            "units, translate each, and rejoin. Chunks are bounded by the "
-            "upstream context window and the output budget, so an oversized "
-            "document is always legal. Defaults to TG_SPLIT_SENTENCES. Leave "
-            "off for single segments: the adapter was trained on whole segments."
+            "Structure-preserving chunk: split into blocks (paragraphs, "
+            "headings, list/table lines), translate each, rejoin exactly with "
+            "the original separators. Code fences and $$ math pass through "
+            "verbatim. Every prompt is bounded by the upstream context window "
+            "and the output budget, so an oversized document is always legal. "
+            "Defaults to TG_SPLIT_SENTENCES. Leave off for single segments: "
+            "the adapter was trained on whole segments."
         ),
     )
 
