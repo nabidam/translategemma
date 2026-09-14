@@ -322,6 +322,58 @@ class TestDelivery:
         assert out.startswith("Gateway Error (502):")
         assert captured == []
 
+    def test_connection_error_not_attached(self, monkeypatch):
+        # Regression: connection failures arrive as "Translation
+        # connection error:" — a prefix the old error check missed, so a
+        # file containing the error text got attached.
+        module = _load_pipe(monkeypatch)
+        captured = []
+        _chats_stub(monkeypatch, captured)
+
+        def boom(url, json=None, timeout=None):
+            raise ConnectionError("connection refused")
+
+        module.requests.post = boom
+        out = _run_pipe(
+            module,
+            body={
+                "messages": [user_msg("The quick brown fox jumps over the lazy dog.")],
+                "stream": False,
+            },
+            __chat_id__="chat-1",
+            __message_id__="msg-1",
+            __user__={"id": "u1"},
+        )
+        assert out == "Translation connection error: connection refused"
+        assert captured == []
+
+    def test_empty_translation_not_attached(self, monkeypatch):
+        # A 200 with an empty body is a failure too: no file, a visible
+        # error instead of an empty reply.
+        module = _load_pipe(monkeypatch)
+        captured = []
+        _chats_stub(monkeypatch, captured)
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"translation": ""}
+
+        module.requests.post = lambda url, json=None, timeout=None: FakeResp()
+        out = _run_pipe(
+            module,
+            body={
+                "messages": [user_msg("The quick brown fox jumps over the lazy dog.")],
+                "stream": False,
+            },
+            __chat_id__="chat-1",
+            __message_id__="msg-1",
+            __user__={"id": "u1"},
+        )
+        assert out == "The translator returned no text (empty response)."
+        assert captured == []
+
     def test_status_events_emitted(self, monkeypatch):
         module = _load_pipe(monkeypatch)
         calls = []

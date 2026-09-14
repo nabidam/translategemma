@@ -2,7 +2,7 @@
 title: TranslateGemma Translation Pipe (Deterministic)
 author: TranslateGemma Team
 description: Select this pipe as the model and every message becomes a translation request. Files, pasted text, and references like "translate this" are resolved deterministically, the document never touches a chat LLM (no context overflow, no chatty replies, nothing re-emitted), the full structured translation is streamed back as the reply, and it is attached as a downloadable file.
-version: 1.0.0
+version: 1.0.1
 license: MIT
 requirements: requests, pydantic
 """
@@ -189,8 +189,16 @@ class Pipe:
                 }
             )
 
-        if result.startswith(("Error:", "Gateway Error", "vLLM Error")):
+        # The client signals failures as prefixed strings; connection
+        # problems arrive as "Translation connection error:" (caught above).
+        # A failure is not a translation: never attach a file for it.
+        is_error = result.startswith(
+            ("Error:", "Gateway Error", "vLLM Error", "Translation connection error")
+        )
+        if is_error:
             return result
+        if not result:
+            return "The translator returned no text (empty response)."
 
         if self.valves.ATTACH_FILE:
             await store_translation_file(
