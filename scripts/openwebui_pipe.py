@@ -1,8 +1,8 @@
 """
-title: TranslateGemma Translation Tool (Context & File Aware)
+title: TranslateGemma Translation Pipe (Deterministic)
 author: TranslateGemma Team
-description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating. Every successful translation is attached to the chat as a downloadable file (stored in OpenWebUI file storage); large translations are delivered as that file alone, with a short acknowledgement instead of making the base model re-emit them.
-version: 2.5.0
+description: Select this pipe as the model and every message becomes a translation request. Files, pasted text, and references like "translate this" are resolved deterministically, the document never touches a chat LLM (no context overflow, no chatty replies, nothing re-emitted), the full structured translation is streamed back as the reply, and it is attached as a downloadable file.
+version: 1.0.0
 license: MIT
 requirements: requests, pydantic
 """
@@ -804,11 +804,34 @@ async def store_translation_file(
 
     return name
 
+import asyncio
 from typing import Any, Callable, Optional
 from pydantic import BaseModel, Field
 
+# Reply chunks for streaming: paragraph-sized, so the chat renders
+# progressively without fragmenting a line.
+_CHUNK_CHARS = 1500
 
-class Tools:
+
+def _reply_chunks(text: str):
+    """Yield streaming chunks that rejoin to `text` exactly.
+
+    The framework emits each yielded line as its own delta and never joins
+    them back together, so paragraph breaks must ride on the chunk — a
+    splitter that drops the separator would flatten the whole document.
+    """
+    parts = (text or "").split("\n\n")
+    for i, part in enumerate(parts):
+        sep = "" if i == len(parts) - 1 else "\n\n"
+        if part:
+            for start in range(0, len(part), _CHUNK_CHARS):
+                piece = part[start : start + _CHUNK_CHARS]
+                yield piece + sep if start + _CHUNK_CHARS >= len(part) else piece
+        elif sep:
+            yield sep
+
+
+class Pipe:
     class Valves(BaseModel):
         BACKEND_MODE: str = Field(
             default="gateway",
@@ -836,30 +859,18 @@ class Tools:
         )
         MAX_NEW_TOKENS: int = Field(
             default=512,
-            description="Maximum new tokens per segment (one sentence; 512 is the gateway default and 4x less KV-cache pressure than 2048 on long documents)",
+            description="Maximum new tokens per segment (512 is the gateway default and 4x less KV-cache pressure than 2048 on long documents)",
         )
         TIMEOUT_SECONDS: int = Field(
             default=300,
             description="Timeout in seconds for long documents",
         )
-        RELAY_MAX_CHARS: int = Field(
-            default=8000,
-            description=(
-                "Translations longer than this many characters are delivered as a "
-                "chat file attachment with a short acknowledgement, instead of "
-                "being re-emitted by the base model. The base model would "
-                "otherwise have to copy the whole translation into its reply, "
-                "which overflows its own context window and is slow. 0 disables "
-                "the acknowledgement mode (always relay inline)."
-            ),
-        )
-        ALWAYS_ATTACH_FILE: bool = Field(
+        ATTACH_FILE: bool = Field(
             default=True,
             description=(
-                "Always attach the translation as a downloadable chat file, even "
-                "when the result is small enough to be relayed inline — the file "
-                "is created alongside the normal reply. Set False to attach a "
-                "file only for large results."
+                "Attach the translation as a downloadable chat file (stored in "
+                "OpenWebUI file storage). The full translation is always part "
+                "of the reply itself; the file is a convenience copy."
             ),
         )
 
@@ -876,165 +887,119 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    # ------------------------------------------------------------- translate
-
-    async def translate(
+    async def pipe(
         self,
-        text: str = "",
-        source_lang: Optional[str] = None,
-        target_lang: Optional[str] = None,
-        split_sentences: Optional[bool] = None,
-        __messages__: Optional[list] = None,
-        __files__: Optional[list] = None,
+        body: dict,
         __user__: Optional[dict] = None,
         __chat_id__: Optional[str] = None,
         __message_id__: Optional[str] = None,
+        __files__: Optional[list] = None,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
-    ) -> str:
-        """
-        Translates text, documents, or conversation context using finetuned TranslateGemma 27B. ALWAYS translate the ENTIRE content — never a summary or partial excerpt, and never ask the user whether to translate all or part. A file/document attached with no instruction is a complete request to translate it in full (default target: Persian).
+    ):
+        """Handle one chat completion. The body's messages are the
+        conversation; the reply IS the translation. No base model is
+        involved at any point."""
+        body = body or {}
+        messages = body.get("messages") or []
+        stream = bool(body.get("stream", False))
 
-        :param text: Text to translate. For uploaded files and references like 'this' or 'the above', leave it empty or pass 'this' — the tool locates the document/message itself. Pass inline/pasted text here verbatim. `/translate [src] [tgt] ...` is also accepted.
-        :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
-        :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
-        :param split_sentences: Whether to chunk long documents structure-preservingly (blocks/lines/sentences) for concurrent batching.
-        :return: Translated text. Every successful translation is attached to the chat as a downloadable file (ALWAYS_ATTACH_FILE valve). Translations longer than the RELAY_MAX_CHARS valve are returned to the model as a short acknowledgement (the attached file carries the content) instead of the full text.
-        """
-        # 1-3. Deterministic source resolution (files, context blocks, message
-        #      text, history) — never the system prompt, never a prior relay.
-        info = await resolve_source(text, __messages__, __files__)
+        current_idx, current_text = last_user_message(messages)
+        # /translate [src] [tgt] ... works on the pipe too (language override
+        # + optional inline text).
+        text_arg = current_text if current_text.strip().startswith("/translate") else ""
+
+        info = await resolve_source(
+            text_arg, messages, __files__, include_assistant_history=False
+        )
         file_names = info["file_names"]
-        unreadable_files = info["unreadable_files"]
-        if info["cmd_src"]:
-            source_lang = info["cmd_src"]
-        if info["cmd_tgt"]:
-            target_lang = info["cmd_tgt"]
+        resolved = sanitize_document(info["text"])
 
-        resolved = info["text"]
         if not resolved:
-            if unreadable_files:
-                names = ", ".join(unreadable_files[:3])
-                return (
-                    f"Error: The attached file ({names}) has no readable text yet. "
+            if info["unreadable_files"]:
+                names = ", ".join(info["unreadable_files"][:3])
+                error = (
+                    f"The attached file ({names}) has no readable text yet. "
                     "Its content extraction may still be running or failed — wait a "
                     "moment and send the message again. For files, use the "
                     "'Using Entire Document' upload mode (Settings → Interface → "
                     "File → Default Upload Mode) so the full text is available."
                 )
-            return (
-                "Error: No text or file content found to translate. "
-                "Upload a file (with full-context upload mode), paste the text, "
-                "or point at a specific earlier message."
-            )
-
-        # OCR markdown and scraped pages carry non-translatable payloads
-        # (base64 image data, HTML). Translating them produces garbage and
-        # inflates the token count until the relay back through the base
-        # model overflows its context window.
-        resolved = sanitize_document(resolved)
-        if not resolved:
-            return (
-                "Error: The content contains no translatable text (only images, "
-                "binary data, or markup). Nothing was sent to the translator."
-            )
+            else:
+                error = (
+                    "Nothing to translate. Attach a document or paste the text — "
+                    "every message sent to this pipe is a translation request. "
+                    "Use '/translate [src] [tgt] ...' to override the languages "
+                    f"(defaults: {self.valves.DEFAULT_SOURCE_LANG} → "
+                    f"{self.valves.DEFAULT_TARGET_LANG})."
+                )
+            return error
 
         src, tgt = resolve_languages(
-            source_lang,
-            target_lang,
+            info["cmd_src"] or None,
+            info["cmd_tgt"] or None,
             __user__,
             self.valves.DEFAULT_SOURCE_LANG,
             self.valves.DEFAULT_TARGET_LANG,
         )
-
-        if split_sentences is None:
-            split_sentences = len(resolved) > 250 or "\n" in resolved
-
+        split = len(resolved) > 250 or "\n" in resolved
         word_count = len(resolved.split())
-        mode_desc = "with structure-preserving splitting" if split_sentences else "direct"
-        if info["source"] == "attached file" and file_names:
-            source_desc = f"file: {', '.join(file_names[:2])}"
-        else:
-            source_desc = info["source"] or "text"
+        source_desc = (
+            f"file: {', '.join(file_names[:2])}"
+            if info["source"] == "attached file" and file_names
+            else info["source"] or "text"
+        )
 
         if __event_emitter__:
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Translating {word_count} words [{src} \u279c {tgt}] ({mode_desc}, from {source_desc})...",
+                        "description": f"Translating {word_count} words [{src} \u279c {tgt}] (from {source_desc})...",
                         "done": False,
                     },
                 }
             )
 
+        client = TranslationClient(
+            backend_mode=self.valves.BACKEND_MODE,
+            gateway_url=self.valves.GATEWAY_URL,
+            vllm_url=self.valves.VLLM_URL,
+            vllm_model_name=self.valves.VLLM_MODEL_NAME,
+            max_new_tokens=self.valves.MAX_NEW_TOKENS,
+            timeout_seconds=self.valves.TIMEOUT_SECONDS,
+        )
         try:
-            client = TranslationClient(
-                backend_mode=self.valves.BACKEND_MODE,
-                gateway_url=self.valves.GATEWAY_URL,
-                vllm_url=self.valves.VLLM_URL,
-                vllm_model_name=self.valves.VLLM_MODEL_NAME,
-                max_new_tokens=self.valves.MAX_NEW_TOKENS,
-                timeout_seconds=self.valves.TIMEOUT_SECONDS,
-            )
-            result = client.translate(resolved, src, tgt, split_sentences)
+            # The gateway call blocks; keep the event loop free for the
+            # progress events and other chats.
+            result = await asyncio.to_thread(client.translate, resolved, src, tgt, split)
+        except Exception as error:
+            result = f"Translation connection error: {str(error)}"
 
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Translation complete ({word_count} words).",
-                            "done": True,
-                        },
-                    }
-                )
-            is_error = result.startswith(("Error:", "Gateway Error", "vLLM Error"))
-            if result and not is_error:
-                if (
-                    self.valves.RELAY_MAX_CHARS > 0
-                    and len(result) > self.valves.RELAY_MAX_CHARS
-                ):
-                    # The base model must not re-emit a document-sized result.
-                    name = await store_translation_file(
-                        result,
-                        file_names,
-                        tgt,
-                        __chat_id__,
-                        __message_id__,
-                        __event_emitter__,
-                        __user__,
-                    )
-                    return (
-                        f"Translation complete: {word_count} words, {src} to {tgt}. The full "
-                        f"translation is already attached to the chat as the file '{name}' and "
-                        "is visible to the user. Your reply must be a single short sentence "
-                        "acknowledging that the translation is ready and attached (for "
-                        "example: 'Done - the full translation is attached.'). NEVER restate, "
-                        "quote, summarize, or repeat any of the translated content."
-                    )
-                if self.valves.ALWAYS_ATTACH_FILE:
-                    # Default behaviour: the model relays the full text verbatim,
-                    # and the file is attached alongside the reply.
-                    await store_translation_file(
-                        result,
-                        file_names,
-                        tgt,
-                        __chat_id__,
-                        __message_id__,
-                        __event_emitter__,
-                        __user__,
-                    )
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Translation complete ({word_count} words).",
+                        "done": True,
+                    },
+                }
+            )
+
+        if result.startswith(("Error:", "Gateway Error", "vLLM Error")):
             return result
 
-        except Exception as error:
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Translation failed: {str(error)}",
-                            "done": True,
-                        },
-                    }
-                )
-            return f"Translation connection error: {str(error)}"
+        if self.valves.ATTACH_FILE:
+            await store_translation_file(
+                result,
+                file_names,
+                tgt,
+                __chat_id__,
+                __message_id__,
+                __event_emitter__,
+                __user__,
+            )
+
+        if stream:
+            return _reply_chunks(result)
+        return result

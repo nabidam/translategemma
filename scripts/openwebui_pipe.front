@@ -1,0 +1,208 @@
+"""
+title: TranslateGemma Translation Pipe (Deterministic)
+author: TranslateGemma Team
+description: Select this pipe as the model and every message becomes a translation request. Files, pasted text, and references like "translate this" are resolved deterministically, the document never touches a chat LLM (no context overflow, no chatty replies, nothing re-emitted), the full structured translation is streamed back as the reply, and it is attached as a downloadable file.
+version: 1.0.0
+license: MIT
+requirements: requests, pydantic
+"""
+from translation_core import *
+import asyncio
+from typing import Any, Callable, Optional
+from pydantic import BaseModel, Field
+
+# Reply chunks for streaming: paragraph-sized, so the chat renders
+# progressively without fragmenting a line.
+_CHUNK_CHARS = 1500
+
+
+def _reply_chunks(text: str):
+    """Yield streaming chunks that rejoin to `text` exactly.
+
+    The framework emits each yielded line as its own delta and never joins
+    them back together, so paragraph breaks must ride on the chunk — a
+    splitter that drops the separator would flatten the whole document.
+    """
+    parts = (text or "").split("\n\n")
+    for i, part in enumerate(parts):
+        sep = "" if i == len(parts) - 1 else "\n\n"
+        if part:
+            for start in range(0, len(part), _CHUNK_CHARS):
+                piece = part[start : start + _CHUNK_CHARS]
+                yield piece + sep if start + _CHUNK_CHARS >= len(part) else piece
+        elif sep:
+            yield sep
+
+
+class Pipe:
+    class Valves(BaseModel):
+        BACKEND_MODE: str = Field(
+            default="gateway",
+            description="Backend mode: 'gateway' (translategemma-api gateway) or 'vllm'",
+        )
+        GATEWAY_URL: str = Field(
+            default="http://translategemma-api:8000/translate",
+            description="URL to the TranslateGemma FastAPI gateway (/translate)",
+        )
+        VLLM_URL: str = Field(
+            default="http://translategemma-vllm:8000/v1/chat/completions",
+            description="URL to vLLM chat completions if querying vLLM directly",
+        )
+        VLLM_MODEL_NAME: str = Field(
+            default="model",
+            description="Model identifier served by vLLM",
+        )
+        DEFAULT_SOURCE_LANG: str = Field(
+            default="en",
+            description="Default source language ISO code (e.g. en, fa, de, fr, ru)",
+        )
+        DEFAULT_TARGET_LANG: str = Field(
+            default="fa",
+            description="Default target language ISO code (e.g. fa, en, de, fr, ru)",
+        )
+        MAX_NEW_TOKENS: int = Field(
+            default=512,
+            description="Maximum new tokens per segment (512 is the gateway default and 4x less KV-cache pressure than 2048 on long documents)",
+        )
+        TIMEOUT_SECONDS: int = Field(
+            default=300,
+            description="Timeout in seconds for long documents",
+        )
+        ATTACH_FILE: bool = Field(
+            default=True,
+            description=(
+                "Attach the translation as a downloadable chat file (stored in "
+                "OpenWebUI file storage). The full translation is always part "
+                "of the reply itself; the file is a convenience copy."
+            ),
+        )
+
+    class UserValves(BaseModel):
+        source_lang: str = Field(
+            default="",
+            description="Personal default source language code (leave blank for system default)",
+        )
+        target_lang: str = Field(
+            default="",
+            description="Personal default target language code (leave blank for system default)",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def pipe(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
+        __files__: Optional[list] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+    ):
+        """Handle one chat completion. The body's messages are the
+        conversation; the reply IS the translation. No base model is
+        involved at any point."""
+        body = body or {}
+        messages = body.get("messages") or []
+        stream = bool(body.get("stream", False))
+
+        current_idx, current_text = last_user_message(messages)
+        # /translate [src] [tgt] ... works on the pipe too (language override
+        # + optional inline text).
+        text_arg = current_text if current_text.strip().startswith("/translate") else ""
+
+        info = await resolve_source(
+            text_arg, messages, __files__, include_assistant_history=False
+        )
+        file_names = info["file_names"]
+        resolved = sanitize_document(info["text"])
+
+        if not resolved:
+            if info["unreadable_files"]:
+                names = ", ".join(info["unreadable_files"][:3])
+                error = (
+                    f"The attached file ({names}) has no readable text yet. "
+                    "Its content extraction may still be running or failed — wait a "
+                    "moment and send the message again. For files, use the "
+                    "'Using Entire Document' upload mode (Settings → Interface → "
+                    "File → Default Upload Mode) so the full text is available."
+                )
+            else:
+                error = (
+                    "Nothing to translate. Attach a document or paste the text — "
+                    "every message sent to this pipe is a translation request. "
+                    "Use '/translate [src] [tgt] ...' to override the languages "
+                    f"(defaults: {self.valves.DEFAULT_SOURCE_LANG} → "
+                    f"{self.valves.DEFAULT_TARGET_LANG})."
+                )
+            return error
+
+        src, tgt = resolve_languages(
+            info["cmd_src"] or None,
+            info["cmd_tgt"] or None,
+            __user__,
+            self.valves.DEFAULT_SOURCE_LANG,
+            self.valves.DEFAULT_TARGET_LANG,
+        )
+        split = len(resolved) > 250 or "\n" in resolved
+        word_count = len(resolved.split())
+        source_desc = (
+            f"file: {', '.join(file_names[:2])}"
+            if info["source"] == "attached file" and file_names
+            else info["source"] or "text"
+        )
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Translating {word_count} words [{src} \u279c {tgt}] (from {source_desc})...",
+                        "done": False,
+                    },
+                }
+            )
+
+        client = TranslationClient(
+            backend_mode=self.valves.BACKEND_MODE,
+            gateway_url=self.valves.GATEWAY_URL,
+            vllm_url=self.valves.VLLM_URL,
+            vllm_model_name=self.valves.VLLM_MODEL_NAME,
+            max_new_tokens=self.valves.MAX_NEW_TOKENS,
+            timeout_seconds=self.valves.TIMEOUT_SECONDS,
+        )
+        try:
+            # The gateway call blocks; keep the event loop free for the
+            # progress events and other chats.
+            result = await asyncio.to_thread(client.translate, resolved, src, tgt, split)
+        except Exception as error:
+            result = f"Translation connection error: {str(error)}"
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Translation complete ({word_count} words).",
+                        "done": True,
+                    },
+                }
+            )
+
+        if result.startswith(("Error:", "Gateway Error", "vLLM Error")):
+            return result
+
+        if self.valves.ATTACH_FILE:
+            await store_translation_file(
+                result,
+                file_names,
+                tgt,
+                __chat_id__,
+                __message_id__,
+                __event_emitter__,
+                __user__,
+            )
+
+        if stream:
+            return _reply_chunks(result)
+        return result

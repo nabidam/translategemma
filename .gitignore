@@ -39,6 +39,9 @@ docs/refs/
 docs/MULTI_GPU_TRAINING.md
 # Research journal for the OpenWebUI integration (internal investigation notes).
 docs/OPENWEBUI_INTEGRATION_RESEARCH.md
+# OpenWebUI x Wan2.2-T2V (vllm-omni) integration guide — targets the prod
+# machine deployment (vllm-omni port, Docker network, proxy settings).
+docs/OPENWEBUI_WAN22_INTEGRATION.md
 docs/EVALUATION_BACKLOG.md
 docs/EVALUATION_METRICS_EXPLAINED.md
 docs/GLOSSARY_FA.md
