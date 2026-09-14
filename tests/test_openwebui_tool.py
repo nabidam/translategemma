@@ -79,8 +79,11 @@ def _make_capturing_backend(module, calls, translation="TRANSLATION_OUTPUT"):
     module.requests.post = fake_post
 
 
-def _run(module, **kwargs):
+def _run(module, valves=None, **kwargs):
     tool = module.Tools()
+    if valves:
+        for key, value in valves.items():
+            setattr(tool.valves, key, value)
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(tool.translate(**kwargs))
@@ -624,7 +627,9 @@ class TestLargeTranslationAttachment:
         assert entry["url"].startswith("data:text/markdown")
         assert ";base64," in entry["url"]
 
-    def test_small_translation_relayed_inline(self, monkeypatch):
+    def test_small_translation_relayed_inline_and_attached(self, monkeypatch):
+        # v2.4: small results are relayed inline (default behaviour) AND
+        # attached as a downloadable file alongside the reply.
         module = _load_tool(monkeypatch)
         calls = []
         small = "This is a short translation."
@@ -637,8 +642,108 @@ class TestLargeTranslationAttachment:
             __files__=[],
             __event_emitter__=emit,
         )
+        # The model still gets the full text to relay verbatim.
+        assert out == small
+        file_event = [e for e in events if e.get("type") == "chat:message:files"]
+        assert len(file_event) == 1
+        entry = file_event[0]["data"]["files"][0]
+        assert entry["content"] == small
+        assert entry["type"] == "file"
+        assert entry["url"].startswith("data:text/markdown")
+
+    def test_small_translation_no_file_when_valve_off(self, monkeypatch):
+        module = _load_tool(monkeypatch)
+        calls = []
+        small = "This is a short translation."
+        _make_capturing_backend(module, calls, translation=small)
+        events, emit = self._events()
+        out = _run(
+            module,
+            valves={"ALWAYS_ATTACH_FILE": False},
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __event_emitter__=emit,
+        )
         assert out == small
         assert not [e for e in events if e.get("type") == "chat:message:files"]
+
+    def test_small_translation_stored_as_real_downloadable_file(self, monkeypatch):
+        # v2.4 with storage available: even a small translation becomes a real
+        # OpenWebUI file, and the tool result stays the relay text.
+        module = _load_tool(monkeypatch)
+        calls = []
+        small = "This is a short translation."
+        _make_capturing_backend(module, calls, translation=small)
+
+        uploaded = {}
+
+        class FakeFileForm:
+            def __init__(self, **kwargs):
+                uploaded["form"] = kwargs
+
+        class FakeRecord:
+            @property
+            def id(self):
+                return uploaded["form"]["id"]
+
+            def model_dump(self):
+                return {
+                    "id": uploaded["form"]["id"],
+                    "filename": uploaded["form"]["filename"],
+                    "data": uploaded["form"]["data"],
+                    "meta": uploaded["form"]["meta"],
+                }
+
+        class FakeFiles:
+            @staticmethod
+            async def insert_new_file(user_id, form_data, db=None):
+                uploaded["user_id"] = user_id
+                return FakeRecord()
+
+        class FakeStorage:
+            @staticmethod
+            def upload_file(fileobj, filename, tags):
+                data = fileobj.read()
+                uploaded["bytes"] = data
+                uploaded["filename"] = filename
+                return data, f"/tmp/uploads/{filename}"
+
+        files_mod = types.ModuleType("open_webui.models.files")
+        files_mod.Files = FakeFiles
+        files_mod.FileForm = FakeFileForm
+        storage_mod = types.ModuleType("open_webui.storage.provider")
+        storage_mod.Storage = FakeStorage
+        models_mod = types.ModuleType("open_webui.models")
+        storage_pkg = types.ModuleType("open_webui.storage")
+        open_webui_mod = types.ModuleType("open_webui")
+        monkeypatch.setitem(sys.modules, "open_webui", open_webui_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models", models_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.models.files", files_mod)
+        monkeypatch.setitem(sys.modules, "open_webui.storage", storage_pkg)
+        monkeypatch.setitem(sys.modules, "open_webui.storage.provider", storage_mod)
+
+        events, emit = self._events()
+        out = _run(
+            module,
+            text="A source sentence that is long enough to split into parts for sure.",
+            __messages__=[],
+            __files__=[],
+            __user__={"id": "user-1"},
+            __event_emitter__=emit,
+        )
+        # Relay behaviour is untouched.
+        assert out == small
+        # Real file stored, entry references the file id (downloadable).
+        assert uploaded["bytes"] == small.encode("utf-8")
+        assert uploaded["form"]["data"]["content"] == small
+        file_id = uploaded["form"]["id"]
+        entry = [e for e in events if e.get("type") == "chat:message:files"][0][
+            "data"
+        ]["files"][0]
+        assert entry["id"] == file_id
+        assert entry["url"] == file_id
+        assert not entry["url"].startswith("data:")
 
     def test_error_never_attached(self, monkeypatch):
         module = _load_tool(monkeypatch)

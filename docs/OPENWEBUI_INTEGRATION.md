@@ -7,7 +7,7 @@ This guide details how to integrate the fine-tuned and merged **TranslateGemma-2
 4. **Interactive `/translate` slash command** with default language fallback.
 
 > **Verified against the OpenWebUI v0.11.3 source.** The tool in section 2 is
-> version 2.3.0 and is the canonical copy kept in `scripts/openwebui_tool.py`
+> version 2.4.0 and is the canonical copy kept in `scripts/openwebui_tool.py`
 > (tests: `tests/test_openwebui_tool.py`). It is written for how v0.11.3
 > *actually* delivers file content to tools (see section 5), which differs from
 > older OpenWebUI versions:
@@ -45,7 +45,7 @@ Standard OpenWebUI chat endpoints pass only a flat string (`{"role": "user", "co
 │  User uploads document or types: /translate [text]                      │
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │ OpenWebUI Tool: translategemma_tool (Workspace > Tools, v2.3.0)   │  │
+│  │ OpenWebUI Tool: translategemma_tool (Workspace > Tools, v2.4.0)   │  │
 │  │ - Self-resolves the text: RAG <context> block of the current      │  │
 │  │   message, __files__ full content (in-process, no 10k cap),       │  │
 │  │   <attached_files> ids, or conversation history — the base model  │  │
@@ -53,7 +53,7 @@ Standard OpenWebUI chat endpoints pass only a flat string (`{"role": "user", "co
 │  │ - Disambiguates multi-source chats: current message wins; a       │  │
 │  │   previous translation is never re-selected as a source           │  │
 │  │ - Strips non-translatable OCR artifacts (base64 images, HTML)     │  │
-│  │ - Long results attach to the chat as a file (RELAY_MAX_CHARS)     │  │
+│  │ - Every result attaches to the chat as a file (downloadable)      │  │
 │  │ - Structure-preserving split: split_sentences=True (>250 chars)   │  │
 │  │ - Sends live progress status chips via __event_emitter__          │  │
 │  └─────────────────────────────────┬─────────────────────────────────┘  │
@@ -84,13 +84,13 @@ Standard OpenWebUI chat endpoints pass only a flat string (`{"role": "user", "co
 
 In OpenWebUI v0.11.3, custom extensibility uses **Tools** (`class Tools:`).
 
-This v2.3.0 tool implementation includes:
+This v2.4.0 tool implementation includes:
 - **Self-served content resolution**: The tool reads `__messages__` and `__files__` itself and finds the text to translate. The base model only says *"translate"* — it does **not** retype document content into the tool argument. This removes the two failure modes of v1:
   - *Long documents got shortened*: the model could not reproduce 10k+ chars verbatim in a tool argument (and the built-in `view_file` caps at 10,000 chars by default). The tool now sends the complete text to the gateway.
   - *Mixed-up sources*: with two or more sources in one chat, v1's "last non-empty message" fallback could grab the previous translation or an old source. v2 resolves in a deterministic order (below) and never selects a prior `translate` result as a source.
 - **v0.11.3 message-format aware**: handles list-of-parts message content, `<attached_files>`/`<file id=...>` tags, RAG `<context>`/`<source>` blocks, and the fact that the last message at call time is the assistant `tool_call`.
 - **OCR artifact stripping (v2.2)**: before the gateway call, the resolved text is cleaned of non-translatable payloads — base64 image data-URIs, markdown images (alt text kept), HTML comments and tags (inner text kept). OCR-generated markdown embeds image data inline; "translating" it produced garbage and inflated the token count until the relay back through the base model overflowed its context window. A document that is images/binary only now returns an explicit "no translatable text" error.
-- **Large results as downloadable chat files (v2.2, storage in v2.3)**: translations longer than the `RELAY_MAX_CHARS` valve (default 8000 chars) are attached to the chat as a file via OpenWebUI's own `chat:message:files` mechanism (persisted to the message via `Chats.add_message_files_by_id_and_message_id`), and the base model receives a one-line acknowledgement instruction instead of the document-sized text — the model never reads or re-emits it. The translation is stored as a **real OpenWebUI file** (`Storage.upload_file` + `Files.insert_new_file`, no RAG processing), so the chat chip previews the markdown and its name is a working link to `/files/{id}/content` — i.e. the file can actually be **downloaded**. Without storage access it degrades to a content-only (preview-only) entry.
+- **A downloadable file for every translation (v2.2 attachment, storage in v2.3, always-on in v2.4)**: every successful translation is attached to the chat as a file via OpenWebUI's own `chat:message:files` mechanism (persisted to the message via `Chats.add_message_files_by_id_and_message_id`) and stored as a **real OpenWebUI file** (`Storage.upload_file` + `Files.insert_new_file`, no RAG processing), so the chat chip previews the markdown and its name is a working link to `/files/{id}/content` — i.e. the file can actually be **downloaded**; the file also appears in Workspace → Files. For translations longer than the `RELAY_MAX_CHARS` valve (default 8000 chars) the file is the *only* delivery path: the base model receives a one-line acknowledgement instruction instead of the document-sized text (it never reads or re-emits it). For shorter results the file is attached **alongside** the normal reply, which the model still relays verbatim (`ALWAYS_ATTACH_FILE` valve, default on, restores the attach-only-when-large behaviour when off). Without storage access the attachment degrades to a content-only (preview-only) entry.
 - **Structure-preserving chunking**: For inputs exceeding 250 characters or containing newlines, it automatically sets `split_sentences: True`. The gateway splits the document into **blocks** (paragraphs, headings, list/table lines) and keeps the original separators as data: a block that fits the token budget translates as a whole unit (also the best unit for MT quality), an over-budget block descends to lines (structural blocks) or `pysbd` sentences with their original gaps (prose), and a unit still over budget is hard-sliced at token boundaries. Code fences (```/~~~) and `$$` math blocks pass through **verbatim** — they never reach the model. Rejoining is exact (`translated unit + original separator`), so the output keeps the input's markdown structure instead of collapsing to one line.
 - **User & Global Valves**: Preserves default language fallbacks (`en` ➔ `fa`).
 
@@ -109,8 +109,8 @@ Navigate in OpenWebUI to **Workspace → Tools → Add Tool (`+`)**, name it `tr
 """
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
-description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating, and returns large translations as a downloadable chat file attachment (stored in OpenWebUI file storage) instead of making the base model re-emit them.
-version: 2.3.0
+description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating. Every successful translation is attached to the chat as a downloadable file (stored in OpenWebUI file storage); large translations are delivered as that file alone, with a short acknowledgement instead of making the base model re-emit them.
+version: 2.4.0
 license: MIT
 requirements: requests, pydantic
 """
@@ -252,11 +252,21 @@ class Tools:
         RELAY_MAX_CHARS: int = Field(
             default=8000,
             description=(
-                "Translations longer than this many characters are returned to the "
-                "user as a chat file attachment instead of being re-emitted by the "
-                "base model. The base model would otherwise have to copy the whole "
-                "translation into its reply, which overflows its own context window "
-                "and is slow. 0 disables the attachment (always relay inline)."
+                "Translations longer than this many characters are delivered as a "
+                "chat file attachment with a short acknowledgement, instead of "
+                "being re-emitted by the base model. The base model would "
+                "otherwise have to copy the whole translation into its reply, "
+                "which overflows its own context window and is slow. 0 disables "
+                "the acknowledgement mode (always relay inline)."
+            ),
+        )
+        ALWAYS_ATTACH_FILE: bool = Field(
+            default=True,
+            description=(
+                "Always attach the translation as a downloadable chat file, even "
+                "when the result is small enough to be relayed inline — the file "
+                "is created alongside the normal reply. Set False to attach a "
+                "file only for large results."
             ),
         )
 
@@ -676,32 +686,25 @@ class Tools:
         except Exception:
             return None
 
-    async def _attach_translation_file(
+    async def _store_translation_file(
         self,
         translation: str,
         file_names: list,
-        src: str,
         tgt: str,
-        word_count: int,
         __chat_id__: Optional[str],
         __message_id__: Optional[str],
         __event_emitter__: Optional[Callable[[dict], Any]],
         __user__: Optional[dict],
     ) -> str:
-        """Deliver a large translation to the user as a chat file attachment.
-
-        The base model must not re-emit a document-sized translation: the
-        tool result becomes part of its prompt, and the reply would have to
-        copy the whole thing back out. Both overflow its context window (and
-        cost a full re-generation). So the translation goes to the chat as a
-        file — the same mechanism OpenWebUI's own generate_image tool uses —
-        and the model gets a short instruction to acknowledge, not repeat.
+        """Store the translation as a downloadable chat file. Returns the name.
 
         When possible the translation is stored as a real OpenWebUI file
         (file storage + DB record): the chat chip's modal then previews the
         markdown and the file name is a link to /files/{id}/content, which
         the browser downloads. Without storage access it degrades to a
-        content-only entry (preview only).
+        content-only entry (preview only). Persistence and the
+        chat:message:files event are best effort — a failure here must not
+        fail the translation itself.
         """
         name = f"translation-{tgt}.md"
         if file_names:
@@ -757,6 +760,38 @@ class Tools:
             except Exception:
                 pass
 
+        return name
+
+    async def _attach_translation_file(
+        self,
+        translation: str,
+        file_names: list,
+        src: str,
+        tgt: str,
+        word_count: int,
+        __chat_id__: Optional[str],
+        __message_id__: Optional[str],
+        __event_emitter__: Optional[Callable[[dict], Any]],
+        __user__: Optional[dict],
+    ) -> str:
+        """Deliver a large translation to the user as a chat file attachment.
+
+        The base model must not re-emit a document-sized translation: the
+        tool result becomes part of its prompt, and the reply would have to
+        copy the whole thing back out. Both overflow its context window (and
+        cost a full re-generation). So the translation goes to the chat as a
+        file — the same mechanism OpenWebUI's own generate_image tool uses —
+        and the model gets a short instruction to acknowledge, not repeat.
+        """
+        name = await self._store_translation_file(
+            translation,
+            file_names,
+            tgt,
+            __chat_id__,
+            __message_id__,
+            __event_emitter__,
+            __user__,
+        )
         return (
             f"Translation complete: {word_count} words, {src} to {tgt}. The full "
             f"translation is already attached to the chat as the file '{name}' and "
@@ -788,7 +823,7 @@ class Tools:
         :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
         :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
         :param split_sentences: Whether to chunk long documents structure-preservingly (blocks/lines/sentences) for concurrent batching.
-        :return: Translated text. Translations longer than the RELAY_MAX_CHARS valve are returned as a chat file attachment (with a short acknowledgement for the model) instead of the full text.
+        :return: Translated text. Every successful translation is attached to the chat as a downloadable file (ALWAYS_ATTACH_FILE valve). Translations longer than the RELAY_MAX_CHARS valve are returned to the model as a short acknowledgement (the attached file carries the content) instead of the full text.
         """
         # 1. Attached files on the CURRENT message (full text, no viewer caps).
         file_parts = []
@@ -965,23 +1000,36 @@ class Tools:
                         },
                     }
                 )
-            if (
-                self.valves.RELAY_MAX_CHARS > 0
-                and result
-                and not result.startswith(("Error:", "Gateway Error", "vLLM Error"))
-                and len(result) > self.valves.RELAY_MAX_CHARS
-            ):
-                return await self._attach_translation_file(
-                    result,
-                    file_names,
-                    src,
-                    tgt,
-                    word_count,
-                    __chat_id__,
-                    __message_id__,
-                    __event_emitter__,
-                    __user__,
-                )
+            is_error = result.startswith(("Error:", "Gateway Error", "vLLM Error"))
+            if result and not is_error:
+                if (
+                    self.valves.RELAY_MAX_CHARS > 0
+                    and len(result) > self.valves.RELAY_MAX_CHARS
+                ):
+                    # The base model must not re-emit a document-sized result.
+                    return await self._attach_translation_file(
+                        result,
+                        file_names,
+                        src,
+                        tgt,
+                        word_count,
+                        __chat_id__,
+                        __message_id__,
+                        __event_emitter__,
+                        __user__,
+                    )
+                if self.valves.ALWAYS_ATTACH_FILE:
+                    # Default behaviour: the model relays the full text verbatim,
+                    # and the file is attached alongside the reply.
+                    await self._store_translation_file(
+                        result,
+                        file_names,
+                        tgt,
+                        __chat_id__,
+                        __message_id__,
+                        __event_emitter__,
+                        __user__,
+                    )
             return result
 
         except Exception as error:
@@ -1339,7 +1387,7 @@ the fix each relies on:
 | 8 | The **system prompt** gets translated instead of the document | v2.0's "leave `text` empty" rule pushes the model into the tool's self-resolution; when the file content is absent (focused mode / still extracting) the old history fallback scanned *every* message and returned the system prompt as the source | v2.1 fallback **skips `system`/`developer`/`tool`/`function` roles** and never re-selects a prior `translate` relay; if no real source exists it returns an explicit "file has no readable text yet / use full-context upload mode" error instead of guessing. Also adds a raw on-disk read for text-like files (.md/.txt/…) when extraction hasn't written `data.content` yet |
 | 9 | Long document → `Gateway Error (500): Internal Server Error` | `/translate` had no error handler: any upstream failure (vLLM 400 "prompt too long" on a giant unsegmentable chunk; a chunk exceeding `vllm_timeout` under KV pressure from 2048 tokens × hundreds of concurrent segments; API-container OOM) surfaced as a generic 500 whose traceback only lived in a log the container itself corrupted (`fastapi run` = dev mode, reload supervisor shares stdout → torn json-file log) | Gateway now answers **502 with the actual upstream error text** (visible in the chat); Dockerfile runs production `uvicorn` (no reload → intact logs, no mid-request restarts); tool `MAX_NEW_TOKENS` default 2048 → 512 per segment (4× less KV demand). Rebuild both images to apply |
 | 10 | vLLM 400: `maximum context length is N … request has M input tokens` | The document (or pysbd's "whole text is one segment" fallback for a language it has no model for — e.g. `pt`/`tr`/`ko`) reached `/completions` as one over-context prompt; `split_sentences` split by sentence but never bounded chunk size to the window | The gateway now chunks **budget-aware**: `min(context − max_new_tokens − 256, max_new_tokens // 2)` source tokens per chunk, sentence → paragraph/line → hard token-boundary slices, greedily re-packed. The window is auto-probed from vLLM `/v1/models` (or set `TG_MAX_CONTEXT_TOKENS`). An oversized document now degrades to more chunks, never a 400 |
-| 11 | OCR markdown → garbage words in the output, and the chat then shows the **base model's** own context error (`maximum context length is 262144 … 262145 input tokens`) with no translation shown | Two compounding bugs: (a) OCR markdown embeds full **base64 image payloads** inline — the v2.1 tool sent them to the MT model, which "translated" the blobs into garbage (the split/wrong words); (b) the inflated translation came back as the tool result, which the **base model** must re-emit into its reply — that re-emit overflows the base model's own context window (a different, larger vLLM than the gateway's) and the error replaces the translation | v2.2 tool **strips** base64 data-URIs, markdown images (keeping alt text), HTML comments/tags (keeping inner text) *before* the gateway call — a document that is only images/binary now returns an explicit "no translatable text" error instead of garbage. And translations longer than the `RELAY_MAX_CHARS` valve (default 8000) are stored as a real OpenWebUI file and returned as a **downloadable chat file attachment** (the same `chat:message:files` mechanism OpenWebUI's own `generate_image` uses; `v2.3` adds the file-storage step so the chip previews and the name links to `/files/{id}/content`),  with the base model given a one-line acknowledgement instruction it must follow — the model never reads or re-types the document-sized result |
+| 11 | OCR markdown → garbage words in the output, and the chat then shows the **base model's** own context error (`maximum context length is 262144 … 262145 input tokens`) with no translation shown | Two compounding bugs: (a) OCR markdown embeds full **base64 image payloads** inline — the v2.1 tool sent them to the MT model, which "translated" the blobs into garbage (the split/wrong words); (b) the inflated translation came back as the tool result, which the **base model** must re-emit into its reply — that re-emit overflows the base model's own context window (a different, larger vLLM than the gateway's) and the error replaces the translation | v2.2 tool **strips** base64 data-URIs, markdown images (keeping alt text), HTML comments/tags (keeping inner text) *before* the gateway call — a document that is only images/binary now returns an explicit "no translatable text" error instead of garbage. And translations longer than the `RELAY_MAX_CHARS` valve (default 8000) are stored as a real OpenWebUI file and returned as a **downloadable chat file attachment** (the same `chat:message:files` mechanism OpenWebUI's own `generate_image` uses; `v2.3` adds the file-storage step so the chip previews and the name links to `/files/{id}/content`; `v2.4` attaches a file to **every** translation, small ones alongside the normal reply), with the base model given a one-line acknowledgement instruction it must follow for large results — the model never reads or re-types the document-sized result |
  | 12 | Multi-line markdown input → **one-line** output (all structure gone) | The old chunker flattened the document to a flat sentence list (pysbd drops every newline; the line fallback strips lines) and rejoined translations with `" "`, destroying every paragraph break, heading, and list marker before/after the model saw it | The gateway now chunks **structure-preserving**: blocks (paragraphs/headings/list/table lines) are the unit, each carries its exact original separator, code fences and `$$` math pass through verbatim, and the rejoin is `translated unit + original separator` — so the output keeps the input's markdown layout. A prompt never spans a paragraph break |
 
 
@@ -1366,6 +1414,11 @@ the fix each relies on:
   results the base model still re-emits the text, so raise the base model's
   `max_tokens`. Long results no longer pass through the model at all: above
   the `RELAY_MAX_CHARS` valve they arrive as a chat file attachment.
+- **No file chip next to a short translation** (v2.4) → the
+  `ALWAYS_ATTACH_FILE` valve is off (files are then attached only for large
+  results), or the tool has no file-storage access (it then falls back to a
+  preview-only data-URI chip — see the download note below). Confirm the
+  valve is on and the tool is the v2.4 build.
 - **Chat shows the base model's context error** (`maximum context length is …
   input tokens`) while the tool panel shows a full translation → the
   document-sized tool result was being relayed through the base model and

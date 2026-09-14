@@ -1,8 +1,8 @@
 """
 title: TranslateGemma Translation Tool (Context & File Aware)
 author: TranslateGemma Team
-description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating, and returns large translations as a downloadable chat file attachment (stored in OpenWebUI file storage) instead of making the base model re-emit them.
-version: 2.3.0
+description: High-accuracy translation using finetuned TranslateGemma 27B. Self-resolves the text to translate from uploaded documents, conversation context, and inline text — no manual copy/paste by the model. Never falls back to the system prompt. Strips non-translatable artifacts (base64 image blobs, HTML) before translating. Every successful translation is attached to the chat as a downloadable file (stored in OpenWebUI file storage); large translations are delivered as that file alone, with a short acknowledgement instead of making the base model re-emit them.
+version: 2.4.0
 license: MIT
 requirements: requests, pydantic
 """
@@ -144,11 +144,21 @@ class Tools:
         RELAY_MAX_CHARS: int = Field(
             default=8000,
             description=(
-                "Translations longer than this many characters are returned to the "
-                "user as a chat file attachment instead of being re-emitted by the "
-                "base model. The base model would otherwise have to copy the whole "
-                "translation into its reply, which overflows its own context window "
-                "and is slow. 0 disables the attachment (always relay inline)."
+                "Translations longer than this many characters are delivered as a "
+                "chat file attachment with a short acknowledgement, instead of "
+                "being re-emitted by the base model. The base model would "
+                "otherwise have to copy the whole translation into its reply, "
+                "which overflows its own context window and is slow. 0 disables "
+                "the acknowledgement mode (always relay inline)."
+            ),
+        )
+        ALWAYS_ATTACH_FILE: bool = Field(
+            default=True,
+            description=(
+                "Always attach the translation as a downloadable chat file, even "
+                "when the result is small enough to be relayed inline — the file "
+                "is created alongside the normal reply. Set False to attach a "
+                "file only for large results."
             ),
         )
 
@@ -568,32 +578,25 @@ class Tools:
         except Exception:
             return None
 
-    async def _attach_translation_file(
+    async def _store_translation_file(
         self,
         translation: str,
         file_names: list,
-        src: str,
         tgt: str,
-        word_count: int,
         __chat_id__: Optional[str],
         __message_id__: Optional[str],
         __event_emitter__: Optional[Callable[[dict], Any]],
         __user__: Optional[dict],
     ) -> str:
-        """Deliver a large translation to the user as a chat file attachment.
-
-        The base model must not re-emit a document-sized translation: the
-        tool result becomes part of its prompt, and the reply would have to
-        copy the whole thing back out. Both overflow its context window (and
-        cost a full re-generation). So the translation goes to the chat as a
-        file — the same mechanism OpenWebUI's own generate_image tool uses —
-        and the model gets a short instruction to acknowledge, not repeat.
+        """Store the translation as a downloadable chat file. Returns the name.
 
         When possible the translation is stored as a real OpenWebUI file
         (file storage + DB record): the chat chip's modal then previews the
         markdown and the file name is a link to /files/{id}/content, which
         the browser downloads. Without storage access it degrades to a
-        content-only entry (preview only).
+        content-only entry (preview only). Persistence and the
+        chat:message:files event are best effort — a failure here must not
+        fail the translation itself.
         """
         name = f"translation-{tgt}.md"
         if file_names:
@@ -649,6 +652,38 @@ class Tools:
             except Exception:
                 pass
 
+        return name
+
+    async def _attach_translation_file(
+        self,
+        translation: str,
+        file_names: list,
+        src: str,
+        tgt: str,
+        word_count: int,
+        __chat_id__: Optional[str],
+        __message_id__: Optional[str],
+        __event_emitter__: Optional[Callable[[dict], Any]],
+        __user__: Optional[dict],
+    ) -> str:
+        """Deliver a large translation to the user as a chat file attachment.
+
+        The base model must not re-emit a document-sized translation: the
+        tool result becomes part of its prompt, and the reply would have to
+        copy the whole thing back out. Both overflow its context window (and
+        cost a full re-generation). So the translation goes to the chat as a
+        file — the same mechanism OpenWebUI's own generate_image tool uses —
+        and the model gets a short instruction to acknowledge, not repeat.
+        """
+        name = await self._store_translation_file(
+            translation,
+            file_names,
+            tgt,
+            __chat_id__,
+            __message_id__,
+            __event_emitter__,
+            __user__,
+        )
         return (
             f"Translation complete: {word_count} words, {src} to {tgt}. The full "
             f"translation is already attached to the chat as the file '{name}' and "
@@ -680,7 +715,7 @@ class Tools:
         :param source_lang: Source language code (e.g. 'en', 'fa', 'de', 'fr', 'ru').
         :param target_lang: Target language code (e.g. 'fa', 'en', 'de', 'fr', 'ru').
         :param split_sentences: Whether to chunk long documents structure-preservingly (blocks/lines/sentences) for concurrent batching.
-        :return: Translated text. Translations longer than the RELAY_MAX_CHARS valve are returned as a chat file attachment (with a short acknowledgement for the model) instead of the full text.
+        :return: Translated text. Every successful translation is attached to the chat as a downloadable file (ALWAYS_ATTACH_FILE valve). Translations longer than the RELAY_MAX_CHARS valve are returned to the model as a short acknowledgement (the attached file carries the content) instead of the full text.
         """
         # 1. Attached files on the CURRENT message (full text, no viewer caps).
         file_parts = []
@@ -857,23 +892,36 @@ class Tools:
                         },
                     }
                 )
-            if (
-                self.valves.RELAY_MAX_CHARS > 0
-                and result
-                and not result.startswith(("Error:", "Gateway Error", "vLLM Error"))
-                and len(result) > self.valves.RELAY_MAX_CHARS
-            ):
-                return await self._attach_translation_file(
-                    result,
-                    file_names,
-                    src,
-                    tgt,
-                    word_count,
-                    __chat_id__,
-                    __message_id__,
-                    __event_emitter__,
-                    __user__,
-                )
+            is_error = result.startswith(("Error:", "Gateway Error", "vLLM Error"))
+            if result and not is_error:
+                if (
+                    self.valves.RELAY_MAX_CHARS > 0
+                    and len(result) > self.valves.RELAY_MAX_CHARS
+                ):
+                    # The base model must not re-emit a document-sized result.
+                    return await self._attach_translation_file(
+                        result,
+                        file_names,
+                        src,
+                        tgt,
+                        word_count,
+                        __chat_id__,
+                        __message_id__,
+                        __event_emitter__,
+                        __user__,
+                    )
+                if self.valves.ALWAYS_ATTACH_FILE:
+                    # Default behaviour: the model relays the full text verbatim,
+                    # and the file is attached alongside the reply.
+                    await self._store_translation_file(
+                        result,
+                        file_names,
+                        tgt,
+                        __chat_id__,
+                        __message_id__,
+                        __event_emitter__,
+                        __user__,
+                    )
             return result
 
         except Exception as error:
